@@ -12,10 +12,13 @@ _TRANSLATION = str.maketrans(_CONFUSABLES)
 
 _CYRILLIC = re.compile(r"[а-яё]", re.IGNORECASE)
 
-# Границы слова, устойчивые к «+», «#» и «.» — обычный \b на них не работает,
+# Границы слова, устойчивые к «+» и «#» — обычный \b на них не работает,
 # потому что после «+» нет перехода между словесным и несловесным символом.
+# Точка сама по себе границей не считается (иначе «Python.» в конце
+# предложения не матчился бы), но точка перед следующим словом — считается
+# (иначе «node» ловил бы «node.js»).
 _LEFT_BOUNDARY = r"(?<![\w+#.])"
-_RIGHT_BOUNDARY = r"(?![\w+#.])"
+_RIGHT_BOUNDARY = r"(?![\w+#]|\.\w)"
 
 
 def normalize(text: str) -> str:
@@ -23,11 +26,27 @@ def normalize(text: str) -> str:
     return text.lower().translate(_TRANSLATION)
 
 
+def _is_stem_word(word: str) -> bool:
+    """Кириллическое слово без цифр склоняется, поэтому матчится по основе.
+
+    Решение принимается по исходному написанию слова, до нормализации.
+    Цифры исключены из правила, чтобы короткие коды вроде «1С» не превращались
+    в неограниченный префиксный матч (1С не должно ловить 1Cats).
+    """
+    return bool(_CYRILLIC.search(word)) and not any(ch.isdigit() for ch in word)
+
+
 def _compile(pattern: str) -> re.Pattern[str]:
-    by_stem = bool(_CYRILLIC.search(pattern))
-    words = [re.escape(word) for word in normalize(pattern).split()]
-    body = r"\s+".join(words)
-    tail = r"\w*" if by_stem else _RIGHT_BOUNDARY
+    raw_words = pattern.split()
+    norm_words = normalize(pattern).split()
+    parts = [
+        re.escape(norm_word) + (r"\w*" if _is_stem_word(raw_word) else "")
+        for raw_word, norm_word in zip(raw_words, norm_words, strict=True)
+    ]
+    body = r"\s+".join(parts)
+    # Хвост из \w* у последнего слова уже сам ограничивает совпадение справа;
+    # добавлять _RIGHT_BOUNDARY нужно, только если последнее слово не по основе.
+    tail = "" if raw_words and _is_stem_word(raw_words[-1]) else _RIGHT_BOUNDARY
     return re.compile(_LEFT_BOUNDARY + body + tail)
 
 
