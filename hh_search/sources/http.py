@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -103,12 +104,23 @@ class PoliteClient:
         self._sleep(self._config.delay_between_requests_sec * (2**attempt))
 
     def _parse_retry_after(self, value: str) -> float | None:
-        """Разбирает Retry-After по RFC 9110: delay-seconds (в т.ч. дробные) или HTTP-date."""
+        """Разбирает Retry-After по RFC 9110: delay-seconds (в т.ч. дробные) или HTTP-date.
+
+        "nan" отбрасывается отдельно: float("nan") не бросает ValueError, а любое
+        сравнение с NaN ложно, из-за чего он проходит сквозь min() в _backoff()
+        неизменным и улетает в sleep(). Бесконечность (inf), напротив, безопасна —
+        min(inf, MAX_RETRY_AFTER_SEC) корректно даёт потолок, поэтому она не
+        отбрасывается здесь.
+        """
         text = value.strip()
         try:
-            return max(float(text), 0.0)
+            seconds = float(text)
         except ValueError:
-            pass
+            seconds = None
+        if seconds is not None:
+            if math.isnan(seconds):
+                return None
+            return max(seconds, 0.0)
         try:
             target = parsedate_to_datetime(text)
         except (TypeError, ValueError):

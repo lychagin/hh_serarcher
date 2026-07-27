@@ -1,3 +1,4 @@
+import math
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
@@ -208,3 +209,47 @@ def test_no_sleep_after_final_failed_attempt() -> None:
         client.get(URL)
     assert route.call_count == 2
     assert all(delay < 2.0 for delay in slept)
+
+
+# --- Раунд исправлений 2 ---------------------------------------------------
+
+
+@respx.mock
+def test_retry_after_nan_falls_back_to_normal_backoff() -> None:
+    """Находка раунда 2 (Important): float("nan") не бросает ValueError, а любое
+    сравнение с NaN ложно, поэтому на ecd05dd nan проходил сквозь min() в
+    _backoff() неизменным и улетал в sleep() как есть (в проде с настоящим
+    time.sleep это аварийно валит процесс). Мусорное значение обязано приводить
+    к обычному экспоненциальному backoff, как и для любого другого невалидного
+    заголовка."""
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "nan"}),
+            httpx.Response(200, text="ok"),
+        ]
+    )
+    client, slept = make_client()
+    with client:
+        response = client.get(URL)
+    assert response.status_code == 200
+    assert route.call_count == 2
+    assert not any(math.isnan(delay) for delay in slept)
+    assert 1.0 in slept  # обычный backoff: delay_between_requests_sec * 2**0
+
+
+@respx.mock
+def test_retry_after_infinite_is_capped_at_300() -> None:
+    """Находка раунда 2: Retry-After: inf уже был безопасен (min(inf, 300.0) даёт
+    потолок корректно) — фиксируем это поведение отдельным тестом."""
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "inf"}),
+            httpx.Response(200, text="ok"),
+        ]
+    )
+    client, slept = make_client()
+    with client:
+        response = client.get(URL)
+    assert response.status_code == 200
+    assert route.call_count == 2
+    assert 300.0 in slept
