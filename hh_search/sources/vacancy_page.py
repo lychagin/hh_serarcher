@@ -61,12 +61,17 @@ def _extract_locality(posting: dict[str, Any]) -> str | None:
     return locality if isinstance(locality, str) else None
 
 
+def _extract_description(posting: dict[str, Any]) -> str:
+    raw_description = posting.get("description")
+    return html_to_text(raw_description) if isinstance(raw_description, str) else ""
+
+
 def parse_vacancy_page(html: str) -> VacancyDetails:
     posting = extract_job_posting(html)
     if posting is None:
         raise FetchFailed("на странице нет блока JSON-LD с JobPosting")
     return VacancyDetails(
-        description=html_to_text(str(posting.get("description", ""))),
+        description=_extract_description(posting),
         valid_through=_parse_datetime(posting.get("validThrough")),
         location=_extract_locality(posting),
     )

@@ -69,3 +69,30 @@ def test_html_to_text_unescapes_and_keeps_line_breaks() -> None:
 
 def test_vacancy_url_is_built_from_id() -> None:
     assert vacancy_url("135586311") == "https://hh.ru/vacancy/135586311"
+
+
+def test_parse_vacancy_page_treats_null_description_as_empty() -> None:
+    html = (
+        '<script type="application/ld+json">{"@type": "JobPosting", '
+        '"description": null}</script>'
+    )
+    details = parse_vacancy_page(html)
+    assert details.description == ""
+
+
+def test_parse_vacancy_page_treats_object_description_as_empty() -> None:
+    html = (
+        '<script type="application/ld+json">{"@type": "JobPosting", '
+        '"description": {"a": 1}}</script>'
+    )
+    details = parse_vacancy_page(html)
+    assert details.description == ""
+
+
+def test_parse_vacancy_page_treats_numeric_description_as_empty() -> None:
+    html = (
+        '<script type="application/ld+json">{"@type": "JobPosting", '
+        '"description": 123}</script>'
+    )
+    details = parse_vacancy_page(html)
+    assert details.description == ""
