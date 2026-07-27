@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS vacancy (
     status          TEXT NOT NULL,
     reject_reason   TEXT,
     first_seen_at   TEXT NOT NULL,
-    reported_at     TEXT
+    reported_at     TEXT,
+    corrupt_count   INTEGER NOT NULL DEFAULT 0,
+    corrupt_payload BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);

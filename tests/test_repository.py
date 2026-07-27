@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from hh_search.domain.models import DiscoveredVacancy, Salary, ScoreBreakdown, VacancyDetails
-from hh_search.storage.repository import SqliteRepository
+from hh_search.storage.repository import MAX_CORRUPT_ATTEMPTS, SqliteRepository
 
 
 @pytest.fixture()
@@ -341,3 +341,134 @@ def test_reset_cache_removes_stored_validators(repo: SqliteRepository) -> None:
     repo.save_cache_headers("https://hh.ru/x", etag='"v1"', last_modified=None)
     repo.reset_cache("https://hh.ru/x")
     assert repo.cache_headers("https://hh.ru/x") == {}
+
+
+# --- Раунд исправлений 3 ------------------------------------------------
+
+
+def test_repeatedly_corrupt_vacancy_reaches_terminal_status_and_stops_cycling(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """N1: вакансия, портящаяся детерминированно на каждом переобогащении
+    (баг в скоринге, эволюция схемы), не должна качаться и пересчитываться
+    вечно. После MAX_CORRUPT_ATTEMPTS карантинов она обязана уйти в
+    терминальный статус и перестать возвращаться в очередь — иначе
+    системная порча раскачивает весь бэклог бесконечно."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    for _ in range(MAX_CORRUPT_ATTEMPTS):
+        # имитируем очередной цикл переобогащения, который снова
+        # заканчивается битым score_detail (детерминированный баг)
+        raw.execute(
+            "UPDATE vacancy SET description = ?, score = ?, score_detail = ? WHERE id = ?",
+            ("Yocto", 87.4, "{битый", "1"),
+        )
+        raw.commit()
+        repository = SqliteRepository(db_path)
+        with caplog.at_level(logging.ERROR):
+            assert repository.unreported() == []
+        repository.close()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    assert repository.pending_enrichment(max_attempts=99) == []
+    assert repository.unreported() == []
+    repository.close()
+
+
+def test_corrupted_discovery_fields_do_not_crash_report(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """N2: порча title/published_at/salary_from (не только score_detail) не
+    должна ронять unreported() или pending_enrichment() целиком — модель
+    угроз (порча сырым SQL мимо API) касается всех колонок, из которых
+    строится DiscoveredVacancy, а не только score_detail."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)  # останется pending
+    repository.add_discovered(make_vacancy("2"), "embedded", 9)
+    repository.save_enriched("2", VacancyDetails(description="Yocto"), make_score())
+    repository.add_discovered(make_vacancy("3"), "embedded", 9)
+    repository.save_enriched("3", VacancyDetails(description="Yocto"), make_score(total=10.0))
+    repository.add_discovered(make_vacancy("4"), "embedded", 9)
+    repository.save_enriched("4", VacancyDetails(description="Yocto"), make_score(total=20.0))
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    # x'FFFEFA...' — заведомо невалидные UTF-8-байты в title вакансии "1"
+    raw.execute(
+        "UPDATE vacancy SET title = CAST(x'FFFEFA696E76616C6964' AS TEXT) WHERE id = ?",
+        ("1",),
+    )
+    raw.execute("UPDATE vacancy SET published_at = 'мусор' WHERE id = ?", ("3",))
+    raw.execute("UPDATE vacancy SET salary_from = 'текст' WHERE id = ?", ("4",))
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    with caplog.at_level(logging.ERROR):
+        pending = repository.pending_enrichment(max_attempts=3)
+    assert pending == []  # "1" была единственной pending, и она испорчена
+
+    with caplog.at_level(logging.ERROR):
+        unreported = repository.unreported()
+    assert {v.discovered.id for v in unreported} == {"2"}
+    repository.close()
+
+
+def test_corrupt_payload_is_preserved_after_quarantine(tmp_path: object) -> None:
+    """N3: карантин не должен уничтожать улики — исходный (испорченный)
+    score_detail сохраняется в corrupt_payload перед обнулением рабочих
+    полей, а не теряется безвозвратно (например, если порча на самом деле
+    эволюция схемы, которую предстоит мигрировать отдельным скриптом)."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE vacancy SET score_detail = ? WHERE id = ?", ("{битый payload", "1"))
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    assert repository.unreported() == []
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    row = raw.execute("SELECT corrupt_payload FROM vacancy WHERE id = ?", ("1",)).fetchone()
+    raw.close()
+    assert row is not None
+    assert row[0] is not None
+    assert row[0].decode("utf-8") == "{битый payload"
+
+
+def test_model_validate_bug_propagates_instead_of_silently_corrupting(
+    repo: SqliteRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Дополнительно (раунд 3): ошибка в самом валидаторе (не порча
+    данных, а баг) обязана падать громко, а не тихо карантинить здоровую
+    вакансию и молча возвращать пустой список."""
+    repo.add_discovered(make_vacancy(), "embedded", 9)
+    repo.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+
+    def broken_validate(*_args: object, **_kwargs: object) -> ScoreBreakdown:
+        raise AttributeError("опечатка в валидаторе")
+
+    monkeypatch.setattr(ScoreBreakdown, "model_validate", broken_validate)
+    with pytest.raises(AttributeError):
+        repo.unreported()
+    monkeypatch.undo()
+
+    # данные здоровой вакансии не должны были быть тихо стёрты карантином
+    pending = repo.unreported()
+    assert len(pending) == 1
+    assert pending[0].discovered.id == "1"

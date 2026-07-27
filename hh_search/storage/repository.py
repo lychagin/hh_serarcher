@@ -12,7 +12,7 @@ from hh_search.domain.models import (
     ScoredVacancy,
     VacancyDetails,
 )
-from hh_search.storage.mappers import to_discovered
+from hh_search.storage.mappers import decode_optional_text, decode_text, to_discovered
 from hh_search.storage.run_log import RunLog
 from hh_search.storage.time_utils import now_iso, to_utc_iso
 
@@ -21,16 +21,38 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 STATUS_NEW = "new"
 STATUS_REJECTED = "rejected"
 STATUS_REPORTED = "reported"
+# Терминальный статус: вакансия исчерпала MAX_CORRUPT_ATTEMPTS попыток
+# самовосстановления (см. _quarantine) и больше не возвращается в очередь.
+STATUS_CORRUPT = "corrupt"
 
-# Все колонки vacancy, кроме score_detail. Используется в двух запросах:
-# score_detail либо не нужен вовсе (pending_enrichment), либо выбирается
-# отдельно через CAST(... AS BLOB) (unreported) — см. комментарий там.
-_VACANCY_COLUMNS_SANS_SCORE_DETAIL = (
-    "id, url, title, company, area, salary_raw, salary_from, salary_to, "
-    "salary_currency, published_at, description, fetched_at, enrich_attempts, "
-    "score, cluster, cluster_weight, primary_query, status, reject_reason, "
-    "first_seen_at, reported_at"
+# Порог попыток карантина на одну вакансию, после которого self-heal
+# сменяется терминальным статусом — без него системная порча (например,
+# несовместимая после эволюции схема ScoreBreakdown) вечно перекачивает
+# и переоценивает весь бэклог.
+MAX_CORRUPT_ATTEMPTS = 3
+
+# Колонки, из которых строится DiscoveredVacancy. Текстовые обёрнуты в
+# CAST(... AS BLOB): sqlite3 декодирует TEXT-колонки в UTF-8 на этапе
+# fetch, до того как код увидит хоть одну строку, — битые байты в любой
+# из них роняют ВЕСЬ курсор, а не одну строку. BLOB отдаёт сырые байты,
+# decode переносится в mappers.to_discovered, где его можно поймать
+# точечно per-row.
+_DISCOVERED_COLUMNS_SQL = (
+    "id, CAST(url AS BLOB) AS url, CAST(title AS BLOB) AS title, "
+    "CAST(company AS BLOB) AS company, CAST(area AS BLOB) AS area, "
+    "CAST(salary_raw AS BLOB) AS salary_raw, salary_from, salary_to, "
+    "CAST(salary_currency AS BLOB) AS salary_currency, "
+    "CAST(published_at AS BLOB) AS published_at, "
+    "CAST(primary_query AS BLOB) AS primary_query"
 )
+
+# TypeError — json.loads(None) при score_detail = NULL. ValueError —
+# общий предок JSONDecodeError, UnicodeDecodeError и pydantic
+# ValidationError (все три — его подклассы), т.е. любая ожидаемая форма
+# порчи данных. Не Exception: ошибка в самом коде (например, опечатка в
+# ScoreBreakdown.model_validate) не является порчей данных и обязана
+# упасть громко, а не тихо закарантинить здоровую вакансию.
+_CORRUPTION_EXCEPTIONS = (TypeError, ValueError)
 
 logger = logging.getLogger(__name__)
 
@@ -139,16 +161,22 @@ class SqliteRepository:
     # --- enrichment ----------------------------------------------------
 
     def pending_enrichment(self, max_attempts: int) -> list[DiscoveredVacancy]:
-        # score_detail сознательно не выбирается: он здесь не нужен, а
-        # выбор битой TEXT-колонки роняет чтение всей строки ещё на этапе
-        # fetch (см. unreported).
         rows = self._connection.execute(
-            f"SELECT {_VACANCY_COLUMNS_SANS_SCORE_DETAIL} FROM vacancy "
+            f"SELECT {_DISCOVERED_COLUMNS_SQL}, corrupt_count FROM vacancy "
             "WHERE status = ? AND description IS NULL AND enrich_attempts < ? "
             "ORDER BY published_at DESC",
             (STATUS_NEW, max_attempts),
         ).fetchall()
-        return [to_discovered(row) for row in rows]
+        result: list[DiscoveredVacancy] = []
+        for row in rows:
+            try:
+                result.append(to_discovered(row))
+            except _CORRUPTION_EXCEPTIONS:
+                logger.error(
+                    "вакансия %s: данные обнаружения повреждены", row["id"], exc_info=True
+                )
+                self._quarantine(row["id"], int(row["corrupt_count"]), payload=None)
+        return result
 
     def save_enriched(
         self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
@@ -180,64 +208,75 @@ class SqliteRepository:
     # --- scoring and reporting -----------------------------------------
 
     def unreported(self) -> list[ScoredVacancy]:
-        # score_detail выбирается через CAST(... AS BLOB): sqlite3 пытается
-        # декодировать TEXT-колонки в UTF-8 уже на этапе fetch, до того как
-        # код увидит хоть одну строку, — битые байты роняют ВЕСЬ курсор
-        # (не одну строку) с OperationalError мимо любого try внизу. BLOB
-        # decode откладывается в Python, где его можно поймать точечно.
         rows = self._connection.execute(
-            f"SELECT {_VACANCY_COLUMNS_SANS_SCORE_DETAIL}, "
-            "CAST(score_detail AS BLOB) AS score_detail FROM vacancy "
+            f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
+            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail, "
+            "corrupt_count FROM vacancy "
             "WHERE status = ? AND score IS NOT NULL AND description IS NOT NULL "
             "ORDER BY score DESC",
             (STATUS_NEW,),
         ).fetchall()
         result: list[ScoredVacancy] = []
-        corrupt_ids: list[str] = []
         for row in rows:
+            raw_score_detail = row["score_detail"]
             try:
-                raw = row["score_detail"]
-                text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                text = decode_optional_text(raw_score_detail)
+                if text is None:
+                    raise TypeError("score_detail is NULL")
                 score = ScoreBreakdown.model_validate(json.loads(text))
-            except Exception:  # noqa: BLE001
-                # Эта ветка по определению разбирает заведомо испорченные
-                # данные — NULL, битый UTF-8, невалидный JSON или
-                # несовместимую (после эволюции) схему ScoreBreakdown.
-                # Любое исключение здесь означает одно и то же: строке
-                # нельзя доверять. Уже пойманный узкий список
-                # (JSONDecodeError, ValidationError) пропускал остальные
-                # формы порчи и ронял отчёт целиком.
+                result.append(
+                    ScoredVacancy(
+                        discovered=to_discovered(row),
+                        details=VacancyDetails(description=decode_text(row["description"])),
+                        score=score,
+                        cluster=decode_optional_text(row["cluster"]) or "",
+                    )
+                )
+            except _CORRUPTION_EXCEPTIONS:
                 logger.error(
-                    "вакансия %s: score_detail повреждён, возвращаем в очередь "
-                    "на переобогащение вместо потери",
+                    "вакансия %s: данные повреждены, отправляем в карантин",
                     row["id"],
                     exc_info=True,
                 )
-                corrupt_ids.append(row["id"])
-                continue
-            result.append(
-                ScoredVacancy(
-                    discovered=to_discovered(row),
-                    details=VacancyDetails(description=row["description"]),
-                    score=score,
-                    cluster=row["cluster"] or "",
-                )
-            )
-        if corrupt_ids:
-            # Карантин — это самовосстановление, а не сток: description/
-            # score/score_detail очищаются, enrich_attempts обнуляется
-            # (иначе вакансия могла упереться в max_attempts из-за старых
-            # неудач скачивания, не связанных с этой порчей). status
-            # остаётся 'new', так что на следующем прогоне вакансия снова
-            # видна pending_enrichment() и переобогащается заново —
-            # человеческое вмешательство в БД не требуется.
-            self._connection.executemany(
-                "UPDATE vacancy SET description = NULL, score = NULL, "
-                "score_detail = NULL, enrich_attempts = 0 WHERE id = ?",
-                [(vacancy_id,) for vacancy_id in corrupt_ids],
-            )
-            self._connection.commit()
+                self._quarantine(row["id"], int(row["corrupt_count"]), raw_score_detail)
         return result
+
+    def _quarantine(
+        self, vacancy_id: str, previous_corrupt_count: int, payload: bytes | None
+    ) -> None:
+        """Карантин — самовосстановление, ограниченное MAX_CORRUPT_ATTEMPTS.
+
+        До порога: description/score/score_detail обнуляются, enrich_attempts
+        сбрасывается (иначе вакансия могла упереться в max_attempts из-за
+        старых неудач скачивания, не связанных с этой порчей), status
+        остаётся 'new' — вакансия сама возвращается в pending_enrichment.
+        По достижении порога — терминальный STATUS_CORRUPT, из очереди
+        выведена насовсем, с единственной записью в лог. В обоих случаях
+        исходный payload сохраняется в corrupt_payload, а не теряется.
+        """
+        new_count = previous_corrupt_count + 1
+        if new_count >= MAX_CORRUPT_ATTEMPTS:
+            logger.error(
+                "вакансия %s: превышен лимит восстановлений (%s из %s), "
+                "переводим в терминальный статус %s",
+                vacancy_id,
+                new_count,
+                MAX_CORRUPT_ATTEMPTS,
+                STATUS_CORRUPT,
+            )
+            self._connection.execute(
+                "UPDATE vacancy SET status = ?, description = NULL, score = NULL, "
+                "score_detail = NULL, enrich_attempts = 0, corrupt_count = ?, "
+                "corrupt_payload = ? WHERE id = ?",
+                (STATUS_CORRUPT, new_count, payload, vacancy_id),
+            )
+        else:
+            self._connection.execute(
+                "UPDATE vacancy SET description = NULL, score = NULL, score_detail = NULL, "
+                "enrich_attempts = 0, corrupt_count = ?, corrupt_payload = ? WHERE id = ?",
+                (new_count, payload, vacancy_id),
+            )
+        self._connection.commit()
 
     def mark_reported(self, ids: Sequence[str]) -> None:
         if not ids:
