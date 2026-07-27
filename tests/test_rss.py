@@ -57,6 +57,15 @@ def test_parse_salary_ignores_trailing_words_after_currency(
     assert parse_salary(raw).currency == expected_currency
 
 
+def test_parse_salary_range_without_currency_yields_none() -> None:
+    salary = parse_salary("от 200 000 до 300 000")
+    assert (salary.amount_from, salary.amount_to, salary.currency) == (200000, 300000, None)
+
+
+def test_parse_salary_ignores_periodicity_suffix() -> None:
+    assert parse_salary("от 100 000 ₽ в месяц").currency == "₽"
+
+
 def test_parse_feed_extracts_every_item() -> None:
     vacancies = parse_feed(FIXTURE.read_text(encoding="utf-8"), "Yocto")
     assert len(vacancies) == 20

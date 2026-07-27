@@ -14,7 +14,6 @@ _REGION_RE = re.compile(r"Регион:\s*([^<]+)")
 _INCOME_RE = re.compile(r"дохода:\s*([^<]+)")
 _FROM_RE = re.compile(r"от\s*([\d\s ]+)")
 _TO_RE = re.compile(r"до\s*([\d\s ]+)")
-_CURRENCY_RE = re.compile(r"\d[\d\s ]*\s*([^\d\s]+)")
 _DIGITS_ONLY = re.compile(r"[\s ]")
 
 
@@ -33,6 +32,14 @@ def build_rss_url(query: QuerySpec) -> str:
     return f"{RSS_BASE_URL}?{urlencode(params)}"
 
 
+def _currency_after_last_number(text: str) -> str | None:
+    digits = list(re.finditer(r"\d", text))
+    if not digits:
+        return None
+    tail = text[digits[-1].end() :].strip()
+    return tail.split(maxsplit=1)[0] if tail else None
+
+
 def parse_salary(raw: str) -> Salary:
     text = (raw or "").strip()
     if not text or "не указан" in text:
@@ -44,12 +51,11 @@ def parse_salary(raw: str) -> Salary:
         digits = _DIGITS_ONLY.sub("", match.group(1))
         return int(digits) if digits.isdigit() else None
 
-    currency_matches = _CURRENCY_RE.findall(text)
     return Salary(
         raw=text,
         amount_from=to_int(_FROM_RE.search(text)),
         amount_to=to_int(_TO_RE.search(text)),
-        currency=currency_matches[-1] if currency_matches else None,
+        currency=_currency_after_last_number(text),
     )
 
 
