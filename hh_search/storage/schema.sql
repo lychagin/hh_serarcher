@@ -21,9 +21,19 @@ CREATE TABLE IF NOT EXISTS vacancy (
     reject_reason   TEXT,
     first_seen_at   TEXT NOT NULL,
     reported_at     TEXT,
-    corrupt_count   INTEGER NOT NULL DEFAULT 0,
+    -- Улики: исходное значение score_detail, которое не удалось
+    -- прочитать. Пишется через COALESCE (первая порча не затирается
+    -- последующими) и BLOB, а не TEXT, — payload может сам быть
+    -- невалидным UTF-8. Счётчика попыток рядом нет сознательно: он
+    -- ограничивал сетевой цикл переобогащения, а порча оценки больше
+    -- не приводит к обращениям в сеть (см. quarantine.py).
     corrupt_payload BLOB
 );
+
+-- Три состояния строки со status = 'new' различаются только парой
+-- (description, score_detail) и разбираются тремя непересекающимися
+-- выборками репозитория; description после первой записи не обнуляет
+-- никто, поэтому страница вакансии скачивается не более одного раза.
 
 CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);
 

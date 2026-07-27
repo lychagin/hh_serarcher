@@ -1,5 +1,3 @@
-import json
-import logging
 import sqlite3
 from collections.abc import Iterable, Sequence
 from datetime import datetime
@@ -12,7 +10,9 @@ from hh_search.domain.models import (
     ScoredVacancy,
     VacancyDetails,
 )
-from hh_search.storage.mappers import decode_optional_text, decode_text, to_discovered
+from hh_search.storage.mappers import to_discovered, to_scored, to_scoring_task
+from hh_search.storage.migrations import migrate
+from hh_search.storage.quarantine import Quarantine, safe_rows
 from hh_search.storage.run_log import RunLog
 from hh_search.storage.time_utils import now_iso, to_utc_iso
 
@@ -21,44 +21,38 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 STATUS_NEW = "new"
 STATUS_REJECTED = "rejected"
 STATUS_REPORTED = "reported"
-# Терминальный статус: вакансия исчерпала MAX_CORRUPT_ATTEMPTS попыток
-# самовосстановления (см. _quarantine) и больше не возвращается в очередь.
-STATUS_CORRUPT = "corrupt"
 
-# Порог попыток карантина на одну вакансию, после которого self-heal
-# сменяется терминальным статусом — без него системная порча (например,
-# несовместимая после эволюции схема ScoreBreakdown) вечно перекачивает
-# и переоценивает весь бэклог.
-MAX_CORRUPT_ATTEMPTS = 3
-
-# Колонки, из которых строится DiscoveredVacancy. Текстовые обёрнуты в
-# CAST(... AS BLOB): sqlite3 декодирует TEXT-колонки в UTF-8 на этапе
-# fetch, до того как код увидит хоть одну строку, — битые байты в любой
-# из них роняют ВЕСЬ курсор, а не одну строку. BLOB отдаёт сырые байты,
-# decode переносится в mappers.to_discovered, где его можно поймать
-# точечно per-row.
+# Колонки, из которых строится DiscoveredVacancy. Обёрнуты в CAST(... AS
+# BLOB) ВСЕ до единой: sqlite3 декодирует TEXT-значение на этапе fetch,
+# до того как код увидит хоть одну строку, — битые байты в любой колонке
+# роняют ВЕСЬ курсор. Числовые не исключение: SQLite типизирован
+# динамически, в INTEGER-колонке может лежать текст. BLOB отдаёт сырые
+# байты, разбор переезжает в mappers, где его ловит safe_rows. `id`
+# обёрнут наравне с остальными: иначе испорченный первичный ключ
+# навсегда убивает и очередь, и отчёт, а так карантин адресует строку
+# через WHERE CAST(id AS BLOB) = ?.
 _DISCOVERED_COLUMNS_SQL = (
-    "id, CAST(url AS BLOB) AS url, CAST(title AS BLOB) AS title, "
+    "CAST(id AS BLOB) AS id, CAST(url AS BLOB) AS url, CAST(title AS BLOB) AS title, "
     "CAST(company AS BLOB) AS company, CAST(area AS BLOB) AS area, "
-    "CAST(salary_raw AS BLOB) AS salary_raw, salary_from, salary_to, "
+    "CAST(salary_raw AS BLOB) AS salary_raw, CAST(salary_from AS BLOB) AS salary_from, "
+    "CAST(salary_to AS BLOB) AS salary_to, "
     "CAST(salary_currency AS BLOB) AS salary_currency, "
     "CAST(published_at AS BLOB) AS published_at, "
     "CAST(primary_query AS BLOB) AS primary_query"
 )
 
-# TypeError — json.loads(None) при score_detail = NULL. ValueError —
-# общий предок JSONDecodeError, UnicodeDecodeError и pydantic
-# ValidationError (все три — его подклассы), т.е. любая ожидаемая форма
-# порчи данных. Не Exception: ошибка в самом коде (например, опечатка в
-# ScoreBreakdown.model_validate) не является порчей данных и обязана
-# упасть громко, а не тихо закарантинить здоровую вакансию.
-_CORRUPTION_EXCEPTIONS = (TypeError, ValueError)
-
-logger = logging.getLogger(__name__)
-
 
 class SqliteRepository:
     """Единственное место в проекте, где живёт SQL.
+
+    Для `status = 'new'` определены три непересекающиеся выборки, вместе
+    покрывающие все состояния, кроме исчерпавших попытки скачивания:
+    `pending_enrichment` (описания нет — надо в сеть), `pending_scoring`
+    (описание есть, оценки нет — надо пересчитать локально) и
+    `unreported` (заполнено обе — готово к отправке). Отсюда инвариант
+    модуля: раз записанное `description` не обнуляет ни одна выборка и
+    ни один путь обработки порчи, поэтому страница вакансии скачивается
+    не более одного раза за всю жизнь.
 
     Журнал прогонов и HTTP-кэш вынесены в `run_log.RunLog` (тот же
     `sqlite3.Connection`) ради размера файла; инвариант «весь SQL — в
@@ -70,6 +64,7 @@ class SqliteRepository:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._run_log = RunLog(self._connection)
+        self._quarantine = Quarantine(self._connection)
 
     def __enter__(self) -> "SqliteRepository":
         return self
@@ -86,7 +81,13 @@ class SqliteRepository:
         self._connection.close()
 
     def init_schema(self) -> None:
+        """Создать схему и догнать существующую базу до неё.
+
+        Второе обязательно: база персистентна, а `CREATE TABLE IF NOT
+        EXISTS` на уже существующей таблице не добавляет новых колонок.
+        """
         self._connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        migrate(self._connection)
         self._connection.commit()
 
     # --- discovery -----------------------------------------------------
@@ -158,36 +159,21 @@ class SqliteRepository:
         )
         self._connection.commit()
 
-    # --- enrichment ----------------------------------------------------
+    # --- 1: обогащение, единственная выборка, ходящая в сеть -------------
 
     def pending_enrichment(self, max_attempts: int) -> list[DiscoveredVacancy]:
         rows = self._connection.execute(
-            f"SELECT {_DISCOVERED_COLUMNS_SQL}, corrupt_count FROM vacancy "
+            f"SELECT {_DISCOVERED_COLUMNS_SQL} FROM vacancy "
             "WHERE status = ? AND description IS NULL AND enrich_attempts < ? "
             "ORDER BY published_at DESC",
             (STATUS_NEW, max_attempts),
         ).fetchall()
-        result: list[DiscoveredVacancy] = []
-        for row in rows:
-            try:
-                result.append(to_discovered(row))
-            except _CORRUPTION_EXCEPTIONS:
-                logger.error(
-                    "вакансия %s: данные обнаружения повреждены", row["id"], exc_info=True
-                )
-                self._quarantine(row["id"], int(row["corrupt_count"]), payload=None)
-        return result
+        return safe_rows(rows, to_discovered, self._quarantine)
 
     def save_enriched(
         self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
     ) -> None:
-        """Единственный способ сохранить обогащение — один UPDATE, одна
-        транзакция. Раньше это были save_details + save_score по отдельности;
-        крах между ними оставлял вакансию с описанием, но без оценки —
-        невидимой ни для pending_enrichment, ни для unreported. Здесь такой
-        промежуточной строки не существует: либо записаны обе колонки,
-        либо ни одна.
-        """
+        """Описание и оценка одним UPDATE — обычный путь после скачивания."""
         self._connection.execute(
             "UPDATE vacancy SET description = ?, fetched_at = ?, score = ?, score_detail = ? "
             "WHERE id = ?",
@@ -205,78 +191,42 @@ class SqliteRepository:
         ).fetchone()
         return int(row["enrich_attempts"]) if row else 0
 
-    # --- scoring and reporting -----------------------------------------
+    # --- 2: пересчёт оценки, сеть не задействуется -----------------------
+
+    def pending_scoring(self) -> list[tuple[DiscoveredVacancy, VacancyDetails]]:
+        """Описание есть, оценки нет: пересчитать локально.
+
+        Ровно та щель, через которую вакансия раньше проваливалась мимо
+        обеих выборок, — теперь это явное состояние со своей очередью, а
+        не повод идти за уже скачанной страницей второй раз.
+        """
+        rows = self._connection.execute(
+            f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description "
+            "FROM vacancy WHERE status = ? AND description IS NOT NULL "
+            "AND score_detail IS NULL ORDER BY published_at DESC",
+            (STATUS_NEW,),
+        ).fetchall()
+        return safe_rows(rows, to_scoring_task, self._quarantine)
+
+    def save_score(self, vacancy_id: str, score: ScoreBreakdown) -> None:
+        """Записать пересчитанную оценку, не трогая описание."""
+        self._connection.execute(
+            "UPDATE vacancy SET score = ?, score_detail = ? WHERE id = ?",
+            (score.total, score.model_dump_json(), vacancy_id),
+        )
+        self._connection.commit()
+
+    # --- 3: отчёт --------------------------------------------------------
 
     def unreported(self) -> list[ScoredVacancy]:
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
-            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail, "
-            "corrupt_count FROM vacancy "
-            "WHERE status = ? AND score IS NOT NULL AND description IS NOT NULL "
-            "ORDER BY score DESC",
+            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
+            "FROM vacancy WHERE status = ? AND description IS NOT NULL "
+            "AND score_detail IS NOT NULL ORDER BY score DESC",
             (STATUS_NEW,),
         ).fetchall()
-        result: list[ScoredVacancy] = []
-        for row in rows:
-            raw_score_detail = row["score_detail"]
-            try:
-                text = decode_optional_text(raw_score_detail)
-                if text is None:
-                    raise TypeError("score_detail is NULL")
-                score = ScoreBreakdown.model_validate(json.loads(text))
-                result.append(
-                    ScoredVacancy(
-                        discovered=to_discovered(row),
-                        details=VacancyDetails(description=decode_text(row["description"])),
-                        score=score,
-                        cluster=decode_optional_text(row["cluster"]) or "",
-                    )
-                )
-            except _CORRUPTION_EXCEPTIONS:
-                logger.error(
-                    "вакансия %s: данные повреждены, отправляем в карантин",
-                    row["id"],
-                    exc_info=True,
-                )
-                self._quarantine(row["id"], int(row["corrupt_count"]), raw_score_detail)
-        return result
-
-    def _quarantine(
-        self, vacancy_id: str, previous_corrupt_count: int, payload: bytes | None
-    ) -> None:
-        """Карантин — самовосстановление, ограниченное MAX_CORRUPT_ATTEMPTS.
-
-        До порога: description/score/score_detail обнуляются, enrich_attempts
-        сбрасывается (иначе вакансия могла упереться в max_attempts из-за
-        старых неудач скачивания, не связанных с этой порчей), status
-        остаётся 'new' — вакансия сама возвращается в pending_enrichment.
-        По достижении порога — терминальный STATUS_CORRUPT, из очереди
-        выведена насовсем, с единственной записью в лог. В обоих случаях
-        исходный payload сохраняется в corrupt_payload, а не теряется.
-        """
-        new_count = previous_corrupt_count + 1
-        if new_count >= MAX_CORRUPT_ATTEMPTS:
-            logger.error(
-                "вакансия %s: превышен лимит восстановлений (%s из %s), "
-                "переводим в терминальный статус %s",
-                vacancy_id,
-                new_count,
-                MAX_CORRUPT_ATTEMPTS,
-                STATUS_CORRUPT,
-            )
-            self._connection.execute(
-                "UPDATE vacancy SET status = ?, description = NULL, score = NULL, "
-                "score_detail = NULL, enrich_attempts = 0, corrupt_count = ?, "
-                "corrupt_payload = ? WHERE id = ?",
-                (STATUS_CORRUPT, new_count, payload, vacancy_id),
-            )
-        else:
-            self._connection.execute(
-                "UPDATE vacancy SET description = NULL, score = NULL, score_detail = NULL, "
-                "enrich_attempts = 0, corrupt_count = ?, corrupt_payload = ? WHERE id = ?",
-                (new_count, payload, vacancy_id),
-            )
-        self._connection.commit()
+        return safe_rows(rows, to_scored, self._quarantine)
 
     def mark_reported(self, ids: Sequence[str]) -> None:
         if not ids:
