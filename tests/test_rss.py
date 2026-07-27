@@ -62,6 +62,15 @@ def test_parse_salary_range_without_currency_yields_none() -> None:
     assert (salary.amount_from, salary.amount_to, salary.currency) == (200000, 300000, None)
 
 
+def test_parse_salary_ignores_digit_appearing_after_currency() -> None:
+    salary = parse_salary("от 100 000 ₽, обсуждается на собеседовании 2")
+    assert salary.currency == "₽"
+
+
+def test_parse_salary_handles_currency_glued_to_amount() -> None:
+    assert parse_salary("от 100 000₽").currency == "₽"
+
+
 def test_parse_salary_ignores_periodicity_suffix() -> None:
     assert parse_salary("от 100 000 ₽ в месяц").currency == "₽"
 

@@ -32,12 +32,16 @@ def build_rss_url(query: QuerySpec) -> str:
     return f"{RSS_BASE_URL}?{urlencode(params)}"
 
 
-def _currency_after_last_number(text: str) -> str | None:
-    digits = list(re.finditer(r"\d", text))
-    if not digits:
+def _currency_after_amount(
+    text: str, from_match: re.Match[str] | None, to_match: re.Match[str] | None
+) -> str | None:
+    ends = [m.end() for m in (from_match, to_match) if m is not None]
+    if not ends:
         return None
-    tail = text[digits[-1].end() :].strip()
-    return tail.split(maxsplit=1)[0] if tail else None
+    tail = text[max(ends) :].strip()
+    if not tail:
+        return None
+    return tail.split(maxsplit=1)[0].rstrip(",;")
 
 
 def parse_salary(raw: str) -> Salary:
@@ -51,11 +55,13 @@ def parse_salary(raw: str) -> Salary:
         digits = _DIGITS_ONLY.sub("", match.group(1))
         return int(digits) if digits.isdigit() else None
 
+    from_match = _FROM_RE.search(text)
+    to_match = _TO_RE.search(text)
     return Salary(
         raw=text,
-        amount_from=to_int(_FROM_RE.search(text)),
-        amount_to=to_int(_TO_RE.search(text)),
-        currency=_currency_after_last_number(text),
+        amount_from=to_int(from_match),
+        amount_to=to_int(to_match),
+        currency=_currency_after_amount(text, from_match, to_match),
     )
 
 
