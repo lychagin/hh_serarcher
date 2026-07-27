@@ -19,6 +19,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["hh_search"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"hh_search/storage/schema.sql" = "hh_search/storage/schema.sql"
+
 [tool.pytest.ini_options]
 markers = ["network: ходит в живой hh.ru; в CI пропускается"]
 addopts = "-m 'not network'"
