@@ -12,8 +12,23 @@ _ID_RE = re.compile(r"/vacancy/(\d+)")
 _COMPANY_RE = re.compile(r"Вакансия компании:\s*([^<]+)")
 _REGION_RE = re.compile(r"Регион:\s*([^<]+)")
 _INCOME_RE = re.compile(r"дохода:\s*([^<]+)")
-_FROM_RE = re.compile(r"от\s*([\d\s ]+)")
-_TO_RE = re.compile(r"до\s*([\d\s ]+)")
+
+# Числовой литерал суммы: обязательно хотя бы одна цифра (иначе совпадение-пустышка
+# вроде «до » в «до вычета налогов» стало бы якорем для валюты), опциональный знак и
+# опциональная дробная часть — они входят в совпадение, но не в захваченную группу,
+# чтобы `_to_int` работал с чистыми цифрами. `\s` в str-паттернах Python уже покрывает
+# неразрывный пробел U+00A0, которым разделяет разряды hh.ru.
+_AMOUNT = r"(-?\d[\d\s]*)(?:[.,]\d+)?"
+# `(?<!\w)` не даёт зацепиться за «от»/«до» внутри слова («рабОТа», «ДОход»).
+_FROM_RE = re.compile(r"(?<!\w)от\s*" + _AMOUNT)
+_TO_RE = re.compile(r"(?<!\w)до\s*" + _AMOUNT)
+# Токен валюты не содержит ни цифр («₽5» → «₽»), ни слеша («₽/мес» → «₽»).
+_CURRENCY_RE = re.compile(r"[^\d\s/]+")
+_CURRENCY_LEADING = "([{"
+_CURRENCY_TRAILING = ",;:)]}"
+# Точка не обрезается (она часть «руб.»), но токен из одной пунктуации валютой не является.
+# Символы валют ($, €, ₽, ₸, ...) в набор сознательно не входят.
+_PUNCTUATION = ".,;:!?…()[]{}«»\"'-–—/\\"
 _DIGITS_ONLY = re.compile(r"[\s ]")
 
 
@@ -32,16 +47,44 @@ def build_rss_url(query: QuerySpec) -> str:
     return f"{RSS_BASE_URL}?{urlencode(params)}"
 
 
+def _last_amount(regex: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """Последнее совпадение суммы, а не первое: валюта стоит за самой правой суммой."""
+    matches = list(regex.finditer(text))
+    return matches[-1] if matches else None
+
+
+def _to_int(match: re.Match[str] | None) -> int | None:
+    if match is None:
+        return None
+    digits = _DIGITS_ONLY.sub("", match.group(1))
+    if not digits.isdigit():
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        # CPython отказывается конвертировать литералы длиннее 4300 цифр; битая лента
+        # не должна ронять разбор всех остальных вакансий.
+        return None
+
+
 def _currency_after_amount(
     text: str, from_match: re.Match[str] | None, to_match: re.Match[str] | None
 ) -> str | None:
+    """Валюта — первый бесцифровой токен после конца самого правого числового литерала.
+
+    Якорь существует только там, где регулярка суммы реально распознала число
+    (в `_AMOUNT` цифра обязательна), поэтому ни служебные слова диапазона, ни хвостовой
+    текст («до вычета налогов», «на руки»), ни посторонние цифры правее валюты
+    («обсуждается ... 2») сдвинуть точку отсчёта не могут.
+    """
     ends = [m.end() for m in (from_match, to_match) if m is not None]
     if not ends:
         return None
-    tail = text[max(ends) :].strip()
-    if not tail:
+    token_match = _CURRENCY_RE.match(text[max(ends) :].lstrip())
+    if token_match is None:
         return None
-    return tail.split(maxsplit=1)[0].rstrip(",;")
+    token = token_match.group().lstrip(_CURRENCY_LEADING).rstrip(_CURRENCY_TRAILING)
+    return token if token.strip(_PUNCTUATION) else None
 
 
 def parse_salary(raw: str) -> Salary:
@@ -49,18 +92,12 @@ def parse_salary(raw: str) -> Salary:
     if not text or "не указан" in text:
         return Salary(raw=text or None)
 
-    def to_int(match: re.Match[str] | None) -> int | None:
-        if match is None:
-            return None
-        digits = _DIGITS_ONLY.sub("", match.group(1))
-        return int(digits) if digits.isdigit() else None
-
-    from_match = _FROM_RE.search(text)
-    to_match = _TO_RE.search(text)
+    from_match = _last_amount(_FROM_RE, text)
+    to_match = _last_amount(_TO_RE, text)
     return Salary(
         raw=text,
-        amount_from=to_int(from_match),
-        amount_to=to_int(to_match),
+        amount_from=_to_int(from_match),
+        amount_to=_to_int(to_match),
         currency=_currency_after_amount(text, from_match, to_match),
     )
 

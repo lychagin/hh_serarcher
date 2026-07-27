@@ -75,6 +75,47 @@ def test_parse_salary_ignores_periodicity_suffix() -> None:
     assert parse_salary("от 100 000 ₽ в месяц").currency == "₽"
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("от 200 000 до 300 000", (200000, 300000, None)),
+        ("от 900 000 до 1 300 000 ₸", (900000, 1300000, "₸")),
+        ("от 250 000 ₽", (250000, None, "₽")),
+        ("от 200 000 до 300 000 руб. на руки", (200000, 300000, "руб.")),
+        ("до 2000 EUR на руки", (None, 2000, "EUR")),
+        ("от 100 000 ₽ в месяц", (100000, None, "₽")),
+        ("от 100 000", (100000, None, None)),
+        ("не указан", (None, None, None)),
+        ("", (None, None, None)),
+        ("от 100 000 ₽, обсуждается на собеседовании 2", (100000, None, "₽")),
+        ("от 100 000₽", (100000, None, "₽")),
+        # «до вычета налогов» — не сумма: якорь валюты не имеет права уехать за «₽».
+        ("от 100 000 ₽ до вычета налогов", (100000, None, "₽")),
+        # Несколько диапазонов: побеждает самая правая распознанная сумма.
+        ("от 100 000 до 200 000 или от 300 000 до 400 000 ₽", (300000, 400000, "₽")),
+        # Дробная часть входит в число (и отбрасывается), а не становится валютой.
+        ("от 100 000.50 ₽", (100000, None, "₽")),
+        # Отрицательная сумма не является суммой, но валюту это не ломает.
+        ("от -100 000 ₽", (None, None, "₽")),
+    ],
+)
+def test_parse_salary_control_table(
+    raw: str, expected: tuple[int | None, int | None, str | None]
+) -> None:
+    salary = parse_salary(raw)
+    assert (salary.amount_from, salary.amount_to, salary.currency) == expected
+
+
+def test_parse_salary_survives_absurdly_long_number() -> None:
+    assert parse_salary("от " + "1 " * 10_000 + "₽").amount_from is None
+
+
+def test_parse_salary_ignores_keyword_inside_word() -> None:
+    # «работ» содержит «от», но границей диапазона это слово не делает.
+    salary = parse_salary("оплата за 5 работ 100 000 ₽")
+    assert (salary.amount_from, salary.amount_to, salary.currency) == (None, None, None)
+
+
 def test_parse_feed_extracts_every_item() -> None:
     vacancies = parse_feed(FIXTURE.read_text(encoding="utf-8"), "Yocto")
     assert len(vacancies) == 20
