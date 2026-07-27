@@ -1,6 +1,7 @@
 import math
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,6 +13,11 @@ from hh_search.sources.http import PoliteClient
 
 URL = "https://hh.ru/search/vacancy/rss?text=Yocto"
 ROBOTS = "https://hh.ru/robots.txt"
+# Живой robots.txt hh.ru, скачанный один раз честным User-Agent. Тесты идут
+# на нём, а не на выдуманном: именно живые правила (`Disallow: *?*`,
+# `Disallow: /resume$`, `Allow: /vacancies/*?page=`) решают, какой источник
+# данных нам вообще доступен.
+LIVE_ROBOTS = (Path(__file__).parent / "fixtures" / "robots_hh.txt").read_text(encoding="utf-8")
 
 
 def make_client(**overrides: object) -> tuple[PoliteClient, list[float]]:
@@ -253,3 +259,192 @@ def test_retry_after_infinite_is_capped_at_300() -> None:
     assert response.status_code == 200
     assert route.call_count == 2
     assert 300.0 in slept
+
+
+# --- Раунд исправлений 3: robots.txt на живых правилах hh.ru ----------------
+#
+# Общая причина всех тестов ниже: urllib.robotparser не поддерживает
+# подстановочные знаки (RuleLine.applies_to == startswith по quote()-нутому
+# пути) и сравнивает только путь без query. На 765a1ba это делало живые
+# запреты hh.ru невидимыми, а respect_robots: true — декларацией.
+
+
+def live_robots_response() -> httpx.Response:
+    return httpx.Response(200, text=LIVE_ROBOTS, headers={"Content-Type": "text/plain"})
+
+
+@respx.mock
+def test_live_robots_forbids_rss_search() -> None:
+    """`Disallow: *?*` в секции User-agent: * запрещает ЛЮБОЙ URL с query-строкой,
+    то есть весь RSS-поиск. На 765a1ba шаблон превращался в '%2A%3F%2A' и не
+    совпадал ни с чем — запрос уходил на hh.ru как разрешённый."""
+    respx.get(ROBOTS).mock(return_value=live_robots_response())
+    rss = "https://hh.ru/search/vacancy/rss?text=Yocto&order_by=publication_time"
+    route = respx.get(rss).mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client(respect_robots=True)
+    with client, pytest.raises(RobotsDisallowed):
+        client.get(rss)
+    assert route.call_count == 0, "запрещённый URL не должен уходить в сеть"
+
+
+@respx.mock
+def test_live_robots_forbids_resume_by_dollar_anchor() -> None:
+    """`Disallow: /resume$` — якорь конца пути. stdlib его тоже не понимала."""
+    respx.get(ROBOTS).mock(return_value=live_robots_response())
+    respx.get("https://hh.ru/resume").mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client(respect_robots=True)
+    with client, pytest.raises(RobotsDisallowed):
+        client.get("https://hh.ru/resume")
+
+
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        ("https://hh.ru/vacancy/135586311", "страница вакансии: query нет, запрет *?* не бьёт"),
+        ("https://hh.ru/vacancies/programmist", "листинг без query — под запрет не попадает"),
+        (
+            "https://hh.ru/vacancies/programmist?page=2",
+            "Allow: /vacancies/*?page= (18 символов) длиннее Disallow: *?* (3) и побеждает",
+        ),
+        ("https://hh.ru/resumelike", "якорь $ не даёт /resume$ съесть более длинный путь"),
+    ],
+)
+@respx.mock
+def test_live_robots_allows_listing_and_vacancy_pages(url: str, reason: str) -> None:
+    """Разрешённые живыми правилами URL обязаны проходить.
+
+    Эти четыре случая — не дифференциальные (на 765a1ba матчер разрешал всё
+    подряд, поэтому они там зелёные). Их работа — сторожить, чтобы новый матчер
+    не свалился в противоположную крайность: на них строится переезд discovery
+    с RSS на листинг /vacancies/{slug} + ?page=N."""
+    respx.get(ROBOTS).mock(return_value=live_robots_response())
+    route = respx.get(url).mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client(respect_robots=True)
+    with client:
+        response = client.get(url)
+    assert response.status_code == 200, reason
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_redirect_to_another_host_rechecks_that_hosts_robots() -> None:
+    """hh.ru молча уводит региональные вакансии (Астана, Алматы, Минск) на
+    hh.kz/rabota.by. На 765a1ba follow_redirects=True проходил чужой хост
+    вообще без обращения к его robots.txt, а кэш из одного объекта подсовывал
+    правила hh.ru."""
+    respx.get(ROBOTS).mock(return_value=live_robots_response())
+    foreign_robots = respx.get("https://hh.kz/robots.txt").mock(
+        return_value=httpx.Response(
+            200, text="User-agent: *\nDisallow: /\n", headers={"Content-Type": "text/plain"}
+        )
+    )
+    respx.get("https://hh.ru/vacancy/1").mock(
+        return_value=httpx.Response(302, headers={"Location": "https://hh.kz/vacancy/1"})
+    )
+    target = respx.get("https://hh.kz/vacancy/1").mock(
+        return_value=httpx.Response(200, text="ok")
+    )
+    client, _ = make_client(respect_robots=True)
+    with client, pytest.raises(RobotsDisallowed):
+        client.get("https://hh.ru/vacancy/1")
+    assert foreign_robots.call_count == 1, "robots.txt нового хоста обязан запрашиваться"
+    assert target.call_count == 0, "запрещённая чужим robots.txt страница не качается"
+
+
+@respx.mock
+def test_every_redirect_hop_is_throttled() -> None:
+    """Пауза между запросами обязана соблюдаться и для редиректов. На 765a1ba
+    httpx проходил цепочку внутри одного вызова, мимо _throttle: два запроса к
+    hh.ru уходили подряд без паузы."""
+    respx.get("https://hh.ru/vacancy/1").mock(
+        return_value=httpx.Response(301, headers={"Location": "https://hh.ru/vacancy/2"})
+    )
+    respx.get("https://hh.ru/vacancy/2").mock(return_value=httpx.Response(200, text="ok"))
+    client, slept = make_client(respect_robots=False, delay_between_requests_sec=0.5)
+    with client:
+        response = client.get("https://hh.ru/vacancy/1")
+    assert response.status_code == 200
+    assert slept, "между хопом редиректа и следующим запросом обязана быть пауза"
+    assert slept[0] == pytest.approx(0.5, abs=0.1)
+
+
+@respx.mock
+def test_redirect_loop_is_bounded() -> None:
+    """Кольцо редиректов не должно крутиться вечно."""
+    respx.get("https://hh.ru/a").mock(
+        return_value=httpx.Response(302, headers={"Location": "https://hh.ru/a"})
+    )
+    client, _ = make_client(respect_robots=False)
+    with client, pytest.raises(FetchFailed):
+        client.get("https://hh.ru/a")
+
+
+@respx.mock
+def test_robots_200_with_html_body_means_disallowed() -> None:
+    """Заглушка антибота, отданная со статусом 200, разбиралась в «правил нет»
+    и давала fail-open. Непонятное тело трактуется как недоступность."""
+    respx.get(ROBOTS).mock(
+        return_value=httpx.Response(
+            200,
+            text="<!DOCTYPE html><html><body>Проверка браузера</body></html>",
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        )
+    )
+    route = respx.get(URL).mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client(respect_robots=True)
+    with client, pytest.raises(RobotsDisallowed):
+        client.get(URL)
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_robots_cache_does_not_leak_between_hosts() -> None:
+    """Кэш robots — по origin, не один объект на клиента. На 765a1ba правила
+    первого хоста применялись ко всем последующим."""
+    ru_robots = respx.get(ROBOTS).mock(
+        return_value=httpx.Response(
+            200, text="User-agent: *\nDisallow: /kz/\n", headers={"Content-Type": "text/plain"}
+        )
+    )
+    kz_robots = respx.get("https://hh.kz/robots.txt").mock(
+        return_value=httpx.Response(
+            200, text="User-agent: *\nDisallow: /vacancy/\n", headers={"Content-Type": "text/plain"}
+        )
+    )
+    respx.get("https://hh.ru/vacancy/1").mock(return_value=httpx.Response(200, text="ok"))
+    respx.get("https://hh.ru/vacancy/2").mock(return_value=httpx.Response(200, text="ok"))
+    respx.get("https://hh.kz/vacancy/1").mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client(respect_robots=True)
+    with client:
+        assert client.get("https://hh.ru/vacancy/1").status_code == 200
+        assert client.get("https://hh.ru/vacancy/2").status_code == 200
+        with pytest.raises(RobotsDisallowed):
+            client.get("https://hh.kz/vacancy/1")
+    assert ru_robots.call_count == 1, "robots одного хоста качается ровно один раз"
+    assert kz_robots.call_count == 1, "у нового хоста спрашивается его собственный robots"
+
+
+@respx.mock
+def test_group_for_our_user_agent_wins_over_star() -> None:
+    """Группа выбирается по токену продукта регистронезависимо; несколько строк
+    User-agent подряд задают одну группу."""
+    respx.get(ROBOTS).mock(
+        return_value=httpx.Response(
+            200,
+            text=(
+                "User-agent: *\n"
+                "Disallow: /\n"
+                "\n"
+                "User-agent: SomeoneElse\n"
+                "User-agent: HH-Search\n"
+                "Disallow: /private/\n"
+            ),
+            headers={"Content-Type": "text/plain"},
+        )
+    )
+    respx.get("https://hh.ru/vacancy/1").mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client(respect_robots=True)
+    with client:
+        assert client.get("https://hh.ru/vacancy/1").status_code == 200
+        with pytest.raises(RobotsDisallowed):
+            client.get("https://hh.ru/private/x")

@@ -1,0 +1,186 @@
+User-agent: Yandex
+Allow: /vacancies/*?page=
+Allow: /vacancies/*?*&page=
+Disallow: /auth/*
+Disallow: /login
+Disallow: /account/*
+Disallow: /area_switcher*
+Disallow: /search/resume/advanced
+Disallow: /rss/*
+Disallow: /admin/*
+Disallow: /away
+Disallow: /vrsurvey/survey_thank_you_page
+Disallow: /chat
+Disallow: /article/22266
+Disallow: /mentors/profile
+Disallow: /resume$
+Disallow: /resume?*
+Disallow: /*?page=
+Disallow: /*?*&page=
+Clean-param: 8&L_is_autosearch&L_lenient&L_profession_id&L_save_area&Python&_cn_direct&_cn_profile&_cn_task&a&accept_temporary&action&active&activeTab&actual-format&ad-session-id&adays&added&adfox-version&admitad_uid&adname&adposition&advert&advertising_id&advice&af_ad_format&af_ad_tran_id&af_adset_id&af_c_idaf_click_lookback&af_deeplink&af_dp&af_inactivity_window&af_js_web&af_prt&af_reengagement_window&af_siteid&af_ss_ui&af_ss_ver&af_sub5&after_logi&age&age_from&age_to&agreementId&allVacancies
+Clean-param: amp;hhtmFrom&anchor&apc&ape&applicant&applicant_youth_vacancies_main&approval_prompt&archived&area&areaId&areas&artem&articleId&asset-click&assist_payment_ss&at&authMethod&automation&autoplay&autotarget_response&autotarget_tresponse&b&backUrl&back_redirect&backurl&banner-id&banner-sizes&banner-test-tags&baobab_event_id&behaviour&billId&billnumber&block&bottom_left_lat&bottom_left_lng&brid&browse_mode&business_trip_readiness&c&cache_ttl_sec&callDirection&calltouch_tm&campaign
+Clean-param: candidateId&candidateTopicId&cartId&category&categoryIds&chatId&chat_alias&chat_id&chatik&citizenship&clckid&click-time&clickType&clickedSuggestId&clickid&clid&client_id&client_type&clubId&clusters&cn&code&code_card&collection&collectionFilter&collectionId&compensationCurrencyCode&constructor-rendered-assets&contactType&contactsOpened&context_predicted_vacancy_id&context_vacancy_id&ctime&currency_code&currentRegionId&current_employer_id&customDomain&datasetName&date&date_from
+Clean-param: date_to&debug_2&deep_link_value&default_area&desireableCompensation&device&device_id&deviceid&disableBrowserCache&disableGlobalInfoCollect&display&distance&district&divisionId&dl_command&doPreview&domain&domainAreaId&dpt&draftId&driverLicenseType&driver_license_types&duid&e&edit&education&education_level&education_levels&emailVerification&email_hash&employer&employerEmailConfirmation&employerId&employerManagerId&employerState&employer_id&employer_profile_menu&employment
+Clean-param: employment_form&empty&enable_experiment&enable_sn&enable_snippets&endDate&entrypoint&erid&error&etext&event_id&excludeArchived&excludeClosed&exclude_closed&exclude_suitable_hidden&excluded_text&exists&exp&exp_company_size&exp_industry&exp_period&experience&ext-uniq-id&fail&fbclid&feedbackSent&field&filter&filterText&filter_exp_industry&filter_exp_period&firstName&flnk&fmode&folder&forceQuickResponse&forceResumeCreation&force_excluded_resume&force_login&from&fromArticle&fromBlock
+Clean-param: fromDraftId&fromOauth&fromPage&fromResponsePage&fromResponsesPage&fromSearch&fromSearchLine&fromService&from_api&from_delete&from_label&funnelId&gad_campaignid&gad_source&gaid&gbraid&gcmes&gcmlg&gender&geocode_type&google_aid&groupId&grouping&grpos&hasVacanciesLink&has_epgu_auth_try&hash&header&height&hhmobile_user_agent&hhmobile_uuid&hhtmFr&hhtmFro&hhtmFrom&hhtmFromLabel&hhtmSource&hhtmSourceLabel&hhtmfrom&hidden_filters&hideBinding&hide_title&hit-log-id&hl&host&httmFrom&icookie&id
+Clean-param: idfa&ignoreStepRestore&include_all_folders&industry&interviewedTopicId&isApp&isDefaultArea&isEmployerLogin&isFromOauth&isGift&isMap&isMultiAccount&isNewResume&isShowMCP&is_part_time_clusters_enabled&is_retargeting&itemsOnPage&items_on_page&j2mtags&job_search_status&job_search_status_changed_by_user&key&keyno&keyword&kind&l10n&la&label&lang&language&langv&lastArea&lastName&last_used_timestamp&letter&levelId&level_id&linkId&locale&logic&login&loginAs&loginkey&lr&m-message-click-id
+Clean-param: m-message-key-id&makeVacancyVisible&managerType&mark&media-test-tag&media_source&melonFashionTab&mentorId&mentorServiceId&messageId&meta&metro&mhh_redirect&mid&mime&moderation_mail&msgCode&needShortRoleExtensions&need_sec_link&neighbours&network&new_structure&noAccountFoundError&noRedirect&no_default_area&no_magic&no_redirect&nocookies&nonce&oauth&obnov&obnovresume&oid&only_with_salary&openStartTestModal&openedInsideChatik&order&order-id&orderBy&orderCode&order_by&ordered
+Clean-param: ordernumber&ored_clusters&originalVacancyId&originalurl&overRideDomainAreaId&p1&p2&p5&package&part_time&partnerHash&path&payMethod&payerdenial&paymentState&pcode-active-testids&pcodever&per_page&period&pf&phone&pid&pl&place&plim&pm_block&pm_position&polygon&pos&position&postponed&pr&precision&preparedTemplateId&profArea&profRoleId&profRoles&profession_experience&professional&professionalAreaId&professional_role&promocode&ptl&publicationId&published&publisher_id&puid1&puid53&puid54
+Clean-param: puid60&puid61&puid62&purpose&purposeId&query&r&rand&rank&rating_year&rb_clickid&reason&recommended_by_uid&redirectFailUrl&redirectTo&redirect_uri&ref&regionid&regions&relocation&rendered-direct-assets&report&reqId&requestId&response&response_type&responsesCount&responsesRequired&result&resume&resumeBuilderUrl&resumeFrom&resumeHash&resumeId&resumeTitle&resumeUrl&resume_hash&reviewId&roistat&roistat_param1&roistat_param2&roistat_param3&roistat_param4&roistat_param5&roistat_pos
+Clean-param: roistat_referrer&roistat_visit&role&rqs&rs&rsv_result&rte&runAction&s&salary&salary_frequency&salary_from&salary_mode&salary_to&saved_search_id&schedule&scid&scope&screen_name&scroll_target&search&searchPeriod&searchRid&searchSessionId&searchText&search_domain&search_field&search_period&search_source&sec_link_scene&section&selectPublicationType&selectedApprovalStatus&selectedArchivationType&selectedAreaId&selectedManagerId&selectedVacancyPublicationFormat&selectedVacancyVisibility
+Clean-param: send_resumes_step&sent_date&serviceType&service_type&session_language&set_job_search_status&shareVacancy&show&showAntifraudModal&showClusters&showNotification&showOnlyNew&showOnlyNewResponses&showOnlyRelevantTopics&showOnlyWithVehicle&showReports&show_conditions&show_gifted_resume_contacts&sid&simhash&site&site_id&size&sj&skill&skillId&skill_id&skipSwitcher&skip_choose_account&social_site_code&sortBy&sort_point_lat&sort_point_lng&source&sozdannewresume&specialization&spm&src_pof&ssp
+Clean-param: st&startedWithQuestion&stat-id&state&statid&status&step&stepName&stl&sub&sub2&sub3&sub4&successScheduled&suggestId&suggestedRegionId&surveyProfession&surveyType&swnt&t&tab&tagid&target&targetUrl&tclick&telegram_id&template&templateId&templateType&test-tag&testGuid&text&tgWebAppData&tgWebAppPlatform&tgWebAppThemeParams&tgWebAppVersion&tgclid&theme&tld&tm&to&toAnother&token&toolsVisible&top_right_lat&top_right_lng&topicId&totalSearchesInLetter&totalVacancies&total_searches_in_letter
+Clean-param: total_vacancies_in_letter&tresponse&trk&type&uc&university&untrustedEmployer&url&useKama&use_autologin&use_external_browser&userType&user_id&user_type&utm&utm_area&utm_campaign&utm_client&utm_content&utm_department&utm_exp_group&utm_fk&utm_id&utm_keyword&utm_local_campaign&utm_match_type&utm_matched_keyword&utm_medium&utm_name&utm_oid&utm_reader&utm_redirect_vacancy_id&utm_referrer&utm_region_id&utm_sitelink_id&utm_source&utm_source_domain&utm_source_service&utm_specialization
+Clean-param: utm_subsource_type&utm_term&utm_vacancy&utm_vacancy_id&utmb&vacanciesFilter&vacanciesNotRequired&vacanciesRequired&vacancy&vacancyId&vacancyName&vacancyNameField&vacancy_id&vacancy_response&verificationId&verified_languages&verified_skills&version&visible&volgograd&vrResponseHash&vss&wid&widget&width&withBacklink&withTopFilterCatalog&work_format&work_schedule_by_days&work_ticket&working_hours&yandexuid&ybaip&yclid&yprqee
+
+User-agent: YandexDirect
+Allow: *?*
+Disallow: /login
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: Googlebot
+Allow: *?u*
+Allow: *?currencyCode*
+Allow: *?vacancyId*
+Allow: /account/signup*
+Allow: /vacancies/*?page=
+Allow: /vacancies/*?*&page=
+Disallow: /auth/*
+Disallow: /login
+Disallow: /account/*
+Disallow: /area_switcher*
+Disallow: /search/resume/advanced
+Disallow: /rss/*
+Disallow: /admin/*
+Disallow: /away
+Disallow: /vrsurvey/survey_thank_you_page
+Disallow: /chat
+Disallow: /article/22266
+Disallow: *?*
+Disallow: /mentors/profile
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: AdsBot-Google
+Allow: /account/signup*
+Disallow: /login
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: AdsBot-Google-Mobile
+Allow: /account/signup*
+Disallow: /login
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: LCC
+Disallow: /
+
+User-agent: ltx71 - (http://ltx71.com/)
+Disallow: /
+
+User-agent: bingbot
+Crawl-delay: 60
+Allow: *?u*
+Allow: *?currencyCode*
+Allow: *?vacancyId*
+Allow: /vacancies/*?page=
+Allow: /vacancies/*?*&page=
+Disallow: /auth/*
+Disallow: /login
+Disallow: /account/*
+Disallow: /area_switcher*
+Disallow: /search/resume/advanced
+Disallow: /rss/*
+Disallow: /admin/*
+Disallow: /away
+Disallow: /vrsurvey/survey_thank_you_page
+Disallow: /chat
+Disallow: /article/22266
+Disallow: *?*
+Disallow: /mentors/profile
+Disallow: /resume$
+Disallow: /resume?*
+
+
+User-agent: GPTBot
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: Claude-Web
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: ClaudeBot
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: ChatGPT-User
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: Google-Extended
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: FacebookBot
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: OAI-SearchBot
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: OAI-Fetcher
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: Anthropic-ai
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: CCBot
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+User-agent: PerplexityBot
+Disallow: /vacancy/*
+Disallow: /resume$
+Disallow: /resume?*
+
+
+User-agent: *
+Allow: *?u*
+Allow: *?currencyCode*
+Allow: *?vacancyId*
+Allow: /vacancies/*?page=
+Allow: /vacancies/*?*&page=
+Disallow: /auth/*
+Disallow: /login
+Disallow: /account/*
+Disallow: /area_switcher*
+Disallow: /search/resume/advanced
+Disallow: /rss/*
+Disallow: /admin/*
+Disallow: /away
+Disallow: /vrsurvey/survey_thank_you_page
+Disallow: /chat
+Disallow: /article/22266
+Disallow: *?*
+Disallow: /mentors/profile
+Disallow: /resume$
+Disallow: /resume?*
+
+Host: https://hh.ru
+Sitemap: https://hh.ru/sitemap/main.xml
