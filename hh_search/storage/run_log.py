@@ -7,12 +7,25 @@
 только здесь.
 """
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 
+from hh_search.storage.mappers import decode_text
 from hh_search.storage.time_utils import now_iso, parse_utc, to_utc_iso
 
-ALLOWED_RUN_COUNTERS = {"discovered", "new_count", "rejected", "enriched", "reported", "error"}
+ALLOWED_RUN_COUNTERS = {
+    "discovered",
+    "new_count",
+    "rejected",
+    "enriched",
+    "reported",
+    "rescored",
+    "stuck",
+    "error",
+}
+
+logger = logging.getLogger(__name__)
 
 
 class RunLog:
@@ -48,25 +61,56 @@ class RunLog:
         self._connection.commit()
 
     def last_successful_run(self) -> datetime | None:
-        row = self._connection.execute(
-            "SELECT finished_at FROM run WHERE status IN ('ok', 'partial') "
-            "AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
-        ).fetchone()
-        return parse_utc(row["finished_at"]) if row else None
+        """Время последнего успешного прогона; от него зависит healthcheck.
+
+        Одна испорченная строка журнала не имеет права заклинить сервис
+        навсегда, поэтому здесь тот же приём, что и в выборках вакансий:
+        `CAST(... AS BLOB)` (иначе битый UTF-8 роняет весь курсор ещё на
+        fetch) плюс разбор по одной строке. Нечитаемая дата пропускается
+        с записью в лог, ответом становится ближайшая читаемая — сервис
+        в худшем случае считает себя протухшим, но остаётся живым.
+        LIMIT 1 убран намеренно: с ним битая верхняя строка означала бы
+        «успешных прогонов нет вовсе».
+        """
+        cursor = self._connection.execute(
+            "SELECT CAST(finished_at AS BLOB) AS finished_at FROM run "
+            "WHERE status IN ('ok', 'partial') AND finished_at IS NOT NULL "
+            "ORDER BY finished_at DESC"
+        )
+        for row in cursor:
+            raw = row["finished_at"]
+            try:
+                return parse_utc(decode_text(raw))
+            except ValueError:
+                logger.error(
+                    "журнал прогонов: finished_at = %r не разбирается как дата, строка пропущена",
+                    raw,
+                    exc_info=True,
+                )
+        return None
 
     # --- conditional requests ------------------------------------------
 
     def cache_headers(self, url: str) -> dict[str, str]:
+        """Валидаторы условного запроса; значения гарантированно `str`.
+
+        Без `CAST(... AS BLOB)` битый UTF-8 в кэше ронял бы fetch, а без
+        разбора здесь `bytes` уезжали бы прямо в HTTP-заголовок. Нечитаемый
+        валидатор просто не отправляется: худший исход — лишний полный
+        ответ вместо 304, а не сломанный запрос.
+        """
         row = self._connection.execute(
-            "SELECT etag, last_modified FROM http_cache WHERE url = ?", (url,)
+            "SELECT CAST(etag AS BLOB) AS etag, "
+            "CAST(last_modified AS BLOB) AS last_modified FROM http_cache WHERE url = ?",
+            (url,),
         ).fetchone()
         if row is None:
             return {}
         headers: dict[str, str] = {}
-        if row["etag"]:
-            headers["If-None-Match"] = row["etag"]
-        if row["last_modified"]:
-            headers["If-Modified-Since"] = row["last_modified"]
+        for header, column in (("If-None-Match", "etag"), ("If-Modified-Since", "last_modified")):
+            value = _safe_text(row[column], column)
+            if value:
+                headers[header] = value
         return headers
 
     def save_cache_headers(self, url: str, etag: str | None, last_modified: str | None) -> None:
@@ -85,3 +129,15 @@ class RunLog:
         """Явный сброс кэша — аварийный выход, если валидатор протух."""
         self._connection.execute("DELETE FROM http_cache WHERE url = ?", (url,))
         self._connection.commit()
+
+
+def _safe_text(value: bytes | str | None, column: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return decode_text(value)
+    except ValueError:
+        logger.error(
+            "http-кэш: колонка %s не декодируется (%r), валидатор не отправлен", column, value
+        )
+        return None

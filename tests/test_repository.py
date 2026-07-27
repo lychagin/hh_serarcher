@@ -4,10 +4,12 @@ import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+from pydantic import ValidationError
 
 from hh_search.domain.models import DiscoveredVacancy, Salary, ScoreBreakdown, VacancyDetails
+from hh_search.storage.migrations import ADDED_COLUMNS
 from hh_search.storage.quarantine import STATUS_CORRUPT
-from hh_search.storage.repository import SqliteRepository
+from hh_search.storage.repository import SCHEMA_PATH, SqliteRepository
 
 
 @pytest.fixture()
@@ -57,6 +59,14 @@ def read_column(db_path: str, column: str, vacancy_id: str) -> object:
     return None if row is None else row[0]
 
 
+def ids_with_status(db_path: str, status: str) -> set[str]:
+    """Строки в заданном статусе — сырым SQL, мимо любых выборок."""
+    raw = sqlite3.connect(db_path)
+    rows = raw.execute("SELECT id FROM vacancy WHERE status = ?", (status,)).fetchall()
+    raw.close()
+    return {str(row[0]) for row in rows}
+
+
 def test_add_discovered_reports_new_only_once(repo: SqliteRepository) -> None:
     assert repo.add_discovered(make_vacancy(), "embedded", 9) is True
     assert repo.add_discovered(make_vacancy(), "embedded", 9) is False
@@ -83,7 +93,7 @@ def test_rejected_vacancy_is_not_offered_for_enrichment(repo: SqliteRepository) 
 def test_pending_enrichment_skips_exhausted_attempts(repo: SqliteRepository) -> None:
     repo.add_discovered(make_vacancy(), "embedded", 9)
     for _ in range(3):
-        repo.bump_enrich_attempt("1")
+        repo.bump_enrich_attempt("1", max_attempts=3)
     assert repo.pending_enrichment(max_attempts=3) == []
 
 
@@ -267,8 +277,11 @@ def test_corrupt_score_self_heals_into_pending_scoring(tmp_path: object) -> None
     (например, после эволюции схемы ScoreBreakdown), после ОДНОГО вызова
     unreported() обязана оказаться в pending_scoring и НИ ОДНА — в
     pending_enrichment: описания целы, идти за ними в сеть незачем.
-    У вакансии "3" вдобавок исчерпаны попытки докачки (3 из 3) — на
-    локальный пересчёт это не влияет, потому что сеть не задействуется."""
+    У вакансии "3" вдобавок накоплены попытки докачки (3 при лимите 99) —
+    на локальный пересчёт это не влияет, потому что сеть не
+    задействуется. Лимит здесь заведомо не достигнут: с раунда 5 его
+    исчерпание переводит вакансию в терминальный `rejected`, и проверять
+    на такой строке локальный пересчёт было бы бессмысленно."""
     db_path = str(tmp_path) + "/test.db"
     repository = SqliteRepository(db_path)
     repository.init_schema()
@@ -276,7 +289,7 @@ def test_corrupt_score_self_heals_into_pending_scoring(tmp_path: object) -> None
         repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
         repository.save_enriched(vacancy_id, VacancyDetails(description="Yocto"), make_score())
     for _ in range(3):
-        repository.bump_enrich_attempt("3")
+        repository.bump_enrich_attempt("3", max_attempts=99)
     repository.close()
 
     raw = sqlite3.connect(db_path)
@@ -833,3 +846,381 @@ def test_three_selections_partition_the_new_vacancies(tmp_path: object) -> None:
     assert enrichment & reportable == set()
     assert enrichment | scoring | reportable == {"1", "2", "3"}
     repository.close()
+
+
+# --- Раунд исправлений 5 ------------------------------------------------
+
+
+def test_exhausted_attempts_become_rejected_within_one_call(tmp_path: object) -> None:
+    """A-C1: лимит попыток обязан жить ВНУТРИ хранилища.
+
+    Пока `bump_enrich_attempt` и `mark_rejected` были двумя отдельно
+    закоммиченными состояниями, между ними существовало состояние
+    «status = 'new', enrich_attempts >= max»: pending_enrichment отсекает
+    такую строку по счётчику, pending_scoring и unreported — по пустому
+    описанию. Вакансия исчезала навсегда, причём без всякой аварии —
+    достаточно было, чтобы конвейер не дошёл до второго вызова. Спека
+    §5.2 требует rejected/enrich_failed, и теперь это происходит тем же
+    оператором, что и инкремент."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+
+    assert repository.bump_enrich_attempt("1", max_attempts=3) == 1
+    assert read_column(db_path, "status", "1") == "new"
+    assert [v.id for v in repository.pending_enrichment(max_attempts=3)] == ["1"]
+
+    assert repository.bump_enrich_attempt("1", max_attempts=3) == 2
+    assert read_column(db_path, "status", "1") == "new"
+
+    assert repository.bump_enrich_attempt("1", max_attempts=3) == 3
+    # ни одного промежуточного состояния: счётчик и статус меняются вместе
+    assert read_column(db_path, "status", "1") == "rejected"
+    assert read_column(db_path, "reject_reason", "1") == "enrich_failed"
+    assert repository.pending_enrichment(max_attempts=3) == []
+    assert repository.pending_scoring() == []
+    assert repository.unreported() == []
+    repository.close()
+
+
+def test_every_new_vacancy_is_visible_to_exactly_one_selection(tmp_path: object) -> None:
+    """A-C1 + M-7: перебор ВСЕХ достижимых публичным API состояний.
+
+    Проверяется не «три выборки не пересекаются» (это старый тест умел), а
+    более сильное: множество строк со status = 'new' в точности равно
+    объединению трёх выборок. Именно это равенство нарушала дыра
+    A-C1 — строка была 'new' и не входила ни в одну выборку. Все
+    состояния создаются публичными вызовами, без единого UPDATE мимо
+    API: дыра воспроизводилась ровно так же."""
+    db_path = str(tmp_path) + "/states.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    limit = 3
+    everything = (
+        "нетронутая",
+        "попытки-остались",
+        "попытки-исчерпаны",
+        "описание-без-оценки",
+        "описание-и-оценка",
+        "отсеяна-префильтром",
+        "уже-отправлена",
+    )
+    for vacancy_id in everything:
+        repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+
+    repository.bump_enrich_attempt("попытки-остались", max_attempts=limit)
+    for _ in range(limit):
+        repository.bump_enrich_attempt("попытки-исчерпаны", max_attempts=limit)
+    repository.save_description("описание-без-оценки", VacancyDetails(description="Yocto"))
+    repository.save_enriched("описание-и-оценка", VacancyDetails(description="Yocto"), make_score())
+    repository.mark_rejected("отсеяна-префильтром", "стоп-слово")
+    repository.save_enriched("уже-отправлена", VacancyDetails(description="Yocto"), make_score())
+    repository.mark_reported(["уже-отправлена"])
+
+    enrichment = {v.id for v in repository.pending_enrichment(max_attempts=limit)}
+    scoring = {v.id for v, _ in repository.pending_scoring()}
+    reportable = {v.discovered.id for v in repository.unreported()}
+
+    assert enrichment == {"нетронутая", "попытки-остались"}
+    assert scoring == {"описание-без-оценки"}
+    assert reportable == {"описание-и-оценка"}
+    assert enrichment & scoring == set()
+    assert scoring & reportable == set()
+    assert enrichment & reportable == set()
+    # ключевое: ни одной 'new' строки за пределами трёх выборок
+    assert enrichment | scoring | reportable == ids_with_status(db_path, "new")
+    # исчерпавшая попытки не «пропала», а стала терминальной с причиной
+    assert read_column(db_path, "status", "попытки-исчерпаны") == "rejected"
+    assert read_column(db_path, "reject_reason", "попытки-исчерпаны") == "enrich_failed"
+    repository.close()
+
+
+def test_bump_does_not_resurrect_a_terminal_vacancy(tmp_path: object) -> None:
+    """Обратная сторона A-C1: смена статуса внутри инкремента не имеет
+    права переписать уже терминальный статус. Строка с нечитаемыми
+    discovery-данными (corrupt) — это улика, а не кандидат в rejected."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.close()
+
+    corrupt(db_path, "UPDATE vacancy SET status = ? WHERE id = ?", STATUS_CORRUPT, "1")
+
+    repository = SqliteRepository(db_path)
+    for _ in range(5):
+        repository.bump_enrich_attempt("1", max_attempts=3)
+    assert read_column(db_path, "status", "1") == STATUS_CORRUPT
+    assert read_column(db_path, "reject_reason", "1") is None
+    repository.close()
+
+
+def test_non_finite_score_is_rejected_at_construction(repo: SqliteRepository) -> None:
+    """A-I1: `inf`/`nan` пролезали в ScoreBreakdown без ошибок,
+    model_dump_json писал их как `null`, а `null` не проходил обратную
+    валидацию при чтении. Запись и чтение не были round-trip: вакансия
+    вечно ходила по кругу pending_scoring -> unreported -> карантин, в
+    отчёт не попадала никогда и писала ERROR каждый прогон. Достижимо
+    опечаткой в YAML (`penalty_per_signal: 1e400`), без порчи базы.
+    Починка в корне: нечитаемая оценка не может быть даже создана."""
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            make_score(total=bad)
+        with pytest.raises(ValidationError):
+            ScoreBreakdown(
+                title=1.0,
+                stack=bad,
+                responsibilities=0.5,
+                domain=1.0,
+                penalty=0.0,
+                total=10.0,
+            )
+        with pytest.raises(ValidationError):
+            ScoreBreakdown.model_validate(
+                {
+                    "total": bad,
+                    "title": 1.0,
+                    "stack": 0.5,
+                    "responsibilities": 0.5,
+                    "domain": 1.0,
+                    "penalty": 0.0,
+                }
+            )
+
+    # круговой прогон обычной оценки цел: то, что записано, читается
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    assert repo.unreported()[0].score == make_score()
+
+
+def test_save_enriched_keeps_description_when_score_cannot_be_serialized(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A-I2: `score.model_dump_json()` вычислялся В КОРТЕЖЕ параметров, то
+    есть до UPDATE. Отказ сериализации выбрасывал вместе с оценкой уже
+    скачанное описание — и следующий прогон снова шёл на hh.ru за той же
+    страницей. Ровно тот сетевой цикл, который убирал раунд 4. Теперь
+    описание сохраняется в любом случае, ошибка идёт наружу, а вакансия
+    ждёт локального пересчёта."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+
+    def broken_dump(*_args: object, **_kwargs: object) -> str:
+        raise ValueError("оценка не сериализуется")
+
+    monkeypatch.setattr(ScoreBreakdown, "model_dump_json", broken_dump)
+    with pytest.raises(ValueError, match="не сериализуется"):
+        repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    monkeypatch.undo()
+
+    assert read_column(db_path, "description", "1") == "Yocto"
+    assert read_column(db_path, "score_detail", "1") is None
+    # страница скачана и сохранена: в сеть за ней больше не идём
+    assert repository.pending_enrichment(max_attempts=3) == []
+    assert [v.id for v, _ in repository.pending_scoring()] == ["1"]
+    repository.close()
+
+
+def test_save_description_stores_the_page_without_a_score(repo: SqliteRepository) -> None:
+    """Публичный примитив для конвейера (Task 10): скоринг бросил
+    исключение — описание уже стоило запроса к hh.ru и обязано пережить
+    отказ чисто локального вычисления."""
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_description("1", VacancyDetails(description="Требуется Yocto"))
+
+    tasks = repo.pending_scoring()
+    assert [v.id for v, _ in tasks] == ["1"]
+    assert tasks[0][1].description == "Требуется Yocto"
+    assert repo.pending_enrichment(max_attempts=3) == []
+    assert repo.unreported() == []
+
+    repo.save_score("1", make_score())
+    assert [v.discovered.id for v in repo.unreported()] == ["1"]
+
+
+def test_unreported_shouts_when_the_scoring_queue_was_skipped(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Сторож очереди: хранилище не может заставить конвейер вызвать
+    pending_scoring(), но обязано не дать пропуску пройти незамеченным.
+    Каждая такая строка — вакансия, которая уже стоила запроса к hh.ru и
+    всё равно не попадёт ни в один отчёт."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repository.add_discovered(make_vacancy("2"), "embedded", 9)
+    repository.save_enriched("2", VacancyDetails(description="Yocto"), make_score(total=50.0))
+    repository.close()
+
+    corrupt(db_path, "UPDATE vacancy SET score = NULL, score_detail = NULL WHERE id = ?", "2")
+
+    repository = SqliteRepository(db_path)
+    with caplog.at_level(logging.ERROR):
+        result = repository.unreported()
+
+    assert [v.discovered.id for v in result] == ["1"]
+    assert "1 вакансий" in caplog.text
+    assert "pending_scoring()" in caplog.text
+
+    # очередь разобрана — сторож молчит
+    for vacancy, _ in repository.pending_scoring():
+        repository.save_score(vacancy.id, make_score(total=50.0))
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        assert len(repository.unreported()) == 2
+    assert caplog.text == ""
+    repository.close()
+
+
+def test_run_journal_accepts_rescoring_counters(tmp_path: object) -> None:
+    """Наблюдаемость «очередь пересчёта не сходится» — метрика прогона, а
+    не состояние на вакансии. Хранилище обязано её принять; заполнение —
+    обязанность конвейера (Task 10)."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    run_id = repository.start_run()
+    repository.finish_run(run_id, "ok", discovered=20, rescored=4, stuck=2)
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    row = raw.execute("SELECT rescored, stuck FROM run WHERE id = ?", (run_id,)).fetchone()
+    raw.close()
+    assert (row[0], row[1]) == (4, 2)
+
+
+def test_last_successful_run_survives_a_corrupt_journal(tmp_path: object) -> None:
+    """M-2: одна битая дата в журнале роняла last_successful_run (ValueError
+    на разборе или TypeError на байтах), а от него зависит healthcheck
+    (§8.2). Битая строка обязана пропускаться, а не заклинивать сервис
+    навсегда: в худшем случае сервис считает себя протухшим, но живёт."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    good = repository.start_run()
+    repository.finish_run(good, "ok", finished_at=datetime(2026, 7, 27, 10, 0, tzinfo=UTC))
+    garbage = repository.start_run()
+    repository.finish_run(garbage, "ok", finished_at=datetime(2026, 7, 27, 11, 0, tzinfo=UTC))
+    bad_bytes = repository.start_run()
+    repository.finish_run(bad_bytes, "ok", finished_at=datetime(2026, 7, 27, 12, 0, tzinfo=UTC))
+    repository.close()
+
+    # 'мусор' и невалидный UTF-8 сортируются ВЫШЕ валидных дат, поэтому
+    # обе битые строки встречаются раньше здоровой.
+    corrupt(db_path, "UPDATE run SET finished_at = 'мусор' WHERE id = ?", garbage)
+    corrupt(
+        db_path,
+        "UPDATE run SET finished_at = CAST(x'FFFEFA696E76616C6964' AS TEXT) WHERE id = ?",
+        bad_bytes,
+    )
+
+    repository = SqliteRepository(db_path)
+    assert repository.last_successful_run() == datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+    repository.close()
+
+
+def test_cache_headers_never_leak_bytes_into_http(tmp_path: object) -> None:
+    """M-2: битый валидатор уезжал в HTTP-заголовок как `bytes` (BLOB в
+    колонке) либо ронял fetch целиком (невалидный UTF-8 в TEXT). Значения
+    заголовков обязаны быть `str`; нечитаемый валидатор просто не
+    отправляется — худший исход полный ответ вместо 304."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    modified = "Wed, 21 Oct 2026 07:28:00 GMT"
+    repository.save_cache_headers("https://hh.ru/blob", '"v1"', modified)
+    repository.save_cache_headers("https://hh.ru/text", '"v2"', modified)
+    repository.close()
+
+    corrupt(db_path, "UPDATE http_cache SET etag = x'FFFEFA' WHERE url = ?", "https://hh.ru/blob")
+    corrupt(
+        db_path,
+        "UPDATE http_cache SET etag = CAST(x'FFFEFA696E76616C6964' AS TEXT) WHERE url = ?",
+        "https://hh.ru/text",
+    )
+
+    repository = SqliteRepository(db_path)
+    for url in ("https://hh.ru/blob", "https://hh.ru/text"):
+        headers = repository.cache_headers(url)
+        assert headers == {"If-Modified-Since": modified}
+        assert all(isinstance(value, str) for value in headers.values())
+    repository.close()
+
+
+def test_migration_backfills_primary_query_and_run_counters(tmp_path: object) -> None:
+    """M-3: ALTER TABLE ставит всем старым строкам primary_query = '', и
+    отчёт по мигрированной базе показывал бы пустой found_by_query —
+    возврат дефекта I2 (рассинхрон с кластером) для всех старых вакансий.
+    Реальные запросы лежат в vacancy_query, откуда их и надо взять."""
+    db_path = str(tmp_path) + "/old.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(FIRST_GENERATION_SCHEMA)
+    for vacancy_id in ("1", "2"):
+        raw.execute(
+            "INSERT INTO vacancy (id, url, title, published_at, status, first_seen_at) "
+            "VALUES (?, ?, 'Старая вакансия', '2026-07-27T09:00:00+00:00', 'new', "
+            "'2026-07-27T09:00:00+00:00')",
+            (vacancy_id, f"https://hh.ru/vacancy/{vacancy_id}"),
+        )
+    raw.executemany(
+        "INSERT INTO vacancy_query (vacancy_id, query) VALUES (?, ?)",
+        [("1", "Yocto"), ("2", "Yocto"), ("2", "Embedded Linux")],
+    )
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    for _ in range(3):  # идемпотентность: три старта сервиса подряд
+        repository.init_schema()
+
+    found = {v.id: v.found_by_query for v in repository.pending_enrichment(max_attempts=3)}
+    assert found == {"1": "Yocto", "2": "Embedded Linux"}  # при равных весах — детерминированно
+
+    # новые счётчики прогона тоже доехали до старой базы
+    run_id = repository.start_run()
+    repository.finish_run(run_id, "ok", rescored=1, stuck=2)
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    row = raw.execute("SELECT rescored, stuck FROM run WHERE id = ?", (run_id,)).fetchone()
+    raw.close()
+    assert (row[0], row[1]) == (1, 2)
+
+
+def test_added_columns_cover_every_column_of_the_current_schema() -> None:
+    """M-5: колонка, добавленная в schema.sql без строки в ADDED_COLUMNS,
+    делает миграцию молча неполной — и это проявляется только на проде,
+    при апгрейде персистентной базы, как `no such column`. Сторож
+    сравнивает schema.sql с достижимым множеством «схема первого
+    поколения ∪ ADDED_COLUMNS»."""
+    current = sqlite3.connect(":memory:")
+    current.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    first_generation = sqlite3.connect(":memory:")
+    first_generation.executescript(FIRST_GENERATION_SCHEMA)
+
+    def tables(connection: sqlite3.Connection) -> set[str]:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(row[1]) for row in rows}
+
+    for table in sorted(tables(current) & tables(first_generation)):
+        reachable = columns(first_generation, table) | {
+            column for owner, column, _ in ADDED_COLUMNS if owner == table
+        }
+        missing = columns(current, table) - reachable
+        assert missing == set(), (
+            f"колонки {sorted(missing)} таблицы {table} есть в schema.sql, но не "
+            f"добавляются миграцией: старая база после апгрейда останется без них"
+        )
+    current.close()
+    first_generation.close()

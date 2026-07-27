@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 from collections.abc import Iterable, Sequence
 from datetime import datetime
@@ -21,6 +22,12 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 STATUS_NEW = "new"
 STATUS_REJECTED = "rejected"
 STATUS_REPORTED = "reported"
+
+# Причина отказа при исчерпании попыток скачивания (спека §5.2).
+# Ставится внутри `bump_enrich_attempt`, тем же UPDATE, что и счётчик.
+REJECT_ENRICH_FAILED = "enrich_failed"
+
+logger = logging.getLogger(__name__)
 
 # Колонки, из которых строится DiscoveredVacancy. Обёрнуты в CAST(... AS
 # BLOB) ВСЕ до единой: sqlite3 декодирует TEXT-значение на этапе fetch,
@@ -46,13 +53,16 @@ class SqliteRepository:
     """Единственное место в проекте, где живёт SQL.
 
     Для `status = 'new'` определены три непересекающиеся выборки, вместе
-    покрывающие все состояния, кроме исчерпавших попытки скачивания:
+    покрывающие ВСЕ состояния без исключений:
     `pending_enrichment` (описания нет — надо в сеть), `pending_scoring`
     (описание есть, оценки нет — надо пересчитать локально) и
     `unreported` (заполнено обе — готово к отправке). Отсюда инвариант
     модуля: раз записанное `description` не обнуляет ни одна выборка и
     ни один путь обработки порчи, поэтому страница вакансии скачивается
-    не более одного раза за всю жизнь.
+    не более одного раза за всю жизнь. Исчерпание попыток скачивания не
+    создаёт четвёртого, невидимого состояния: лимит применяется внутри
+    `bump_enrich_attempt` тем же оператором, что и инкремент, и строка
+    сразу становится терминальной (`rejected` / `enrich_failed`).
 
     Журнал прогонов и HTTP-кэш вынесены в `run_log.RunLog` (тот же
     `sqlite3.Connection`) ради размера файла; инвариант «весь SQL — в
@@ -170,20 +180,78 @@ class SqliteRepository:
         ).fetchall()
         return safe_rows(rows, to_discovered, self._quarantine)
 
-    def save_enriched(
-        self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
-    ) -> None:
-        """Описание и оценка одним UPDATE — обычный путь после скачивания."""
+    def save_description(self, vacancy_id: str, details: VacancyDetails) -> None:
+        """Сохранить ТОЛЬКО описание: страница скачана, оценки ещё нет.
+
+        Отдельный примитив нужен конвейеру для случая «скоринг бросил
+        исключение»: описание уже стоило одного запроса к hh.ru, и терять
+        его из-за ошибки чисто локального вычисления нельзя — иначе
+        следующий прогон снова пойдёт в сеть за той же страницей.
+        Вакансия остаётся в `pending_scoring` и досчитывается локально.
+        """
         self._connection.execute(
-            "UPDATE vacancy SET description = ?, fetched_at = ?, score = ?, score_detail = ? "
-            "WHERE id = ?",
-            (details.description, now_iso(), score.total, score.model_dump_json(), vacancy_id),
+            "UPDATE vacancy SET description = ?, fetched_at = ? WHERE id = ?",
+            (details.description, now_iso(), vacancy_id),
         )
         self._connection.commit()
 
-    def bump_enrich_attempt(self, vacancy_id: str) -> int:
+    def save_enriched(
+        self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
+    ) -> None:
+        """Описание и оценка одним UPDATE — обычный путь после скачивания.
+
+        Сериализация вынесена ИЗ кортежа параметров сознательно: внутри
+        кортежа она вычисляется до `UPDATE`, поэтому её отказ (например
+        `PydanticSerializationError`, подкласс `ValueError`) выбрасывал
+        вместе с оценкой уже скачанное описание — и следующий прогон шёл
+        за той же страницей в сеть. Теперь неудача сериализации сохраняет
+        описание без оценки и пробрасывает ошибку: вакансия попадает в
+        `pending_scoring`, страница не перекачивается.
+        """
+        try:
+            score_detail = score.model_dump_json()
+        except ValueError:
+            self.save_description(vacancy_id, details)
+            raise
         self._connection.execute(
-            "UPDATE vacancy SET enrich_attempts = enrich_attempts + 1 WHERE id = ?", (vacancy_id,)
+            "UPDATE vacancy SET description = ?, fetched_at = ?, score = ?, score_detail = ? "
+            "WHERE id = ?",
+            (details.description, now_iso(), score.total, score_detail, vacancy_id),
+        )
+        self._connection.commit()
+
+    def bump_enrich_attempt(self, vacancy_id: str, max_attempts: int) -> int:
+        """Инкремент счётчика и, при исчерпании лимита, отказ — ОДНИМ UPDATE.
+
+        Лимит живёт здесь, а не в конвейере, по той же причине, по которой
+        описание и оценка пишутся одним оператором. Пока это были два
+        отдельно закоммиченных состояния (`bump_enrich_attempt`, затем
+        `mark_rejected`), между ними существовало состояние
+        «`status = 'new'`, `enrich_attempts >= max`», невидимое НИ ОДНОЙ
+        из трёх выборок: `pending_enrichment` отсекает такую строку по
+        счётчику, а `pending_scoring`/`unreported` — по пустому описанию.
+        Вакансия пропадала навсегда, причём без всякой аварии: достаточно
+        было, чтобы конвейер не дошёл до второго вызова. Теперь это
+        состояние недостижимо по построению, а не по дисциплине
+        вызывающего.
+
+        Статус меняется только у строки со `status = 'new'`: терминальные
+        `corrupt`/`reported` не воскрешаются и не переписываются.
+        """
+        self._connection.execute(
+            "UPDATE vacancy SET enrich_attempts = enrich_attempts + 1, "
+            "status = CASE WHEN enrich_attempts + 1 >= :limit AND status = :new "
+            "THEN :rejected ELSE status END, "
+            "reject_reason = CASE WHEN enrich_attempts + 1 >= :limit AND status = :new "
+            "THEN :reason ELSE reject_reason END "
+            "WHERE id = :id",
+            {
+                "limit": max_attempts,
+                "new": STATUS_NEW,
+                "rejected": STATUS_REJECTED,
+                "reason": REJECT_ENRICH_FAILED,
+                "id": vacancy_id,
+            },
         )
         self._connection.commit()
         row = self._connection.execute(
@@ -219,6 +287,7 @@ class SqliteRepository:
     # --- 3: отчёт --------------------------------------------------------
 
     def unreported(self) -> list[ScoredVacancy]:
+        self._warn_about_unscored()
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
             "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
@@ -227,6 +296,31 @@ class SqliteRepository:
             (STATUS_NEW,),
         ).fetchall()
         return safe_rows(rows, to_scored, self._quarantine)
+
+    def _warn_about_unscored(self) -> None:
+        """Сторож очереди пересчёта: молчаливого пропуска быть не должно.
+
+        Хранилище не может заставить конвейер вызвать `pending_scoring()`
+        перед отчётом, но может не дать пропуску пройти незамеченным.
+        Каждая такая строка — вакансия, которая уже стоила запроса к
+        hh.ru и всё равно не попадёт ни в один отчёт, пока очередь
+        пересчёта не будет обработана. COUNT(*) по трём предикатам не
+        декодирует ни одного значения, поэтому сторож не падает даже на
+        полностью испорченной таблице.
+        """
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS stuck FROM vacancy WHERE status = ? "
+            "AND description IS NOT NULL AND score_detail IS NULL",
+            (STATUS_NEW,),
+        ).fetchone()
+        stuck = int(row["stuck"]) if row else 0
+        if stuck:
+            logger.error(
+                "%d вакансий с готовым описанием и без оценки не попадут в отчёт: "
+                "конвейер не вызвал pending_scoring() перед unreported(). Описание "
+                "у них есть, перекачка не нужна — нужен локальный пересчёт оценки",
+                stuck,
+            )
 
     def mark_reported(self, ids: Sequence[str]) -> None:
         if not ids:

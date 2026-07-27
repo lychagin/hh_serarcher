@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class Salary(BaseModel):
@@ -28,6 +28,17 @@ class VacancyDetails(BaseModel):
 
 
 class ScoreBreakdown(BaseModel):
+    # inf/nan запрещены на ВХОДЕ, а не при записи в базу. Причина
+    # практическая: json не умеет представлять их иначе как `null`
+    # (`model_dump_json()` пишет именно его), а `null` не проходит
+    # обратную валидацию при чтении. Оценка с inf оказалась бы записью,
+    # которую нельзя прочитать: вакансия вечно ходила бы по кругу
+    # pending_scoring -> unreported -> карантин -> pending_scoring, в
+    # отчёт не попадая никогда и заливая лог ERROR каждый прогон.
+    # Достижимо без порчи базы — опечаткой в YAML (`penalty: 1e400`),
+    # поэтому отказ обязан быть громким и в момент вычисления оценки.
+    model_config = ConfigDict(allow_inf_nan=False)
+
     title: float
     stack: float
     responsibilities: float

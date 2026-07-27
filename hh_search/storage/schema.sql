@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS run (
     rejected    INTEGER DEFAULT 0,
     enriched    INTEGER DEFAULT 0,
     reported    INTEGER DEFAULT 0,
+    -- Наблюдаемость локального цикла пересчёта: rescored — сколько
+    -- оценок пересчитано за прогон, stuck — сколько вакансий осталось
+    -- ждать пересчёта после него. Ненулевой stuck прогон за прогоном
+    -- означает «очередь пересчёта не сходится» — это метрика прогона,
+    -- а не состояние на вакансии, поэтому живёт здесь.
+    rescored    INTEGER DEFAULT 0,
+    stuck       INTEGER DEFAULT 0,
     error       TEXT
 );
 
