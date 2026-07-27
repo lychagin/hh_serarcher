@@ -6,28 +6,31 @@ from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 
-from pydantic import ValidationError
-
 from hh_search.domain.models import (
     DiscoveredVacancy,
-    Salary,
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
 )
+from hh_search.storage.mappers import to_discovered
 from hh_search.storage.run_log import RunLog
-from hh_search.storage.time_utils import now_iso, parse_utc, to_utc_iso
+from hh_search.storage.time_utils import now_iso, to_utc_iso
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 STATUS_NEW = "new"
 STATUS_REJECTED = "rejected"
 STATUS_REPORTED = "reported"
-# Нечитаемый score_detail (битый JSON или новая обязательная схема
-# ScoreBreakdown). Отдельный статус выводит строку из status='new' и тем
-# самым из unreported()/pending_enrichment() без удаления — не блокирует
-# здоровые вакансии и не спамит лог на каждый прогон.
-STATUS_CORRUPT = "corrupt"
+
+# Все колонки vacancy, кроме score_detail. Используется в двух запросах:
+# score_detail либо не нужен вовсе (pending_enrichment), либо выбирается
+# отдельно через CAST(... AS BLOB) (unreported) — см. комментарий там.
+_VACANCY_COLUMNS_SANS_SCORE_DETAIL = (
+    "id, url, title, company, area, salary_raw, salary_from, salary_to, "
+    "salary_currency, published_at, description, fetched_at, enrich_attempts, "
+    "score, cluster, cluster_weight, primary_query, status, reject_reason, "
+    "first_seen_at, reported_at"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,13 +139,16 @@ class SqliteRepository:
     # --- enrichment ----------------------------------------------------
 
     def pending_enrichment(self, max_attempts: int) -> list[DiscoveredVacancy]:
+        # score_detail сознательно не выбирается: он здесь не нужен, а
+        # выбор битой TEXT-колонки роняет чтение всей строки ещё на этапе
+        # fetch (см. unreported).
         rows = self._connection.execute(
-            "SELECT * FROM vacancy "
+            f"SELECT {_VACANCY_COLUMNS_SANS_SCORE_DETAIL} FROM vacancy "
             "WHERE status = ? AND description IS NULL AND enrich_attempts < ? "
             "ORDER BY published_at DESC",
             (STATUS_NEW, max_attempts),
         ).fetchall()
-        return [self._to_discovered(row) for row in rows]
+        return [to_discovered(row) for row in rows]
 
     def save_enriched(
         self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
@@ -174,8 +180,14 @@ class SqliteRepository:
     # --- scoring and reporting -----------------------------------------
 
     def unreported(self) -> list[ScoredVacancy]:
+        # score_detail выбирается через CAST(... AS BLOB): sqlite3 пытается
+        # декодировать TEXT-колонки в UTF-8 уже на этапе fetch, до того как
+        # код увидит хоть одну строку, — битые байты роняют ВЕСЬ курсор
+        # (не одну строку) с OperationalError мимо любого try внизу. BLOB
+        # decode откладывается в Python, где его можно поймать точечно.
         rows = self._connection.execute(
-            "SELECT * FROM vacancy "
+            f"SELECT {_VACANCY_COLUMNS_SANS_SCORE_DETAIL}, "
+            "CAST(score_detail AS BLOB) AS score_detail FROM vacancy "
             "WHERE status = ? AND score IS NOT NULL AND description IS NOT NULL "
             "ORDER BY score DESC",
             (STATUS_NEW,),
@@ -184,28 +196,45 @@ class SqliteRepository:
         corrupt_ids: list[str] = []
         for row in rows:
             try:
-                score = ScoreBreakdown.model_validate(json.loads(row["score_detail"]))
-            except (json.JSONDecodeError, ValidationError):
+                raw = row["score_detail"]
+                text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                score = ScoreBreakdown.model_validate(json.loads(text))
+            except Exception:  # noqa: BLE001
+                # Эта ветка по определению разбирает заведомо испорченные
+                # данные — NULL, битый UTF-8, невалидный JSON или
+                # несовместимую (после эволюции) схему ScoreBreakdown.
+                # Любое исключение здесь означает одно и то же: строке
+                # нельзя доверять. Уже пойманный узкий список
+                # (JSONDecodeError, ValidationError) пропускал остальные
+                # формы порчи и ронял отчёт целиком.
                 logger.error(
-                    "vacancy %s has unreadable score_detail, marking as %s and skipping",
+                    "вакансия %s: score_detail повреждён, возвращаем в очередь "
+                    "на переобогащение вместо потери",
                     row["id"],
-                    STATUS_CORRUPT,
                     exc_info=True,
                 )
                 corrupt_ids.append(row["id"])
                 continue
             result.append(
                 ScoredVacancy(
-                    discovered=self._to_discovered(row),
+                    discovered=to_discovered(row),
                     details=VacancyDetails(description=row["description"]),
                     score=score,
                     cluster=row["cluster"] or "",
                 )
             )
         if corrupt_ids:
+            # Карантин — это самовосстановление, а не сток: description/
+            # score/score_detail очищаются, enrich_attempts обнуляется
+            # (иначе вакансия могла упереться в max_attempts из-за старых
+            # неудач скачивания, не связанных с этой порчей). status
+            # остаётся 'new', так что на следующем прогоне вакансия снова
+            # видна pending_enrichment() и переобогащается заново —
+            # человеческое вмешательство в БД не требуется.
             self._connection.executemany(
-                "UPDATE vacancy SET status = ? WHERE id = ?",
-                [(STATUS_CORRUPT, vacancy_id) for vacancy_id in corrupt_ids],
+                "UPDATE vacancy SET description = NULL, score = NULL, "
+                "score_detail = NULL, enrich_attempts = 0 WHERE id = ?",
+                [(vacancy_id,) for vacancy_id in corrupt_ids],
             )
             self._connection.commit()
         return result
@@ -244,23 +273,3 @@ class SqliteRepository:
 
     def reset_cache(self, url: str) -> None:
         self._run_log.reset_cache(url)
-
-    # --- helpers -------------------------------------------------------
-
-    @staticmethod
-    def _to_discovered(row: sqlite3.Row) -> DiscoveredVacancy:
-        return DiscoveredVacancy(
-            id=row["id"],
-            url=row["url"],
-            title=row["title"],
-            company=row["company"],
-            area=row["area"],
-            salary=Salary(
-                raw=row["salary_raw"],
-                amount_from=row["salary_from"],
-                amount_to=row["salary_to"],
-                currency=row["salary_currency"],
-            ),
-            published_at=parse_utc(row["published_at"]),
-            found_by_query=row["primary_query"] or "",
-        )

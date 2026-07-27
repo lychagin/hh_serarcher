@@ -140,11 +140,13 @@ def test_save_enriched_has_no_partial_state_on_failure(tmp_path: object) -> None
     repository.close()
 
 
-def test_unreported_skips_corrupt_score_detail_and_marks_it(
+def test_unreported_skips_corrupt_score_detail_and_requeues_it(
     tmp_path: object, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """C2: одна битая строка score_detail не должна блокировать весь отчёт,
-    и не должна попадать в очередь снова на каждом следующем прогоне."""
+    """C2: одна битая строка score_detail (невалидный JSON) не должна
+    блокировать весь отчёт и не должна попадать в лог повторно на каждом
+    следующем прогоне — после карантина она выпадает из unreported() сама
+    (score/score_detail обнулены), без отдельного статуса."""
     db_path = str(tmp_path) + "/test.db"
     repository = SqliteRepository(db_path)
     repository.init_schema()
@@ -169,12 +171,117 @@ def test_unreported_skips_corrupt_score_detail_and_marks_it(
     assert [v.discovered.id for v in result] == ["1"]
     assert "2" in caplog.text
 
-    # битая вакансия получила отдельный статус и не будет всплывать
-    # в логе повторно на каждом следующем прогоне
+    # битая вакансия ушла в карантин (score/score_detail обнулены) и
+    # больше не попадает в unreported() вовсе — не всплывает в логе
+    # повторно на каждом следующем прогоне
     caplog.clear()
     with caplog.at_level(logging.ERROR):
         repository.unreported()
     assert "2" not in caplog.text
+    repository.close()
+
+
+def test_unreported_recovers_from_null_score_detail(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C2 (раунд 2): score_detail = NULL — состояние, в которое как раз
+    попадёт оператор, попытавшийся вручную починить битую строку через
+    UPDATE ... SET score_detail = NULL. WHERE-фильтр в unreported() не
+    проверял score_detail IS NOT NULL, json.loads(None) бросал TypeError
+    мимо узкого except — падал весь отчёт, а не только эта строка."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repository.add_discovered(make_vacancy("2"), "embedded", 9)
+    repository.save_enriched("2", VacancyDetails(description="Yocto"), make_score(total=50.0))
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("UPDATE vacancy SET score_detail = NULL WHERE id = ?", ("2",))
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    with caplog.at_level(logging.ERROR):
+        result = repository.unreported()
+
+    assert [v.discovered.id for v in result] == ["1"]
+    assert "2" in caplog.text
+    repository.close()
+
+
+def test_unreported_recovers_from_invalid_utf8_score_detail(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C2 (раунд 2): score_detail, испорченный на уровне байт (не
+    декодируется в UTF-8). sqlite3 декодирует TEXT-колонки при fetch, до
+    того как код увидит хоть одну строку, — раньше OperationalError летел
+    мимо try, роняя весь курсор, а не только эту строку."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repository.add_discovered(make_vacancy("2"), "embedded", 9)
+    repository.save_enriched("2", VacancyDetails(description="Yocto"), make_score(total=50.0))
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    # x'FFFEFA...' — заведомо невалидная UTF-8 последовательность,
+    # записанная напрямую в TEXT-колонку мимо Python (сам Python никогда
+    # не породит такую строку).
+    raw.execute(
+        "UPDATE vacancy SET score_detail = CAST(x'FFFEFA696E76616C6964' AS TEXT) "
+        "WHERE id = ?",
+        ("2",),
+    )
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    with caplog.at_level(logging.ERROR):
+        result = repository.unreported()
+
+    assert [v.discovered.id for v in result] == ["1"]
+    assert "2" in caplog.text
+    repository.close()
+
+
+def test_corrupt_vacancies_self_heal_into_pending_enrichment(tmp_path: object) -> None:
+    """C2 (раунд 2): карантин обязан быть самовосстановлением, а не
+    необратимым стоком. Пачка вакансий, испорченных разом (например, после
+    эволюции схемы ScoreBreakdown), после ОДНОГО вызова unreported()
+    обязана вернуться в pending_enrichment на следующем прогоне без
+    вмешательства человека в БД. Отдельно проверяем, что enrich_attempts
+    обнуляется: у вакансии "3" уже 3 неудачные попытки докачки (равно
+    max_attempts) — без сброса счётчика она осталась бы за бортом
+    pending_enrichment навсегda, даже будучи в остальном полностью
+    восстановленной."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    for vacancy_id in ("1", "2", "3"):
+        repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+        repository.save_enriched(vacancy_id, VacancyDetails(description="Yocto"), make_score())
+    for _ in range(3):
+        repository.bump_enrich_attempt("3")
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.executemany(
+        "UPDATE vacancy SET score_detail = ? WHERE id = ?",
+        [("{битый", "1"), ("{битый", "2"), ("{битый", "3")],
+    )
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    assert repository.unreported() == []  # весь бэклог испорчен разом
+
+    pending_ids = {v.id for v in repository.pending_enrichment(max_attempts=3)}
+    assert pending_ids == {"1", "2", "3"}
     repository.close()
 
 
