@@ -98,7 +98,9 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# BLE и SLF включены намеренно: широкий except и доступ к приватным атрибутам
+# в этом проекте допустимы только там, где это осознанно помечено noqa.
+select = ["E", "F", "I", "UP", "B", "BLE", "SLF"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -1340,7 +1342,7 @@ git commit -m "feat: извлечение JSON-LD со страницы вака
   - `unreported() -> list[ScoredVacancy]`
   - `mark_reported(ids: Sequence[str]) -> None`
   - `set_status(vacancy_id: str, status: str) -> None`
-  - `start_run() -> int`, `finish_run(run_id: int, status: str, **counters: int | str | None) -> None`
+  - `start_run() -> int`, `finish_run(run_id: int, status: str, finished_at: datetime | None = None, **counters: int | str | None) -> None` — `finished_at` по умолчанию «сейчас»; явное значение нужно тестам и делает поведение детерминированным
   - `last_successful_run() -> datetime | None`
   - `cache_headers(url: str) -> dict[str, str]`, `save_cache_headers(url: str, etag: str | None, last_modified: str | None) -> None`
 
@@ -1720,14 +1722,21 @@ class SqliteRepository:
         self._connection.commit()
         return int(cursor.lastrowid or 0)
 
-    def finish_run(self, run_id: int, status: str, **counters: int | str | None) -> None:
+    def finish_run(
+        self,
+        run_id: int,
+        status: str,
+        finished_at: datetime | None = None,
+        **counters: int | str | None,
+    ) -> None:
         allowed = {"discovered", "new_count", "rejected", "enriched", "reported", "error"}
         fields = {name: value for name, value in counters.items() if name in allowed}
         assignments = ", ".join(f"{name} = ?" for name in fields)
         prefix = f"{assignments}, " if assignments else ""
+        moment = (finished_at or datetime.now(UTC)).isoformat()
         self._connection.execute(
             f"UPDATE run SET {prefix}status = ?, finished_at = ? WHERE id = ?",
-            (*fields.values(), status, _now(), run_id),
+            (*fields.values(), status, moment, run_id),
         )
         self._connection.commit()
 
@@ -2842,7 +2851,7 @@ git commit -m "feat: конвейер прогона
 - Produces: `setup_logging(logs_dir: Path) -> None`; `serve(config: Config, run: Callable[[], None], sleep: Callable[[float], None] = time.sleep, iterations: int | None = None) -> None`; typer-приложение `app` с командами `run`, `serve`, `init-db`, `healthcheck`, `report`, `mark`
 
 Команды:
-- `run --once` — один прогон (флаг принимается для симметрии, поведение то же самое)
+- `run` — один прогон. Спека §8.3 писала `run --once`, но флаг ничего не менял: команда всегда делает ровно один прогон. Лишний параметр убран, отклонение фиксируется в Task 13.
 - `serve` — бесконечный цикл; исключение внутри прогона логируется и **не** роняет процесс, кроме `AccessForbidden`, который тоже логируется, но цикл продолжается — иначе контейнер будет перезапускаться в петле
 - `init-db` — создать схему
 - `healthcheck` — код возврата 0, если последний успешный прогон свежее `2 × interval_hours`, иначе 1
@@ -2912,14 +2921,9 @@ def test_healthcheck_fails_on_stale_run(tmp_path: Path) -> None:
     config_dir = prepare(tmp_path)
     runner.invoke(app, ["--config-dir", str(config_dir), "init-db"])
     config = load_config(config_dir)
-    stale = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    stale = datetime.now(UTC) - timedelta(hours=24)
     with SqliteRepository(config.app.paths.state) as repo:
-        run_id = repo.start_run()
-        repo.finish_run(run_id, "ok")
-        repo._connection.execute(  # noqa: SLF001 — прямая подмена времени в тесте
-            "UPDATE run SET finished_at = ? WHERE id = ?", (stale, run_id)
-        )
-        repo._connection.commit()  # noqa: SLF001
+        repo.finish_run(repo.start_run(), "ok", finished_at=stale)
     result = runner.invoke(app, ["--config-dir", str(config_dir), "healthcheck"])
     assert result.exit_code == 1
 
@@ -3101,7 +3105,7 @@ def init_db(ctx: typer.Context) -> None:
 
 
 @app.command("run")
-def run(ctx: typer.Context, once: bool = typer.Option(True, "--once")) -> None:
+def run(ctx: typer.Context) -> None:
     """Выполнить один прогон."""
     config = _config(ctx)
     setup_logging(config.app.paths.logs)
@@ -3211,7 +3215,7 @@ git add hh_search/__main__.py hh_search/scheduler.py hh_search/logging_setup.py 
         hh_search/storage/repository.py tests/test_cli.py tests/test_repository.py
 git commit -m "feat: CLI, логирование и планировщик
 
-serve и run --once вызывают одну и ту же функцию — один код, два
+serve и run вызывают одну и ту же функцию — один код, два
 способа запуска. Падение прогона не роняет демон: иначе контейнер
 уходил бы в петлю перезапусков. healthcheck смотрит в журнал прогонов
 и ловит ситуацию «процесс жив, работа не делается»."
@@ -3519,7 +3523,7 @@ cp config.example/*.yaml data/config/
 $EDITOR data/config/app.yaml     # укажите свой contact_email
 docker compose build
 docker compose run --rm hh-search init-db
-docker compose run --rm hh-search run --once
+docker compose run --rm hh-search run
 docker compose up -d
 ```
 
@@ -3560,7 +3564,7 @@ backoff. Устойчивый `403` останавливает прогон — 
 ## Команды
 
 ```bash
-docker compose run --rm hh-search run --once        # разовый прогон
+docker compose run --rm hh-search run        # разовый прогон
 docker compose run --rm hh-search healthcheck       # свежесть последнего прогона
 docker compose run --rm hh-search report --since 7d # перегенерировать отчёт
 docker compose run --rm hh-search mark 12345 applied
@@ -3592,6 +3596,9 @@ ruff check . && mypy hh_search
 3. В §11 заменить строку про зависимости на: «Рантайм: `httpx`, `pydantic`,
    `PyYAML`, `typer`. `pydantic-settings` добавляется вместе с `TelegramSink` —
    в первой версии секретов нет.»
+4. В §8.3 заменить `run --once` на `run` и добавить пояснение: «флаг `--once`
+   убран — команда всегда выполняет ровно один прогон, отдельный режим
+   задаёт `serve`».
 
 - [ ] **Step 7: Прогнать полную проверку**
 
@@ -3618,9 +3625,9 @@ cluster_weight."
 После Task 13 должно выполняться:
 
 - [ ] `docker compose build` собирается без ошибок
-- [ ] `docker compose run --rm hh-search run --once` с реальным конфигом создаёт
+- [ ] `docker compose run --rm hh-search run` с реальным конфигом создаёт
       `data/reports/<дата>-new.csv` и `.md`
-- [ ] Повторный `run --once` подряд не добавляет в отчёт ни одной вакансии
+- [ ] Повторный `run` подряд не добавляет в отчёт ни одной вакансии
 - [ ] `docker compose run --rm hh-search healthcheck` возвращает 0 после успешного прогона
 - [ ] `pytest -m network` проходит — источник соответствует §3 спеки
 - [ ] `docker compose up -d` поднимает контейнер, он переживает `docker restart`
