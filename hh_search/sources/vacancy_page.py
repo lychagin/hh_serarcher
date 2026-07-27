@@ -62,8 +62,26 @@ def _extract_locality(posting: dict[str, Any]) -> str | None:
 
 
 def _extract_description(posting: dict[str, Any]) -> str:
-    raw_description = posting.get("description")
-    return html_to_text(raw_description) if isinstance(raw_description, str) else ""
+    """Описание из JSON-LD. Пустоты не бывает: её нельзя ни записать, ни повторить.
+
+    Обогащение выбирается по `description IS NULL`, поэтому записанная пустая
+    строка — необратимый приговор: вакансия навсегда числится обогащённой, с
+    баллом 0 и без единой попытки перекачать страницу. Структурная поломка
+    JSON-LD накрывает при этом весь бэклог сразу, поэтому любое неожиданное
+    значение — отказ, включающий штатный счётчик enrich_attempts.
+    """
+    if "description" not in posting:
+        raise FetchFailed("в JSON-LD JobPosting нет поля description")
+    raw_description = posting["description"]
+    if not isinstance(raw_description, str):
+        raise FetchFailed(
+            "поле description в JSON-LD JobPosting не строка, "
+            f"а {type(raw_description).__name__}"
+        )
+    text = html_to_text(raw_description)
+    if not text:
+        raise FetchFailed("поле description в JSON-LD JobPosting пусто после снятия разметки")
+    return text
 
 
 def parse_vacancy_page(html: str) -> VacancyDetails:

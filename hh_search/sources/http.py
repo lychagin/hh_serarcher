@@ -217,6 +217,10 @@ class PoliteClient:
         свой robots.txt, поэтому проверка обязана повторяться после каждого
         перенаправления, а не один раз для исходного URL.
         """
+        if self._client.is_closed:
+            # httpx бросил бы RuntimeError мимо иерархии ошибок приложения, и
+            # прогон упал бы целиком вместо штатного частичного отказа.
+            raise FetchFailed(f"HTTP-клиент уже закрыт, запрос {url} не выполнен")
         current = url
         for _ in range(MAX_REDIRECTS + 1):
             response = self._get_once(current, conditional)

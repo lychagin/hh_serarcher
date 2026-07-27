@@ -71,28 +71,31 @@ def test_vacancy_url_is_built_from_id() -> None:
     assert vacancy_url("135586311") == "https://hh.ru/vacancy/135586311"
 
 
-def test_parse_vacancy_page_treats_null_description_as_empty() -> None:
+# Пустое описание — не «вакансия без текста», а сломанный разбор. Записать его
+# нельзя: pending_enrichment отбирает по `description IS NULL`, поэтому пустая
+# строка навсегда фиксирует вакансию как обогащённую с баллом 0. Отказ обязан
+# быть громким, чтобы включился штатный enrich_attempts.
+@pytest.mark.parametrize(
+    ("raw", "case"),
+    [
+        ("null", "null"),
+        ('{"@value": "текст"}', "словарь"),
+        ('["текст"]', "список"),
+        ("123", "число"),
+        ('""', "пустая строка"),
+        ('"<p> </p>"', "разметка без текста"),
+    ],
+)
+def test_parse_vacancy_page_raises_on_unusable_description(raw: str, case: str) -> None:
     html = (
         '<script type="application/ld+json">{"@type": "JobPosting", '
-        '"description": null}</script>'
+        f'"description": {raw}}}</script>'
     )
-    details = parse_vacancy_page(html)
-    assert details.description == ""
+    with pytest.raises(FetchFailed, match="description"):
+        parse_vacancy_page(html)
 
 
-def test_parse_vacancy_page_treats_object_description_as_empty() -> None:
-    html = (
-        '<script type="application/ld+json">{"@type": "JobPosting", '
-        '"description": {"a": 1}}</script>'
-    )
-    details = parse_vacancy_page(html)
-    assert details.description == ""
-
-
-def test_parse_vacancy_page_treats_numeric_description_as_empty() -> None:
-    html = (
-        '<script type="application/ld+json">{"@type": "JobPosting", '
-        '"description": 123}</script>'
-    )
-    details = parse_vacancy_page(html)
-    assert details.description == ""
+def test_parse_vacancy_page_raises_when_description_key_is_absent() -> None:
+    html = '<script type="application/ld+json">{"@type": "JobPosting"}</script>'
+    with pytest.raises(FetchFailed, match="description"):
+        parse_vacancy_page(html)

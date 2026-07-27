@@ -1,3 +1,5 @@
+import pytest
+
 from hh_search.filtering.matching import SignalMatcher, normalize
 
 
@@ -94,3 +96,19 @@ def test_cyrillic_word_with_digit_requires_whole_word_match() -> None:
     assert matcher.find("состав команды 1club") == []
     # При этом сходимость кириллической и латинской орфографии сохраняется.
     assert matcher.find("Разработчик 1С") == ["1С"]
+
+
+# --- Раунд исправлений 3 ---------------------------------------------------
+
+
+@pytest.mark.parametrize("pattern", ["", "   ", "\t\n"])
+def test_blank_pattern_is_rejected(pattern: str) -> None:
+    # Пустой паттерн компилировался в границы без тела и совпадал почти с любым
+    # текстом: в отсеве это давало необратимый reject с пустой причиной.
+    with pytest.raises(ValueError, match="пуст"):
+        SignalMatcher([pattern])
+
+
+def test_blank_pattern_is_rejected_even_next_to_valid_ones() -> None:
+    with pytest.raises(ValueError):
+        SignalMatcher(["yocto", "", "bsp"])

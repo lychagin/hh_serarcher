@@ -448,3 +448,18 @@ def test_group_for_our_user_agent_wins_over_star() -> None:
         assert client.get("https://hh.ru/vacancy/1").status_code == 200
         with pytest.raises(RobotsDisallowed):
             client.get("https://hh.ru/private/x")
+
+
+@respx.mock
+def test_get_after_close_fails_as_fetch_failed() -> None:
+    """Закрытый клиент — штатный отказ, а не RuntimeError мимо иерархии ошибок.
+
+    Прогон ловит FetchFailed и продолжается частично; RuntimeError уронил бы его
+    целиком, потеряв уже собранные вакансии.
+    """
+    respx.get(URL).mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client()
+    with client:
+        client.get(URL)
+    with pytest.raises(FetchFailed):
+        client.get(URL)

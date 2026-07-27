@@ -1,3 +1,4 @@
+import logging
 import re
 from datetime import datetime
 from urllib.parse import urlencode
@@ -5,8 +6,14 @@ from xml.etree import ElementTree
 
 from hh_search.config.models import QuerySpec
 from hh_search.domain.models import DiscoveredVacancy, Salary
+from hh_search.errors import FetchFailed
+
+logger = logging.getLogger(__name__)
 
 RSS_BASE_URL = "https://hh.ru/search/vacancy/rss"
+# Сколько причин пропуска попадает в лог целиком: лента отдаёт максимум 20
+# элементов, и однотипных причин там обычно одна-две.
+_MAX_LOGGED_REASONS = 5
 
 _ID_RE = re.compile(r"/vacancy/(\d+)")
 _COMPANY_RE = re.compile(r"Вакансия компании:\s*([^<]+)")
@@ -114,16 +121,45 @@ def _first_group(regex: re.Pattern[str], text: str) -> str | None:
 
 
 def parse_feed(xml_text: str, query_text: str) -> list[DiscoveredVacancy]:
-    root = ElementTree.fromstring(xml_text)
+    """Разбирает ленту. Дрейф формата обязан отказывать громко, а не тихо пустеть.
+
+    Пропуск отдельного элемента — законная устойчивость (одна битая запись не
+    уносит остальные 19), но он всегда попадает в лог с причиной. Если у
+    НЕПУСТОЙ ленты не разобрался НИ ОДИН элемент, это уже не битая запись, а
+    смена формата: hh.ru отдаёт pubDate в ISO 8601, но RSS 2.0 предписывает
+    RFC 822, и переход на предписанный формат не имеет права выглядеть как
+    «новых вакансий нет» — иначе сервис молчит месяцами при зелёном
+    healthcheck. Пустая лента (0 элементов) — законный результат узкого запроса.
+    """
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except ElementTree.ParseError as error:
+        raise FetchFailed(
+            f"лента по запросу {query_text!r} не разбирается как XML: {error}"
+        ) from error
+    if root.tag != "rss":
+        # Пространство имён по умолчанию превращает тег в «{uri}rss», и тогда
+        # ./channel/item молча не находит ничего.
+        raise FetchFailed(
+            f"лента по запросу {query_text!r}: корневой элемент <{root.tag}>, ожидался <rss>"
+        )
+    if root.find("channel") is None:
+        raise FetchFailed(f"лента по запросу {query_text!r}: нет элемента <channel>")
+
+    items = list(root.iterfind("./channel/item"))
     vacancies: list[DiscoveredVacancy] = []
-    for item in root.iterfind("./channel/item"):
+    skipped: list[str] = []
+    for item in items:
         link = (item.findtext("link") or "").strip()
         id_match = _ID_RE.search(link)
         if not id_match:
+            skipped.append(f"в <link> нет id вакансии: {link!r}")
             continue
+        raw_published_at = (item.findtext("pubDate") or "").strip()
         try:
-            published_at = datetime.fromisoformat((item.findtext("pubDate") or "").strip())
+            published_at = datetime.fromisoformat(raw_published_at)
         except ValueError:
+            skipped.append(f"<pubDate> не разбирается как ISO 8601: {raw_published_at!r}")
             continue
         description = item.findtext("description") or ""
         income = _first_group(_INCOME_RE, description) or ""
@@ -138,5 +174,20 @@ def parse_feed(xml_text: str, query_text: str) -> list[DiscoveredVacancy]:
                 published_at=published_at,
                 found_by_query=query_text,
             )
+        )
+
+    if skipped:
+        logger.warning(
+            "лента по запросу %r: пропущено %d из %d элементов; причины: %s",
+            query_text,
+            len(skipped),
+            len(items),
+            "; ".join(skipped[:_MAX_LOGGED_REASONS]),
+        )
+    if items and not vacancies:
+        raise FetchFailed(
+            f"лента по запросу {query_text!r}: разобрать не удалось ни один из "
+            f"{len(items)} элементов — похоже, формат ленты изменился. "
+            f"Причины: {'; '.join(skipped[:_MAX_LOGGED_REASONS])}"
         )
     return vacancies

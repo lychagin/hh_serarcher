@@ -37,6 +37,11 @@ def _is_stem_word(word: str) -> bool:
 
 
 def _compile(pattern: str) -> re.Pattern[str]:
+    if not pattern.strip():
+        # Пустой паттерн даёт регулярку из одних границ, которая совпадает почти
+        # с любым текстом: в отсеве это необратимый reject с пустой причиной.
+        # Молчаливое «ловит всё» здесь опаснее падения на старте.
+        raise ValueError("пустой сигнал: такой паттерн совпал бы с любым текстом")
     raw_words = pattern.split()
     norm_words = normalize(pattern).split()
     parts = [
