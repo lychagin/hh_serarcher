@@ -1,3 +1,6 @@
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
+
 import httpx
 import pytest
 import respx
@@ -90,3 +93,118 @@ def test_respects_robots_disallow() -> None:
     client, _ = make_client(respect_robots=True)
     with client, pytest.raises(RobotsDisallowed):
         client.get(URL)
+
+
+# --- Раунд исправлений 1 --------------------------------------------------
+
+
+@respx.mock
+def test_robots_fetch_is_throttled_like_regular_requests() -> None:
+    """Находка 1 (Critical): запрос robots.txt должен участвовать в троттлинге,
+    то есть между ним и первым реальным запросом обязана быть пауза."""
+    respx.get(ROBOTS).mock(
+        return_value=httpx.Response(200, text="User-agent: *\nDisallow: /forbidden/\n")
+    )
+    respx.get(URL).mock(return_value=httpx.Response(200, text="ok"))
+    client, slept = make_client(respect_robots=True, delay_between_requests_sec=0.5)
+    with client:
+        response = client.get(URL)
+    assert response.status_code == 200
+    assert slept, "ожидалась пауза между robots.txt и основным запросом"
+    assert slept[0] == pytest.approx(0.5, abs=0.1)
+
+
+@respx.mock
+def test_robots_404_means_no_restrictions() -> None:
+    """Находка 3 (Important): 404 у robots.txt — штатная ситуация, доступ разрешён."""
+    respx.get(ROBOTS).mock(return_value=httpx.Response(404))
+    respx.get(URL).mock(return_value=httpx.Response(200, text="ok"))
+    client, _ = make_client(respect_robots=True)
+    with client:
+        response = client.get(URL)
+    assert response.status_code == 200
+
+
+@respx.mock
+def test_robots_5xx_means_disallowed_by_default() -> None:
+    """Находка 3 (Important): недоступный robots.txt (5xx) — запрет по умолчанию."""
+    respx.get(ROBOTS).mock(return_value=httpx.Response(500))
+    client, _ = make_client(respect_robots=True)
+    with client, pytest.raises(RobotsDisallowed):
+        client.get(URL)
+
+
+@respx.mock
+def test_robots_network_error_means_disallowed_by_default() -> None:
+    """Находка 3 (Important): сетевая ошибка при получении robots.txt — запрет."""
+    respx.get(ROBOTS).mock(side_effect=httpx.ConnectError("boom"))
+    client, _ = make_client(respect_robots=True)
+    with client, pytest.raises(RobotsDisallowed):
+        client.get(URL)
+
+
+@respx.mock
+def test_retry_after_accepts_http_date() -> None:
+    """Находка 2 (Important): Retry-After в формате HTTP-date (RFC 9110)."""
+    target = datetime.now(UTC) + timedelta(seconds=5)
+    retry_after = format_datetime(target, usegmt=True)
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": retry_after}),
+            httpx.Response(200, text="ok"),
+        ]
+    )
+    client, slept = make_client()
+    with client:
+        response = client.get(URL)
+    assert response.status_code == 200
+    assert route.call_count == 2
+    assert any(abs(delay - 5.0) < 1.0 for delay in slept)
+
+
+@respx.mock
+def test_retry_after_accepts_fractional_seconds() -> None:
+    """Находка 2 (Important): дробные секунды в Retry-After не отбрасываются."""
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "2.5"}),
+            httpx.Response(200, text="ok"),
+        ]
+    )
+    client, slept = make_client()
+    with client:
+        response = client.get(URL)
+    assert response.status_code == 200
+    assert route.call_count == 2
+    assert 2.5 in slept
+
+
+@respx.mock
+def test_retry_after_is_capped() -> None:
+    """Находка 4 (Minor): неадекватно большой Retry-After ограничивается потолком."""
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "99999999"}),
+            httpx.Response(200, text="ok"),
+        ]
+    )
+    client, slept = make_client()
+    with client:
+        response = client.get(URL)
+    assert response.status_code == 200
+    assert route.call_count == 2
+    assert 300.0 in slept
+    assert 99999999.0 not in slept
+
+
+@respx.mock
+def test_no_sleep_after_final_failed_attempt() -> None:
+    """Находка 5 (Minor): после последней неудачной попытки бэкофф не нужен —
+    экспоненциальный бэкофф после финальной попытки (2**(max_retries-1) * delay
+    = 2.0 в этой конфигурации) не должен встречаться."""
+    route = respx.get(URL).mock(return_value=httpx.Response(503))
+    client, slept = make_client(max_retries=2)
+    with client, pytest.raises(FetchFailed):
+        client.get(URL)
+    assert route.call_count == 2
+    assert all(delay < 2.0 for delay in slept)
