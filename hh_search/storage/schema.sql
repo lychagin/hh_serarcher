@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS vacancy (
     score_detail    TEXT,
     cluster         TEXT,
     cluster_weight  INTEGER NOT NULL DEFAULT 0,
+    primary_query   TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL,
     reject_reason   TEXT,
     first_seen_at   TEXT NOT NULL,
@@ -24,9 +25,16 @@ CREATE TABLE IF NOT EXISTS vacancy (
 
 CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);
 
+-- primary_query всегда переписывается тем же UPDATE, что и cluster/
+-- cluster_weight (см. repository.py), поэтому в отчёте found_by_query
+-- гарантированно совпадает с запросом, определившим кластер. Таблица
+-- ниже хранит ПОЛНЫЙ список запросов, которыми была найдена вакансия
+-- (для будущей аналитики), но репозиторий больше не выбирает
+-- "победителя" из неё через недетерминированный подзапрос.
 CREATE TABLE IF NOT EXISTS vacancy_query (
     vacancy_id TEXT NOT NULL REFERENCES vacancy(id),
     query      TEXT NOT NULL,
+    weight     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (vacancy_id, query)
 );
 

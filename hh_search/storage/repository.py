@@ -1,9 +1,12 @@
 import json
+import logging
 import sqlite3
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
+
+from pydantic import ValidationError
 
 from hh_search.domain.models import (
     DiscoveredVacancy,
@@ -12,25 +15,36 @@ from hh_search.domain.models import (
     ScoredVacancy,
     VacancyDetails,
 )
+from hh_search.storage.run_log import RunLog
+from hh_search.storage.time_utils import now_iso, parse_utc, to_utc_iso
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 STATUS_NEW = "new"
 STATUS_REJECTED = "rejected"
 STATUS_REPORTED = "reported"
+# Нечитаемый score_detail (битый JSON или новая обязательная схема
+# ScoreBreakdown). Отдельный статус выводит строку из status='new' и тем
+# самым из unreported()/pending_enrichment() без удаления — не блокирует
+# здоровые вакансии и не спамит лог на каждый прогон.
+STATUS_CORRUPT = "corrupt"
 
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+logger = logging.getLogger(__name__)
 
 
 class SqliteRepository:
-    """Единственное место в проекте, где живёт SQL."""
+    """Единственное место в проекте, где живёт SQL.
+
+    Журнал прогонов и HTTP-кэш вынесены в `run_log.RunLog` (тот же
+    `sqlite3.Connection`) ради размера файла; инвариант «весь SQL — в
+    слое storage» от этого не нарушается.
+    """
 
     def __init__(self, path: Path | str) -> None:
         self._connection = sqlite3.connect(str(path))
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
+        self._run_log = RunLog(self._connection)
 
     def __enter__(self) -> "SqliteRepository":
         return self
@@ -67,8 +81,8 @@ class SqliteRepository:
             """
             INSERT INTO vacancy (id, url, title, company, area, salary_raw, salary_from,
                                  salary_to, salary_currency, published_at, status,
-                                 cluster, cluster_weight, first_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 cluster, cluster_weight, primary_query, first_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO NOTHING
             """,
             (
@@ -81,23 +95,27 @@ class SqliteRepository:
                 vacancy.salary.amount_from,
                 vacancy.salary.amount_to,
                 vacancy.salary.currency,
-                vacancy.published_at.isoformat(),
+                to_utc_iso(vacancy.published_at),
                 STATUS_NEW,
                 cluster,
                 weight,
-                _now(),
+                vacancy.found_by_query,
+                now_iso(),
             ),
         )
         is_new = cursor.rowcount > 0
         self._connection.execute(
-            "INSERT OR IGNORE INTO vacancy_query (vacancy_id, query) VALUES (?, ?)",
-            (vacancy.id, vacancy.found_by_query),
+            "INSERT OR IGNORE INTO vacancy_query (vacancy_id, query, weight) VALUES (?, ?, ?)",
+            (vacancy.id, vacancy.found_by_query, weight),
         )
         if not is_new:
+            # primary_query переписывается в ТОЙ ЖЕ строке, что и cluster/
+            # cluster_weight, — found_by_query в отчёте не может разойтись
+            # с кластером, который он же и определил.
             self._connection.execute(
-                "UPDATE vacancy SET cluster = ?, cluster_weight = ? "
+                "UPDATE vacancy SET cluster = ?, cluster_weight = ?, primary_query = ? "
                 "WHERE id = ? AND cluster_weight < ?",
-                (cluster, weight, vacancy.id, weight),
+                (cluster, weight, vacancy.found_by_query, vacancy.id, weight),
             )
         self._connection.commit()
         return is_new
@@ -119,21 +137,27 @@ class SqliteRepository:
 
     def pending_enrichment(self, max_attempts: int) -> list[DiscoveredVacancy]:
         rows = self._connection.execute(
-            """
-            SELECT v.*, (SELECT query FROM vacancy_query q WHERE q.vacancy_id = v.id LIMIT 1)
-                   AS found_by_query
-            FROM vacancy v
-            WHERE v.status = ? AND v.description IS NULL AND v.enrich_attempts < ?
-            ORDER BY v.published_at DESC
-            """,
+            "SELECT * FROM vacancy "
+            "WHERE status = ? AND description IS NULL AND enrich_attempts < ? "
+            "ORDER BY published_at DESC",
             (STATUS_NEW, max_attempts),
         ).fetchall()
         return [self._to_discovered(row) for row in rows]
 
-    def save_details(self, vacancy_id: str, details: VacancyDetails) -> None:
+    def save_enriched(
+        self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
+    ) -> None:
+        """Единственный способ сохранить обогащение — один UPDATE, одна
+        транзакция. Раньше это были save_details + save_score по отдельности;
+        крах между ними оставлял вакансию с описанием, но без оценки —
+        невидимой ни для pending_enrichment, ни для unreported. Здесь такой
+        промежуточной строки не существует: либо записаны обе колонки,
+        либо ни одна.
+        """
         self._connection.execute(
-            "UPDATE vacancy SET description = ?, fetched_at = ? WHERE id = ?",
-            (details.description, _now(), vacancy_id),
+            "UPDATE vacancy SET description = ?, fetched_at = ?, score = ?, score_detail = ? "
+            "WHERE id = ?",
+            (details.description, now_iso(), score.total, score.model_dump_json(), vacancy_id),
         )
         self._connection.commit()
 
@@ -149,51 +173,56 @@ class SqliteRepository:
 
     # --- scoring and reporting -----------------------------------------
 
-    def save_score(self, vacancy_id: str, score: ScoreBreakdown) -> None:
-        self._connection.execute(
-            "UPDATE vacancy SET score = ?, score_detail = ? WHERE id = ?",
-            (score.total, score.model_dump_json(), vacancy_id),
-        )
-        self._connection.commit()
-
     def unreported(self) -> list[ScoredVacancy]:
         rows = self._connection.execute(
-            """
-            SELECT v.*, (SELECT query FROM vacancy_query q WHERE q.vacancy_id = v.id LIMIT 1)
-                   AS found_by_query
-            FROM vacancy v
-            WHERE v.status = ? AND v.score IS NOT NULL AND v.description IS NOT NULL
-            ORDER BY v.score DESC
-            """,
+            "SELECT * FROM vacancy "
+            "WHERE status = ? AND score IS NOT NULL AND description IS NOT NULL "
+            "ORDER BY score DESC",
             (STATUS_NEW,),
         ).fetchall()
-        return [
-            ScoredVacancy(
-                discovered=self._to_discovered(row),
-                details=VacancyDetails(description=row["description"]),
-                score=ScoreBreakdown.model_validate(json.loads(row["score_detail"])),
-                cluster=row["cluster"] or "",
+        result: list[ScoredVacancy] = []
+        corrupt_ids: list[str] = []
+        for row in rows:
+            try:
+                score = ScoreBreakdown.model_validate(json.loads(row["score_detail"]))
+            except (json.JSONDecodeError, ValidationError):
+                logger.error(
+                    "vacancy %s has unreadable score_detail, marking as %s and skipping",
+                    row["id"],
+                    STATUS_CORRUPT,
+                    exc_info=True,
+                )
+                corrupt_ids.append(row["id"])
+                continue
+            result.append(
+                ScoredVacancy(
+                    discovered=self._to_discovered(row),
+                    details=VacancyDetails(description=row["description"]),
+                    score=score,
+                    cluster=row["cluster"] or "",
+                )
             )
-            for row in rows
-        ]
+        if corrupt_ids:
+            self._connection.executemany(
+                "UPDATE vacancy SET status = ? WHERE id = ?",
+                [(STATUS_CORRUPT, vacancy_id) for vacancy_id in corrupt_ids],
+            )
+            self._connection.commit()
+        return result
 
     def mark_reported(self, ids: Sequence[str]) -> None:
         if not ids:
             return
         self._connection.executemany(
             "UPDATE vacancy SET status = ?, reported_at = ? WHERE id = ?",
-            [(STATUS_REPORTED, _now(), vacancy_id) for vacancy_id in ids],
+            [(STATUS_REPORTED, now_iso(), vacancy_id) for vacancy_id in ids],
         )
         self._connection.commit()
 
-    # --- run journal ---------------------------------------------------
+    # --- run journal and HTTP cache: делегируются в RunLog --------------
 
     def start_run(self) -> int:
-        cursor = self._connection.execute(
-            "INSERT INTO run (started_at, status) VALUES (?, 'running')", (_now(),)
-        )
-        self._connection.commit()
-        return int(cursor.lastrowid or 0)
+        return self._run_log.start_run()
 
     def finish_run(
         self,
@@ -202,49 +231,19 @@ class SqliteRepository:
         finished_at: datetime | None = None,
         **counters: int | str | None,
     ) -> None:
-        allowed = {"discovered", "new_count", "rejected", "enriched", "reported", "error"}
-        fields = {name: value for name, value in counters.items() if name in allowed}
-        assignments = ", ".join(f"{name} = ?" for name in fields)
-        prefix = f"{assignments}, " if assignments else ""
-        moment = (finished_at or datetime.now(UTC)).isoformat()
-        self._connection.execute(
-            f"UPDATE run SET {prefix}status = ?, finished_at = ? WHERE id = ?",
-            (*fields.values(), status, moment, run_id),
-        )
-        self._connection.commit()
+        self._run_log.finish_run(run_id, status, finished_at, **counters)
 
     def last_successful_run(self) -> datetime | None:
-        row = self._connection.execute(
-            "SELECT finished_at FROM run WHERE status IN ('ok', 'partial') "
-            "AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
-        ).fetchone()
-        return datetime.fromisoformat(row["finished_at"]) if row else None
-
-    # --- conditional requests ------------------------------------------
+        return self._run_log.last_successful_run()
 
     def cache_headers(self, url: str) -> dict[str, str]:
-        row = self._connection.execute(
-            "SELECT etag, last_modified FROM http_cache WHERE url = ?", (url,)
-        ).fetchone()
-        if row is None:
-            return {}
-        headers: dict[str, str] = {}
-        if row["etag"]:
-            headers["If-None-Match"] = row["etag"]
-        if row["last_modified"]:
-            headers["If-Modified-Since"] = row["last_modified"]
-        return headers
+        return self._run_log.cache_headers(url)
 
     def save_cache_headers(self, url: str, etag: str | None, last_modified: str | None) -> None:
-        if etag is None and last_modified is None:
-            return
-        self._connection.execute(
-            "INSERT INTO http_cache (url, etag, last_modified, fetched_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(url) DO UPDATE SET etag = excluded.etag, "
-            "last_modified = excluded.last_modified, fetched_at = excluded.fetched_at",
-            (url, etag, last_modified, _now()),
-        )
-        self._connection.commit()
+        self._run_log.save_cache_headers(url, etag, last_modified)
+
+    def reset_cache(self, url: str) -> None:
+        self._run_log.reset_cache(url)
 
     # --- helpers -------------------------------------------------------
 
@@ -262,6 +261,6 @@ class SqliteRepository:
                 amount_to=row["salary_to"],
                 currency=row["salary_currency"],
             ),
-            published_at=datetime.fromisoformat(row["published_at"]),
-            found_by_query=row["found_by_query"] or "",
+            published_at=parse_utc(row["published_at"]),
+            found_by_query=row["primary_query"] or "",
         )
