@@ -14,7 +14,7 @@ _REGION_RE = re.compile(r"Регион:\s*([^<]+)")
 _INCOME_RE = re.compile(r"дохода:\s*([^<]+)")
 _FROM_RE = re.compile(r"от\s*([\d\s ]+)")
 _TO_RE = re.compile(r"до\s*([\d\s ]+)")
-_CURRENCY_RE = re.compile(r"([A-Za-zА-Яа-я.]+)\s*$")
+_CURRENCY_RE = re.compile(r"\d[\d\s ]*\s*([^\d\s]+)")
 _DIGITS_ONLY = re.compile(r"[\s ]")
 
 
@@ -44,12 +44,12 @@ def parse_salary(raw: str) -> Salary:
         digits = _DIGITS_ONLY.sub("", match.group(1))
         return int(digits) if digits.isdigit() else None
 
-    currency_match = _CURRENCY_RE.search(text)
+    currency_matches = _CURRENCY_RE.findall(text)
     return Salary(
         raw=text,
         amount_from=to_int(_FROM_RE.search(text)),
         amount_to=to_int(_TO_RE.search(text)),
-        currency=currency_match.group(1) if currency_match else None,
+        currency=currency_matches[-1] if currency_matches else None,
     )
 
 
@@ -66,6 +66,10 @@ def parse_feed(xml_text: str, query_text: str) -> list[DiscoveredVacancy]:
         id_match = _ID_RE.search(link)
         if not id_match:
             continue
+        try:
+            published_at = datetime.fromisoformat((item.findtext("pubDate") or "").strip())
+        except ValueError:
+            continue
         description = item.findtext("description") or ""
         income = _first_group(_INCOME_RE, description) or ""
         vacancies.append(
@@ -76,7 +80,7 @@ def parse_feed(xml_text: str, query_text: str) -> list[DiscoveredVacancy]:
                 company=_first_group(_COMPANY_RE, description),
                 area=_first_group(_REGION_RE, description),
                 salary=parse_salary(income),
-                published_at=datetime.fromisoformat((item.findtext("pubDate") or "").strip()),
+                published_at=published_at,
                 found_by_query=query_text,
             )
         )
