@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from hh_search.config.loader import load_config
+from hh_search.config.models import QuerySpec
 
 APP_YAML = """
 contact_email: "me@example.com"
@@ -207,6 +208,20 @@ def test_pages_defaults_to_one(tmp_path: Path) -> None:
         ("%3Fprogrammist", "процентное кодирование"),
         ("prog rammist", "пробел внутри"),
         (" programmist", "пробел в начале"),
+        # Раунд исправлений 6. Набор запрещённых символов ловил не всё:
+        # httpx перед отправкой схлопывает dot-сегменты, поэтому slug «.»
+        # превращал проверенный /vacancies/.?page=1 в ушедший в сеть
+        # /vacancies?page=1, запрещённый живым `Disallow: *?*`. Остальные
+        # случаи — то, что набор символов пропускал молча.
+        (".", "сам себе dot-сегмент: httpx схлопнёт его в /vacancies"),
+        ("..", "выход на уровень выше: httpx схлопнёт его в корень"),
+        ("...", "не dot-сегмент, но и не существующий slug"),
+        ("prog\xa0rammist", "неразрывный пробел"),
+        ("programmist？area=66", "unicode-омоглиф вопросительного знака"),
+        ("programmist∕..", "unicode-омоглиф слеша"),
+        ("Programmist", "регистр: такого slug у hh.ru не существует"),
+        ("-programmist", "дефис в начале"),
+        ("programmist_1c", "подчёркивание"),
     ],
 )
 def test_slug_that_is_not_a_single_path_segment_is_rejected(
@@ -216,7 +231,9 @@ def test_slug_that_is_not_a_single_path_segment_is_rejected(
     запрещает правилом `Disallow: *?*` любой URL с query-строкой. Slug,
     протаскивающий в путь `?`, `&`, `/` или `#`, обходил бы не матчер
     robots (он-то такой URL поймает), а саму договорённость, ради которой
-    discovery и переехал с RSS на листинг."""
+    discovery и переехал с RSS на листинг. Проверка перечисляет не
+    запрещённое, а разрешённое (`^[a-z0-9][a-z0-9-]*$`): список запрещённых
+    символов пропускал и dot-сегменты, и омоглифы, и регистр."""
     body = QUERIES_YAML.replace("slug: programmist", f'slug: "{slug}"')
     with pytest.raises(ValidationError):
         load_config(write_config(tmp_path, **{"queries.yaml": body}))
@@ -232,3 +249,31 @@ def test_parameters_of_the_forbidden_rss_search_are_no_longer_accepted(
     body = QUERIES_YAML.replace("pages: 2", "pages: 2\n    area: [66]")
     with pytest.raises(ValidationError):
         load_config(write_config(tmp_path, **{"queries.yaml": body}))
+
+
+@pytest.mark.parametrize(
+    ("slug", "case"),
+    [
+        ("prog\rrammist", "возврат каретки"),
+        ("prog\vrammist", "вертикальная табуляция"),
+        ("prog\frammist", "перевод страницы"),
+        ("prog\x00rammist", "нулевой байт"),
+    ],
+)
+def test_control_character_in_slug_is_rejected(slug: str, case: str) -> None:
+    """Управляющие символы проверяются на модели, а не через YAML: сам YAML
+    трактует CR/LF как перенос строки и подменил бы значение, из-за чего
+    тест сторожил бы разбор конфига вместо валидатора slug'а. В сети такой
+    slug роняет прогон `httpx.InvalidURL` — мимо иерархии ошибок приложения
+    и уже после старта."""
+    with pytest.raises(ValidationError):
+        QuerySpec(slug=slug, cluster="embedded")
+
+
+@pytest.mark.parametrize("slug", ["programmist", "devops", "web-programmist", "1c-programmist"])
+def test_slug_of_a_real_hh_listing_is_accepted(tmp_path: Path, slug: str) -> None:
+    """Сужение slug не должно свалиться в противоположную крайность: живые
+    курируемые листинги hh.ru — это строчные буквы, цифры и дефис."""
+    body = QUERIES_YAML.replace("slug: programmist", f'slug: "{slug}"')
+    cfg = load_config(write_config(tmp_path, **{"queries.yaml": body}))
+    assert cfg.queries.queries[0].slug == slug

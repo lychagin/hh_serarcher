@@ -178,3 +178,98 @@ def test_parse_listing_raises_when_item_list_element_is_not_a_list() -> None:
     html = page("programmist", {"@type": "ListItem"})
     with pytest.raises(FetchFailed, match="itemListElement"):
         parse_listing(html, "programmist")
+
+
+# --- Раунд исправлений 6 --------------------------------------------------
+
+
+def test_url_is_always_rebuilt_and_never_taken_from_the_feed() -> None:
+    """Решение «url собираем канонический, из ленты не берём» на живой
+    фикстуре не сторожится: там url и так канонические. А utm-хвост из ленты
+    живые правила ПРЯМО запрещают (`Disallow: *?*`), то есть сохранённая
+    ссылка стала бы вакансией, которую нельзя скачать."""
+    items = [
+        {
+            "@type": "ListItem",
+            "url": "https://hh.ru/vacancy/135437299?from=vacancy_search_list&query=x",
+            "name": "Инженер",
+        }
+    ]
+    found = parse_listing(page("programmist", items), "programmist")
+    assert [v.url for v in found] == ["https://hh.ru/vacancy/135437299"]
+
+
+def test_canonical_on_a_foreign_host_does_not_confirm_the_listing() -> None:
+    """Сравнивался только путь, поэтому canonical чужого хоста подтверждал
+    наш листинг: страница с evil.example.com проходила как своя."""
+    html = page("programmist", [item("1")], canonical="https://evil.example.com/vacancies/programmist")
+    with pytest.raises(FetchFailed, match="evil.example.com"):
+        parse_listing(html, "programmist")
+
+
+def test_fake_canonical_planted_before_the_real_one_does_not_win() -> None:
+    """Сторож брал ПЕРВОЕ совпадение где угодно в документе, поэтому
+    фальшивый canonical в HTML-комментарии побеждал настоящий — и двадцать
+    посторонних вакансий проходили тихо. hh.ru отдаёт голову через
+    react-helmet и уже кладёт сериализованное состояние в тело страницы."""
+    html = (
+        "<html><body>"
+        '<!-- <link rel="canonical" href="https://hh.ru/vacancies/programmist"> -->'
+        "</body>"
+        '<head><link rel="canonical" href="https://hh.ru/vacancies"></head></html>'
+        '<script type="application/ld+json">'
+        '{"@type": "ItemList", "itemListElement": []}</script>'
+    )
+    with pytest.raises(FetchFailed, match="programmist"):
+        parse_listing(html, "programmist")
+
+
+def test_two_disagreeing_canonicals_are_a_refusal() -> None:
+    """Если canonical'ов несколько и они расходятся, верить нечему."""
+    html = page("programmist", [item("1")]).replace(
+        "</head>", '<link rel="canonical" href="https://hh.ru/vacancies"></head>'
+    )
+    with pytest.raises(FetchFailed):
+        parse_listing(html, "programmist")
+
+
+def test_item_from_a_foreign_host_is_not_laundered_into_an_hh_url() -> None:
+    """Хост элемента не проверялся, а url собирается канонический — поэтому
+    ссылка чужого хоста «отмывалась» в https://hh.ru/vacancy/{id} и уходила
+    в базу как настоящая вакансия hh.ru."""
+    items = [item("1"), {"@type": "ListItem", "url": "https://evil.example.com/vacancy/2",
+                         "name": "Чужая"}]
+    assert [v.id for v in parse_listing(page("programmist", items), "programmist")] == ["1"]
+
+
+def test_duplicate_ids_within_one_page_collapse() -> None:
+    """Дубликат — это не вторая вакансия. Он врёт счётчику `discovered`,
+    который вычисляется по длине списка."""
+    items = [item("1"), item("1", "Тот же id, другой заголовок"), item("2")]
+    assert [v.id for v in parse_listing(page("programmist", items), "programmist")] == ["1", "2"]
+
+
+@pytest.mark.parametrize(
+    ("bad_id", "case"),
+    [
+        ("000123", "ведущие нули: отдельная строка для той же вакансии"),
+        ("0", "нулевой id"),
+        ("1" * 400, "четырёхсотзначный id"),
+    ],
+)
+def test_implausible_id_is_skipped(bad_id: str, case: str) -> None:
+    items = [item("135437299"), item(bad_id)]
+    found = parse_listing(page("programmist", items), "programmist")
+    assert [v.id for v in found] == ["135437299"], case
+
+
+def test_canonical_outside_the_head_does_not_get_a_vote() -> None:
+    """Обратная сторона предыдущего теста, и она же — причина искать в
+    `<head>`, а не «требовать согласия всех найденных». Строка, похожая на
+    canonical, в сериализованном состоянии страницы (hh.ru кладёт его в
+    тело) не имеет права ни подтвердить листинг, ни отвергнуть его: иначе
+    правильная страница отказывала бы себе сама."""
+    html = page("programmist", [item("1")]).replace(
+        "<body>", '<body><!-- <link rel="canonical" href="https://hh.ru/vacancies"> -->'
+    )
+    assert [v.id for v in parse_listing(html, "programmist")] == ["1"]

@@ -60,6 +60,23 @@ def _product_tokens(user_agent: str) -> set[str]:
     return tokens
 
 
+def normalize(url: str) -> str:
+    """URL в том виде, в каком его отправит httpx (RFC 3986 §6.2).
+
+    Единственная точка нормализации в модуле, и вызывается она ДО проверки
+    robots.txt. Причина — расхождение по построению: `httpx` перед
+    отправкой схлопывает dot-сегменты, поэтому проверка строки «как она
+    пришла» проверяла не тот URL, который уходит в сеть.
+    `/vacancies/.?page=1` превращался в `/vacancies?page=1`, а
+    `/vacancies/..?page=1` — в пустой путь, то есть `/?page=1` для
+    сопоставления (см. `_target_path`); оба запрещены живым правилом
+    hh.ru `Disallow: *?*`, тогда как проверенная форма попадала под
+    `Allow: /vacancies/*?page=` и проходила. Нормализуем сами и дальше
+    работаем ровно с этой строкой — и матчер, и сам запрос.
+    """
+    return str(httpx.URL(url))
+
+
 def _target_path(url: str) -> str:
     """Путь, по которому сопоставляются правила: путь ВМЕСТЕ с query-строкой.
 
@@ -232,6 +249,11 @@ class PoliteClient:
         raise FetchFailed(f"слишком много редиректов при получении {url}")
 
     def _get_once(self, url: str, conditional: dict[str, str] | None) -> httpx.Response:
+        # Нормализация в самом начале, ДО проверки robots: дальше по этому
+        # методу и матчер, и `self._client.get` видят одну и ту же строку,
+        # поэтому щель между «что проверили» и «что ушло» закрыта по
+        # построению, а не дисциплиной каждой новой точки входа в URL.
+        url = normalize(url)
         self._check_robots(url)
         last_error: Exception | None = None
         last_attempt = self._config.max_retries - 1
@@ -304,7 +326,11 @@ class PoliteClient:
         return max((target - datetime.now(UTC)).total_seconds(), 0.0)
 
     def _check_robots(self, url: str) -> None:
-        """Проверяет URL по robots.txt ЕГО хоста.
+        """Проверяет НОРМАЛИЗОВАННЫЙ URL по robots.txt его хоста.
+
+        На вход обязан приходить результат `normalize()` — то есть ровно та
+        строка, которую отправит httpx. Проверять что-либо иное значит
+        выносить вердикт не о том запросе, который уйдёт в сеть.
 
         Кэш — по origin (scheme://netloc), а не один объект на клиента: иначе
         правила hh.ru молча применялись бы к hh.kz и rabota.by, куда уводят

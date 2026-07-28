@@ -15,8 +15,12 @@
 Форма `/vacancies/{slug}?area=66&page=1` формально прошла бы под правило
 `Allow: /vacancies/*?*&page=`, но это обход духа запрета, а не его
 соблюдение: query-строку hh.ru закрыл сознательно. Такие URL здесь не
-строятся, а `QuerySpec.slug` отвергает символы `?`, `&`, `/` и `#` на
-старте (см. `config/models.py`).
+строятся, а `QuerySpec.slug` сужен регуляркой `^[a-z0-9][a-z0-9-]*$` и
+отвергает всё остальное на старте, до первого запроса (см.
+`config/models.py`). Второй половиной той же гарантии служит
+`http.normalize()`: robots проверяется по НОРМАЛИЗОВАННОМУ URL, поэтому
+построить здесь строку, которая проверится как одна, а уйдёт в сеть как
+другая, нельзя даже случайно.
 
 Ценой переезда стал объём данных: листинг отдаёт только id, url и
 заголовок. Компания, регион, зарплата и дата публикации приходят теперь
@@ -36,13 +40,21 @@ from hh_search.sources.vacancy_page import find_ld_json, vacancy_url
 logger = logging.getLogger(__name__)
 
 LISTING_BASE_URL = "https://hh.ru/vacancies"
+# Хост, и только он, считается своим: и у canonical страницы, и у ссылок
+# в ленте. Берётся из LISTING_BASE_URL, чтобы не разойтись с ним.
+LISTING_HOST = urlsplit(LISTING_BASE_URL).netloc
 # Сколько причин пропуска попадает в лог целиком: страница отдаёт 20
 # элементов, и однотипных причин там обычно одна-две.
 _MAX_LOGGED_REASONS = 5
 
-_ID_RE = re.compile(r"^/vacancy/(\d+)$")
+# Ведущий нуль запрещён, длина ограничена: `000123` — это отдельная строка
+# в базе для той же самой вакансии (первичный ключ у нас текстовый),
+# а `\d+` принимал и четырёхсотзначное число. Верхняя граница взята с
+# запасом к живым id (9 знаков) и всё ещё влезает в INTEGER SQLite.
+_ID_RE = re.compile(r"^/vacancy/([1-9][0-9]{0,14})$")
 _CANONICAL_RE = re.compile(r"<link[^>]+rel=[\"']canonical[\"'][^>]*>", re.IGNORECASE)
 _HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']")
+_HEAD_RE = re.compile(r"<head\b[^>]*>(.*?)</head>", re.DOTALL | re.IGNORECASE)
 
 
 def build_listing_url(query: QuerySpec, page: int = 0) -> str:
@@ -59,16 +71,36 @@ def build_listing_url(query: QuerySpec, page: int = 0) -> str:
     return base if page == 0 else f"{base}?page={page}"
 
 
-def _canonical_path(html: str) -> str | None:
-    """Путь из `<link rel="canonical">`. У второй страницы там ещё и `?page=2`,
-    поэтому сравнивается именно путь, а не URL целиком."""
-    tag = _CANONICAL_RE.search(html)
-    if tag is None:
-        return None
-    href = _HREF_RE.search(tag.group(0))
-    if href is None:
-        return None
-    return urlsplit(href.group(1)).path.rstrip("/")
+def _canonical_targets(html: str) -> set[str]:
+    """На что ссылаются ВСЕ теги `<link rel="canonical">` страницы.
+
+    Три решения, каждое закрывает свою щель.
+
+    1. Поиск ограничен содержимым `<head>`, если он есть. Первое
+       совпадение где угодно в документе означало, что фальшивый
+       canonical в HTML-комментарии или в JS-строке побеждает настоящий:
+       hh.ru отдаёт голову через react-helmet и уже кладёт сериализованное
+       состояние в тело страницы.
+    2. Возвращаются ВСЕ найденные, а не первый: расхождение между ними —
+       само по себе повод не верить странице.
+    3. У своего хоста сравнивается путь (у второй страницы в canonical
+       ещё и `?page=2`), у чужого — URL целиком: путь `/vacancies/programmist`
+       на evil.example.com подтверждал наш листинг, потому что хост не
+       смотрели вовсе.
+    """
+    head = _HEAD_RE.search(html)
+    scope = head.group(1) if head is not None else html
+    targets: set[str] = set()
+    for tag in _CANONICAL_RE.findall(scope):
+        href = _HREF_RE.search(tag)
+        if href is None:
+            continue
+        parts = urlsplit(href.group(1))
+        if parts.netloc and parts.netloc != LISTING_HOST:
+            targets.add(href.group(1))
+            continue
+        targets.add(parts.path.rstrip("/"))
+    return targets
 
 
 def _check_slug(html: str, slug: str) -> None:
@@ -82,15 +114,15 @@ def _check_slug(html: str, slug: str) -> None:
     оценивается и попадает в отчёт.
     """
     expected = f"/vacancies/{slug}"
-    actual = _canonical_path(html)
-    if actual is None:
+    actual = _canonical_targets(html)
+    if not actual:
         raise FetchFailed(
             f"на странице листинга {expected} нет тега <link rel=\"canonical\">: "
             "проверить, что hh.ru отдал запрошенный листинг, а не общий индекс, нечем"
         )
-    if actual != expected:
+    if actual != {expected}:
         raise FetchFailed(
-            f"запрошен листинг {expected}, а hh.ru отдал {actual!r}. "
+            f"запрошен листинг {expected}, а hh.ru отдал {sorted(actual)!r}. "
             f"Скорее всего, slug {slug!r} не существует — hh.ru не отвечает на такой "
             "404, а молча показывает общий индекс вакансий"
         )
@@ -120,7 +152,13 @@ def _parse_item(raw: Any, query_text: str) -> tuple[DiscoveredVacancy | None, st
     url = raw.get("url")
     if not isinstance(url, str):
         return None, f"нет строкового поля url: {url!r}"
-    match = _ID_RE.match(urlsplit(url).path)
+    parts = urlsplit(url)
+    # Хост обязателен к проверке именно потому, что ниже url собирается
+    # заново: без неё ссылка чужого хоста «отмывалась» в
+    # https://hh.ru/vacancy/{id} и уходила в базу как настоящая вакансия.
+    if parts.netloc and parts.netloc != LISTING_HOST:
+        return None, f"ссылка ведёт на чужой хост {parts.netloc!r}: {url!r}"
+    match = _ID_RE.match(parts.path)
     if match is None:
         return None, f"url не похож на ссылку на вакансию: {url!r}"
     name = raw.get("name")
@@ -158,12 +196,19 @@ def parse_listing(html: str, query_text: str) -> list[DiscoveredVacancy]:
     items = _item_list(html, query_text)
 
     vacancies: list[DiscoveredVacancy] = []
+    seen: set[str] = set()
     skipped: list[str] = []
     for raw in items:
         vacancy, reason = _parse_item(raw, query_text)
         if vacancy is None:
             skipped.append(reason or "")
             continue
+        if vacancy.id in seen:
+            # Дубликат — не вторая вакансия. Счётчик `discovered` прогона
+            # считается по длине этого списка, и повтор врал бы ему.
+            skipped.append(f"вакансия {vacancy.id} уже встречалась на этой странице")
+            continue
+        seen.add(vacancy.id)
         vacancies.append(vacancy)
 
     if skipped:

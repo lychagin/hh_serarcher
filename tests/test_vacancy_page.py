@@ -132,11 +132,13 @@ def test_parse_vacancy_page_extracts_company_area_and_dates() -> None:
 
 
 def test_parse_vacancy_page_extracts_salary_from_markup() -> None:
-    """Зарплаты в JSON-LD нет: `baseSalary` у hh.ru всегда null, даже когда
-    зарплата указана. Единственный источник — разметка, и формат строки там
-    тот же, что приходил из RSS, поэтому её разбирает тот же parse_salary."""
+    """Зарплаты в JSON-LD нет: поля `baseSalary` у hh.ru не существует вовсе —
+    эта подстрока не встречается на странице ни разу, даже когда зарплата
+    указана. Единственный источник — разметка, и формат строки там тот же,
+    что приходил из RSS, поэтому её разбирает тот же parse_salary."""
+    assert "baseSalary" not in load_salary_fixture(), "поля нет, а не null"
     posting = extract_job_posting(load_salary_fixture())
-    assert posting is not None and not posting.get("baseSalary")
+    assert posting is not None and "baseSalary" not in posting
     details = parse_vacancy_page(load_salary_fixture())
     assert details.salary.amount_from == 100000
     assert details.salary.amount_to == 150000
@@ -184,3 +186,65 @@ def test_extract_salary_ignores_a_renamed_attribute() -> None:
     а не хватать первую попавшуюся сумму со страницы."""
     html = '<div data-qa="vacancy-compensation">от 250 000 ₽</div>'
     assert extract_salary(html) is None
+
+
+# --- Раунд исправлений 6: сторож дрейфа обязан видеть перестройку блока ----
+#
+# `_SALARY_BLOCK_RE` берёт содержимое до ПЕРВОГО `</div>`. Стоит hh.ru
+# обернуть сумму ещё одним `<div>` (обычный React-рефакторинг: вложенный
+# `<span>` там уже есть), и группа окажется пустой. Раньше в этом случае
+# extract_salary возвращал не None, а ПУСТОЙ Salary, из-за чего
+# SalaryBlockStats считал блок НАЙДЕННЫМ: зарплата терялась у всех
+# вакансий, а сторож, потребованный владельцем явно, молчал.
+
+DRIFTED_BLOCKS = {
+    "вложенный div перед суммой": (
+        '<div data-qa="vacancy-salary"><div class="wrapper"></div>'
+        "<span>от 100 000 ₽</span></div>"
+    ),
+    "пустой блок": '<div data-qa="vacancy-salary"></div>',
+    "блок из одной разметки": '<div data-qa="vacancy-salary"><span></span></div>',
+}
+
+
+@pytest.mark.parametrize("case", sorted(DRIFTED_BLOCKS))
+def test_salary_block_without_text_is_drift_and_not_a_salary(case: str) -> None:
+    """«Блок найден, но текста не дал» — это дрейф разметки, а не зарплата."""
+    assert extract_salary(DRIFTED_BLOCKS[case]) is None
+
+
+@pytest.mark.parametrize("case", sorted(DRIFTED_BLOCKS))
+def test_drifted_block_is_not_counted_as_found(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Прогон, где блок отдал только разметку, обязан включать тот же сторож,
+    что и прогон, где атрибут переименован: наблюдаемо это одно и то же —
+    зарплата потеряна у всех."""
+    html = (
+        '<script type="application/ld+json">{"@type": "JobPosting", '
+        '"description": "<p>текст</p>"}</script>' + DRIFTED_BLOCKS[case]
+    )
+    stats = SalaryBlockStats()
+    for _ in range(3):
+        parse_vacancy_page(html, stats)
+    assert (stats.pages, stats.without_salary) == (3, 3)
+    with caplog.at_level(logging.WARNING):
+        stats.log_summary()
+    assert "vacancy-salary" in caplog.text
+
+
+def test_salary_not_stated_stays_a_legitimate_block() -> None:
+    """Различение обязано сохраниться: «з/п не указана» — законный блок с
+    непустым raw, а не дрейф, и сторож обязан молчать."""
+    html = (
+        '<script type="application/ld+json">{"@type": "JobPosting", '
+        '"description": "<p>текст</p>"}</script>'
+        '<div data-qa="vacancy-salary"><span>з/п не указана</span></div>'
+    )
+    salary = extract_salary(html)
+    assert salary is not None
+    assert salary.raw == "з/п не указана"
+    assert (salary.amount_from, salary.amount_to) == (None, None)
+    stats = SalaryBlockStats()
+    parse_vacancy_page(html, stats)
+    assert (stats.pages, stats.without_salary) == (1, 0), "блок есть, дрейфа нет"

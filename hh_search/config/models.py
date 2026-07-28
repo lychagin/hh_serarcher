@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Annotated
 
@@ -114,24 +115,33 @@ class ProfileConfig(Base):
     report_threshold: float = Field(default=60.0, ge=0, le=100)
 
 
+# Slug живых курируемых листингов hh.ru — строчные латинские буквы, цифры
+# и дефис (`programmist`, `devops`, `1c-programmist`). Список разрешённого
+# вместо списка запрещённого выбран сознательно: перечисление запрещённых
+# символов (`?&#/ \t\n%`) пропускало `\r`, `\v`, `\f`, `\x00`, `\xa0` и
+# unicode-омоглифы (`？`, `∕`), а главное — не запрещало slug'у БЫТЬ
+# dot-сегментом (`.`, `..`), из-за чего httpx схлопывал путь и в сеть
+# уходил URL, запрещённый живым `Disallow: *?*`. Заодно снимается разбор
+# регистра: `Programmist` у hh.ru не существует, и узнавать об этом
+# правильно на старте, а не отказом FetchFailed после запроса в сеть.
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
 def _reject_url_syntax(value: str) -> str:
     """Slug обязан быть ОДНИМ сегментом пути и ничем больше.
 
     Он подставляется в `/vacancies/{slug}`, а живой robots.txt hh.ru
     запрещает правилом `Disallow: *?*` любой URL с query-строкой. Slug
-    вида `programmist?area=66` или `programmist/../search/vacancy`
-    протащил бы запрещённый запрос мимо всех проверок кода — не в обход
-    матчера robots (он такой URL поймает), а в обход договорённости, на
-    которой держится право сервиса ходить в источник. Отказ на старте,
-    до первого сетевого запроса.
+    вида `programmist?area=66`, `programmist/../search/vacancy` или просто
+    `..` протащил бы запрещённый запрос мимо всех проверок кода — в обход
+    договорённости, на которой держится право сервиса ходить в источник.
+    Отказ на старте, до первого сетевого запроса.
     """
-    if value.strip() != value:
-        raise ValueError("slug не может начинаться или заканчиваться пробелом")
-    forbidden = set(value) & set("?&#/ \t\n%")
-    if forbidden:
+    if not _SLUG_RE.match(value):
         raise ValueError(
-            f"slug {value!r} содержит недопустимые символы {sorted(forbidden)}: "
-            "разрешён ровно один сегмент пути вида /vacancies/{slug}"
+            f"slug {value!r} не похож на slug листинга hh.ru: разрешены строчные "
+            "латинские буквы, цифры и дефис (не первым символом) — ровно один "
+            "сегмент пути вида /vacancies/{slug}"
         )
     return value
 

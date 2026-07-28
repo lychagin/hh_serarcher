@@ -20,6 +20,17 @@
 таблицы — тоже без собственного знания о схеме: старая таблица
 отодвигается в сторону, актуальную создаёт сам `schema.sql`, строки
 переливаются по пересечению колонок.
+
+Единственный необратимый шаг всего модуля — именно это перестроение, и
+атомарным его сделать нельзя: `connection.executescript()` неявно
+коммитит отложенную транзакцию, поэтому состояние «старая таблица
+отодвинута, новая пустая создана, строки ещё не перелиты» ДОЛГОВЕЧНО.
+Процесс, умерший в этом окне (OOM-kill на VPS, `docker stop`, SIGKILL),
+оставляет базу с пустой `vacancy` и полной отодвинутой таблицей — и
+`PRAGMA integrity_check` при этом честно говорит `ok`. Поэтому
+`apply_schema` начинается не с попытки начать миграцию, а с проверки, не
+надо ли ДОИГРАТЬ прерванную: отодвинутая таблица на диске — это не
+улика, а незавершённая работа.
 """
 
 import sqlite3
@@ -54,9 +65,11 @@ WHERE primary_query = ''
   AND EXISTS (SELECT 1 FROM vacancy_query vq WHERE vq.vacancy_id = vacancy.id)
 """
 
-# Временное имя отодвинутой таблицы. Живёт ровно внутри одного вызова
-# `apply_schema`, но названо так, чтобы упавший посреди миграции процесс
-# оставлял после себя очевидную улику, а не загадку.
+# Имя отодвинутой таблицы. В обычном прогоне живёт внутри одного вызова
+# `apply_schema`, но переживает смерть процесса — и тогда становится
+# единственным свидетельством того, что перестроение начато и не
+# закончено. Имя поэтому фиксированное, а не случайное: следующий старт
+# обязан его узнать.
 _LEGACY_VACANCY = "vacancy_before_nullable_published_at"
 
 
@@ -66,8 +79,12 @@ def apply_schema(connection: sqlite3.Connection, schema_sql: str) -> None:
     Порядок значим: устаревшую таблицу надо отодвинуть ДО того, как
     `schema.sql` создаст актуальную, иначе `CREATE TABLE IF NOT EXISTS`
     увидит старую и не сделает ничего.
+
+    Начинается всё с `_resume_or_detach`, а не с попытки отодвинуть: если
+    отодвинутая таблица уже лежит на диске, значит прошлый процесс умер
+    посреди перестроения, и первым делом надо доиграть ЕГО работу.
     """
-    detached = _detach_vacancy_with_not_null_published_at(connection)
+    detached = _resume_or_detach(connection)
     connection.executescript(schema_sql)
     if detached:
         _refill_from_legacy(connection)
@@ -79,6 +96,32 @@ def apply_schema(connection: sqlite3.Connection, schema_sql: str) -> None:
     # момент обе участвующие колонки заведомо существуют.
     connection.execute(_BACKFILL_PRIMARY_QUERY)
     connection.commit()
+
+
+def _resume_or_detach(connection: sqlite3.Connection) -> bool:
+    """Доиграть прерванное перестроение или начать его. True — надо перелить.
+
+    Оставшаяся на диске отодвинутая таблица значит ровно одно: прошлый
+    процесс успел отодвинуть, но не успел перелить. Проверять при этом
+    `published_at` у новой `vacancy` бессмысленно — она уже nullable, и
+    именно поэтому прежняя версия возвращала здесь False и не переливала
+    НИКОГДА: строки навсегда оставались в отодвинутой таблице, `vacancy`
+    была пуста, а `apply_schema` возвращался без исключения.
+    """
+    if _LEGACY_VACANCY in _tables(connection):
+        _suspend_foreign_keys(connection)
+        return True
+    return _detach_vacancy_with_not_null_published_at(connection)
+
+
+def _suspend_foreign_keys(connection: sqlite3.Connection) -> None:
+    """Выключить проверку внешних ключей на время перестроения.
+
+    `commit()` обязателен: внутри транзакции PRAGMA молча игнорируется, и
+    перелив шёл бы с включённой проверкой.
+    """
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=OFF")
 
 
 def _detach_vacancy_with_not_null_published_at(connection: sqlite3.Connection) -> bool:
@@ -98,8 +141,7 @@ def _detach_vacancy_with_not_null_published_at(connection: sqlite3.Connection) -
         return False
     if not _is_not_null(connection, "vacancy", "published_at"):
         return False
-    connection.commit()  # PRAGMA ниже игнорируется внутри транзакции
-    connection.execute("PRAGMA foreign_keys=OFF")
+    _suspend_foreign_keys(connection)
     connection.execute("PRAGMA legacy_alter_table=ON")
     for index in _indexes_of(connection, "vacancy"):
         connection.execute(f"DROP INDEX {index}")
@@ -115,11 +157,19 @@ def _refill_from_legacy(connection: sqlite3.Connection) -> None:
     нет, поэтому список нечему разойтись с `schema.sql`. Колонки, которых
     в старой базе не было, останутся при своих DEFAULT — их дозаполняет
     обычный проход ADD COLUMN и бэкфилл.
+
+    `INSERT OR IGNORE`, а не `INSERT`: перелив мог уже начаться и умереть
+    на середине, и тогда часть строк в `vacancy` есть. Простой INSERT
+    упал бы на первой из них с IntegrityError, то есть прерванная
+    миграция стала бы невосстановимой ещё и громко. Конфликт возможен
+    только по первичному ключу, а строка с этим ключом либо перелита
+    отсюда же (то же значение), либо записана уже после миграции (значение
+    новее) — в обоих случаях права та, что в `vacancy`.
     """
     shared = sorted(_columns(connection, _LEGACY_VACANCY) & _columns(connection, "vacancy"))
     columns = ", ".join(shared)  # имена пришли из PRAGMA, не из внешних данных
     connection.execute(
-        f"INSERT INTO vacancy ({columns}) SELECT {columns} FROM {_LEGACY_VACANCY}"
+        f"INSERT OR IGNORE INTO vacancy ({columns}) SELECT {columns} FROM {_LEGACY_VACANCY}"
     )
     connection.execute(f"DROP TABLE {_LEGACY_VACANCY}")
     broken = connection.execute("PRAGMA foreign_key_check").fetchall()

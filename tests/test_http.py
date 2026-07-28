@@ -9,7 +9,7 @@ import respx
 
 from hh_search.config.models import HttpConfig, QuerySpec
 from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
-from hh_search.sources.http import PoliteClient
+from hh_search.sources.http import PoliteClient, Robots
 from hh_search.sources.listing import build_listing_url
 from hh_search.sources.rss import RssQuery, build_rss_url
 
@@ -495,3 +495,81 @@ def test_polite_client_passes_urls_built_for_discovery_and_still_blocks_rss() ->
         with pytest.raises(RobotsDisallowed):
             client.get(rss)
         assert route.call_count == 0, "RSS запрещён `Disallow: *?*` и в сеть не уходит"
+
+
+# --- Раунд исправлений 6: проверяем ровно тот URL, который уйдёт в сеть ------
+#
+# Матчер разбирал URL-строку как есть, а httpx перед отправкой нормализует
+# путь по RFC 3986 и схлопывает dot-сегменты. Проверка robots и фактический
+# запрос расходились ПО ПОСТРОЕНИЮ, и любая точка входа в URL наследовала
+# эту щель.
+
+
+def counting_transport(sent: list[str]) -> httpx.MockTransport:
+    """Мок-транспорт, записывающий URL в том виде, в каком его отправил httpx."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(
+                200, text=LIVE_ROBOTS, headers={"Content-Type": "text/plain"}
+            )
+        sent.append(str(request.url))
+        return httpx.Response(200, text="ok")
+
+    return httpx.MockTransport(handler)
+
+
+def robots_aware_client(sent: list[str]) -> PoliteClient:
+    config = HttpConfig(
+        delay_between_requests_sec=0.1, timeout_sec=5, max_retries=3, respect_robots=True
+    )
+    return PoliteClient(
+        config, "hh-search/test", sleep=lambda _: None, transport=counting_transport(sent)
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested", "normalized_by_httpx"),
+    [
+        ("https://hh.ru/vacancies/.?page=1", "https://hh.ru/vacancies?page=1"),
+        ("https://hh.ru/vacancies/..?page=1", "https://hh.ru?page=1"),
+        (
+            "https://hh.ru/vacancies/programmist/../search/vacancy/rss?text=Yocto",
+            "https://hh.ru/vacancies/search/vacancy/rss?text=Yocto",
+        ),
+    ],
+)
+def test_robots_verdict_is_taken_on_the_url_that_actually_goes_out(
+    requested: str, normalized_by_httpx: str
+) -> None:
+    """Проверяется не «что мы проверили», а «что реально ушло в сеть».
+
+    Сначала фиксируем саму щель: httpx схлопывает dot-сегменты, поэтому
+    отправляемый URL отличается от запрошенного. Затем требуем, чтобы
+    вердикт брался по отправляемому — все три нормализованных URL живые
+    правила hh.ru ЗАПРЕЩАЮТ (`Disallow: *?*`), и счётчик запросов обязан
+    остаться нулевым.
+    """
+    assert str(httpx.URL(requested)) == normalized_by_httpx, "щель между проверкой и отправкой"
+    assert not Robots.parse(LIVE_ROBOTS).can_fetch("hh-search/test", normalized_by_httpx)
+
+    sent: list[str] = []
+    client = robots_aware_client(sent)
+    with client, pytest.raises(RobotsDisallowed):
+        client.get(requested)
+    assert sent == [], f"запрещённый {normalized_by_httpx} не имеет права уходить в сеть"
+
+
+def test_normalization_does_not_start_forbidding_the_allowed_urls() -> None:
+    """Контроль к предыдущему тесту: нормализация не должна свалиться в
+    противоположную крайность и запретить обе разрешённые формы листинга."""
+    sent: list[str] = []
+    client = robots_aware_client(sent)
+    query = QuerySpec(slug="programmist", cluster="embedded")
+    with client:
+        for url in (build_listing_url(query), build_listing_url(query, page=1)):
+            assert client.get(url).status_code == 200
+    assert sent == [
+        "https://hh.ru/vacancies/programmist",
+        "https://hh.ru/vacancies/programmist?page=1",
+    ]

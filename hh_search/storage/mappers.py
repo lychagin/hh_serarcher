@@ -79,15 +79,31 @@ def to_discovered(row: sqlite3.Row) -> DiscoveredVacancy:
 
 
 def to_details(row: sqlite3.Row) -> VacancyDetails:
-    """Поля страницы вакансии, прочитанные обратно.
+    """Поля страницы вакансии, прочитанные обратно — ВСЕ до единого.
 
-    Компания, регион и зарплата живут в колонках `vacancy` и приезжают
-    через `to_discovered`, поэтому здесь повторно не читаются: иначе одна
-    и та же величина имела бы два представления в одной строке.
+    Компания, регион, зарплата и дата публикации лежат в тех же колонках
+    `vacancy`, что читает `to_discovered`, и раньше здесь не читались
+    вовсе: `VacancyDetails` записывался с ними, а возвращался без них.
+    Асимметрия тиха и дорога — тип обещает поле, чтение молча отдаёт
+    `None`, и приёмник отчёта, взявший `details.company`, получил бы
+    пустую колонку без единого предупреждения. Двух представлений одной
+    величины при этом не возникает: колонка одна, читатели просто разные —
+    `DiscoveredVacancy` отвечает на «что мы знаем о вакансии», а
+    `VacancyDetails` — на «что принесла страница», и именно в этом виде
+    его принимает `save_enriched`.
     """
     return VacancyDetails(
         description=decode_text(row["description"]),
         valid_through=decode_optional_utc(row["valid_through"]),
+        published_at=decode_optional_utc(row["published_at"]),
+        company=decode_optional_text(row["company"]),
+        area=decode_optional_text(row["area"]),
+        salary=Salary(
+            raw=decode_optional_text(row["salary_raw"]),
+            amount_from=decode_optional_int(row["salary_from"]),
+            amount_to=decode_optional_int(row["salary_to"]),
+            currency=decode_optional_text(row["salary_currency"]),
+        ),
     )
 
 

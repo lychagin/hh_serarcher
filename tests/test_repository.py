@@ -1332,6 +1332,11 @@ def test_enrichment_fills_but_never_erases_what_discovery_already_knew(
 
     discovered = repo.unreported()[0].discovered
     assert discovered.salary.amount_from == 200000
+    # salary_raw проверяется наравне с числовыми полями: без него мутант,
+    # снимающий COALESCE именно с этой колонки, выживал — а в отчёт идёт
+    # как раз сырая строка, числа лишь сортируют.
+    assert discovered.salary.raw == "от 200 000 руб."
+    assert discovered.salary.currency == "руб."
     assert discovered.company == "ООО Ромашка"
     assert discovered.area == "Нижний Новгород"
     assert discovered.published_at == datetime(2026, 7, 27, 9, 0, tzinfo=UTC)
@@ -1434,3 +1439,136 @@ def test_added_columns_cover_every_column_of_the_current_schema() -> None:
         )
     current.close()
     first_generation.close()
+
+
+# --- Раунд исправлений 6 --------------------------------------------------
+#
+# Перестроение таблицы vacancy состоит из трёх шагов, и `executescript`
+# между ними неявно коммитит отложенную транзакцию. Поэтому состояние
+# «старая таблица отодвинута, новая пустая создана, строки ещё не
+# перелиты» ДОЛГОВЕЧНО: оно переживает смерть процесса (OOM-kill на VPS,
+# docker stop, SIGKILL) и обязано доигрываться следующим стартом.
+
+LEGACY_VACANCY = "vacancy_before_nullable_published_at"
+MIGRATION_ROWS = 3
+
+
+def _first_generation_with_rows(db_path: str, rows: int = MIGRATION_ROWS) -> None:
+    """База предыдущего поколения с живым бэклогом, индексом и внешними ключами."""
+    raw = sqlite3.connect(db_path)
+    raw.executescript(FIRST_GENERATION_SCHEMA)
+    raw.executescript("CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);")
+    for number in range(1, rows + 1):
+        raw.execute(
+            "INSERT INTO vacancy (id, url, title, company, published_at, status, "
+            "first_seen_at, cluster, cluster_weight) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                str(number),
+                f"https://hh.ru/vacancy/{number}",
+                f"Вакансия {number}",
+                "ООО Ромашка",
+                "2026-07-27T09:00:00+00:00",
+                "new",
+                "2026-07-20T09:00:00+00:00",
+                "embedded",
+                9,
+            ),
+        )
+        raw.execute(
+            "INSERT INTO vacancy_query (vacancy_id, query) VALUES (?, 'Yocto')", (str(number),)
+        )
+    raw.commit()
+    raw.close()
+
+
+def _die_inside_migration(db_path: str, stage: str) -> None:
+    """Собрать сырым SQL ровно то состояние, в котором умер процесс.
+
+    Никакого кода миграции здесь не вызывается сознательно: состояние
+    описывается тем, что реально лежит на диске, а не тем, как его туда
+    положили, — иначе тест сторожил бы реализацию, а не восстановление.
+    """
+    raw = sqlite3.connect(db_path)
+    raw.execute("PRAGMA legacy_alter_table=ON")
+    raw.execute("DROP INDEX idx_vacancy_status")
+    raw.execute(f"ALTER TABLE vacancy RENAME TO {LEGACY_VACANCY}")
+    raw.execute("PRAGMA legacy_alter_table=OFF")
+    if stage in ("новая таблица создана", "перелив начат"):
+        raw.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    if stage == "перелив начат":
+        # Перелив успел скопировать первую строку и умер на второй.
+        raw.execute(
+            "INSERT INTO vacancy (id, url, title, company, published_at, status, "
+            f"first_seen_at, cluster, cluster_weight) SELECT id, url, title, company, "
+            "published_at, status, first_seen_at, cluster, cluster_weight "
+            f"FROM {LEGACY_VACANCY} WHERE id = '1'"
+        )
+    raw.commit()
+    raw.close()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["только переименование", "новая таблица создана", "перелив начат"],
+)
+def test_migration_killed_midway_is_finished_by_the_next_start(
+    tmp_path: object, stage: str
+) -> None:
+    """Смерть процесса посреди перестроения не имеет права уносить таблицу.
+
+    Раньше следующий старт видел, что `vacancy` существует и published_at
+    уже nullable, — и не делал НИЧЕГО: строки навсегда оставались в
+    отодвинутой таблице, `vacancy` была пуста, внешние ключи висели,
+    `apply_schema` возвращался без исключения, а `PRAGMA integrity_check`
+    говорил `ok`. Тихая потеря всего бэклога на персистентном томе.
+    """
+    db_path = str(tmp_path) + "/killed.db"
+    _first_generation_with_rows(db_path)
+    _die_inside_migration(db_path, stage)
+
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+
+    pending = repository.pending_enrichment(max_attempts=3)
+    assert {v.id for v in pending} == {str(n) for n in range(1, MIGRATION_ROWS + 1)}
+    assert all(v.company == "ООО Ромашка" for v in pending)
+    assert all(v.published_at == datetime(2026, 7, 27, 9, 0, tzinfo=UTC) for v in pending)
+    assert all(v.found_by_query == "Yocto" for v in pending), "бэкфилл догнал доигранную миграцию"
+    # индекс восстановлен на ПЕРВОМ же старте: он уехал с отодвинутой таблицей
+    assert _indexes_of_vacancy(db_path) >= {"idx_vacancy_status"}
+    # доигранная миграция идемпотентна: следующий старт ничего не ломает
+    repository.init_schema()
+    assert len(repository.pending_enrichment(max_attempts=3)) == MIGRATION_ROWS
+    repository.close()
+
+    raw = sqlite3.connect(db_path)
+    tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert LEGACY_VACANCY not in tables, "отодвинутая таблица обязана исчезнуть"
+    assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    notnull = {r[1]: r[3] for r in raw.execute("PRAGMA table_info(vacancy)")}
+    assert notnull["published_at"] == 0
+    raw.close()
+
+
+def test_details_are_read_back_exactly_as_they_were_written(repo: SqliteRepository) -> None:
+    """`VacancyDetails` — носитель «что принесла страница», и чтение обязано
+    отдавать то же самое. Асимметрия здесь тиха и дорога: тип обещает
+    company/area/salary/published_at, а приёмник отчёта, взявший
+    `details.company`, получал бы пустую колонку без единого предупреждения.
+    """
+    repo.add_discovered(make_listed("1"), "embedded", 9)
+    written = enriched_details()
+    repo.save_enriched("1", written, make_score())
+
+    assert repo.unreported()[0].details == written
+
+
+def test_details_round_trip_through_the_scoring_queue(repo: SqliteRepository) -> None:
+    """Та же симметрия на второй выборке, отдающей VacancyDetails."""
+    repo.add_discovered(make_listed("1"), "embedded", 9)
+    written = enriched_details()
+    repo.save_description("1", written)
+
+    _, details = repo.pending_scoring()[0]
+    assert details == written
