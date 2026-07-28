@@ -25,7 +25,11 @@ class Prefilter:
         # (`Signal` в config/models.py), и сам `_compile`. Проверять третий
         # раз здесь нечего — но тест на это в suite'е есть, потому что
         # именно в отсеве последствия такого сигнала необратимы.
-        self._negative = SignalMatcher(profile.negative)
+        # Группы здесь разворачиваются в плоский список: на шаге 3 сигнал не
+        # участвует ни в каком насыщении, а становится отдельной причиной
+        # отказа в `reject_reason`, и склеивать причины не во что. Повторов
+        # в этом списке быть не может — дубликаты отвергнуты конфигом.
+        self._negative = SignalMatcher([signal for group in profile.negative for signal in group])
 
     def reason_to_reject(self, vacancy: DiscoveredVacancy) -> str | None:
         """Причина отказа или `None`, если вакансия идёт дальше.

@@ -1,6 +1,13 @@
 from hh_search.config.models import ProfileConfig
 from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, VacancyDetails
-from hh_search.filtering.matching import SignalMatcher
+from hh_search.filtering.matching import SignalGroupMatcher
+
+# Поля склеиваются в одну строку, и разделитель обязан быть не-пробельным.
+# С обычным «\n» многословный сигнал совпадал ЧЕРЕЗ СТЫК: `\s+` между
+# словами паттерна считает перевод строки обычным пробелом, поэтому
+# заголовок, кончающийся на «оператор», и описание, начинающееся с «ПК»,
+# давали стоп-слову «оператор пк» минус пятнадцать очков ниоткуда.
+_FIELD_SEPARATOR = "\n|\n"
 
 
 class KeywordScorer:
@@ -9,23 +16,23 @@ class KeywordScorer:
     total = 100 × (w.title·title + w.stack·stack + w.resp·resp + w.domain·domain) − penalty,
     снизу подрезано нулём.
 
-    Известное ограничение: дубликат в списке сигналов накручивает
-    насыщение. `stack: [yocto, yocto, yocto, yocto, yocto]` при
-    `saturation.stack = 5` даёт 1.0 на описании с одним словом — `find`
-    возвращает по одному вхождению на ПАТТЕРН, а не на уникальное слово.
-    Ловить это в коде нечем: дубликат в YAML — законный ключ с законным
-    значением. Проверяется глазами при правке профиля.
+    Единица счёта в насыщении и в штрафе — ГРУППА написаний, а не паттерн:
+    `arm`, `arm64`, `armv7`, `armv8` перечисляются в конфиге вынужденно
+    (§6.1), но означают одну архитектуру. Дубликат внутри списка сигналов
+    накручивал бы насыщение так же, как это делали написания, — он
+    отвергается валидатором конфига, там же, где `_UniqueKeyLoader`
+    отвергает повторный ключ YAML.
     """
 
     def __init__(self, profile: ProfileConfig) -> None:
         self._profile = profile
         signals = profile.signals
-        self._title_roles = SignalMatcher(signals.title_roles)
-        self._title_tech = SignalMatcher(signals.title_tech)
-        self._stack = SignalMatcher(signals.stack)
-        self._responsibilities = SignalMatcher(signals.responsibilities)
-        self._domain = SignalMatcher(signals.domain)
-        self._negative = SignalMatcher(profile.negative)
+        self._title_roles = SignalGroupMatcher(signals.title_roles)
+        self._title_tech = SignalGroupMatcher(signals.title_tech)
+        self._stack = SignalGroupMatcher(signals.stack)
+        self._responsibilities = SignalGroupMatcher(signals.responsibilities)
+        self._domain = SignalGroupMatcher(signals.domain)
+        self._negative = SignalGroupMatcher(profile.negative)
 
     def score(self, discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown:
         title = discovered.title
@@ -40,8 +47,10 @@ class KeywordScorer:
         tech = self._title_tech.find(title)
         stack = self._stack.find(description)
         responsibilities = self._responsibilities.find(description)
-        domain = self._domain.find(f"{description}\n{company}")
-        negative = self._negative.find(f"{title}\n{description}")
+        domain = self._domain.find(f"{description}{_FIELD_SEPARATOR}{company}")
+        # Штраф считается по склейке заголовка и описания одним поиском:
+        # один сигнал — один штраф, сколько бы полей его ни содержало.
+        negative = self._negative.find(f"{title}{_FIELD_SEPARATOR}{description}")
 
         title_component = 1.0 if roles and tech else (0.5 if roles or tech else 0.0)
         # Насыщение обязательно: без min(...) оценка измеряла бы длину
@@ -61,8 +70,9 @@ class KeywordScorer:
             + weights.responsibilities * responsibilities_component
             + weights.domain * domain_component
         )
-        # Штраф пропорционален ЧИСЛУ стоп-слов: одно случайное слово не
-        # убивает хорошую вакансию, три убивают (спека §6).
+        # Штраф пропорционален ЧИСЛУ стоп-сигналов: одно случайное слово не
+        # убивает хорошую вакансию, три убивают (спека §6). Три написания
+        # одного стоп-слова — по-прежнему один сигнал и один штраф.
         penalty = len(negative) * self._profile.penalty_per_signal
         # Верхнего clamp'а нет сознательно: компоненты ≤ 1.0, веса
         # неотрицательны и суммируются в 1.0 (валидатор `Weights`), штраф
@@ -80,8 +90,13 @@ class KeywordScorer:
             penalty=penalty,
             # Округляется только total — число, которое человек сравнивает с
             # порогом. Компоненты остаются как есть: по ним арифметика §6
-            # должна сходиться обратно, а 0.67 вместо 1/3 её ломает.
+            # должна сходиться обратно, а 0.33 вместо 1/3 её ломает.
             total=round(total, 1),
+            # В каждом списке — по одному элементу на ЗАСЧИТАННЫЙ сигнал, а
+            # внутри элемента через « / » перечислены конкретные написания,
+            # из-за которых он засчитан. Так разбивка отвечает разом и на
+            # «какие слова совпали», и на «сколько сигналов набрано»:
+            # len(matched["stack"]) — это ровно числитель насыщения.
             matched={
                 "title_roles": roles,
                 "title_tech": tech,

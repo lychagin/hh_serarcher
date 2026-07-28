@@ -13,39 +13,42 @@ from hh_search.sources.listing import parse_listing
 FIXTURES = Path(__file__).parent / "fixtures"
 LIVE_LISTING = "listing_programmist.html.gz"
 
+SignalList = list[str | list[str]]
+
 # Стоп-слова образца profile.yaml из спеки §7 — ровно те, что поедут в прод.
-SPEC_NEGATIVE = [
-    "junior",
-    "стажёр",
-    "intern",
+# Написания одной сущности собраны в группы: для префильтра это ничего не
+# меняет (он спрашивает «есть ли хоть одно»), но конфиг здесь обязан быть
+# буквальной копией прода, иначе прогон по живому листингу ниже сторожит
+# не тот список.
+SPEC_NEGATIVE: SignalList = [
+    ["junior", "стажёр", "intern"],
     "1c",
     "продаж",
     "рекрутер",
     "ручн тестиров",
-    "оператор пк",
-    "оператор call",
-    "оператор колл",
-    "оператор станка",
+    ["оператор пк", "оператор call", "оператор колл", "оператор станка"],
     "курьер",
 ]
 
+# Позитивные сигналы префильтр не читает вовсе (на шаге 3 известен только
+# заголовок), но пустой список сигналов конфиг больше не принимает: он
+# молча обнуляет компонент оценки. Здесь стоит заведомо не совпадающая
+# заглушка — она и фиксирует непричастность позитивных сигналов к отсеву.
+UNUSED_SIGNAL: SignalList = ["несовпадающаязаглушка"]
 
-def make_profile(negative: list[str]) -> ProfileConfig:
-    """Профиль, в котором заполнено только то, что читает префильтр.
 
-    Позитивные сигналы намеренно пусты: на шаге 3 они не участвуют вовсе,
-    и пустые списки это фиксируют лучше любого комментария.
-    """
+def make_profile(negative: SignalList) -> ProfileConfig:
+    """Профиль, в котором заполнено только то, что читает префильтр."""
     return ProfileConfig(
         weights=Weights(title=0.4, stack=0.3, responsibilities=0.2, domain=0.1),
         saturation=Saturation(stack=5, responsibilities=3),
         penalty_per_signal=15,
         signals=Signals(
-            title_roles=[],
-            title_tech=[],
-            stack=[],
-            responsibilities=[],
-            domain=[],
+            title_roles=UNUSED_SIGNAL,
+            title_tech=UNUSED_SIGNAL,
+            stack=UNUSED_SIGNAL,
+            responsibilities=UNUSED_SIGNAL,
+            domain=UNUSED_SIGNAL,
         ),
         negative=negative,
     )
@@ -114,6 +117,44 @@ def test_empty_stop_word_cannot_reach_the_prefilter() -> None:
         make_profile([""])
     with pytest.raises(ValueError, match="пустой сигнал"):
         SignalMatcher([" "])
+
+
+def test_duplicate_stop_word_cannot_reach_the_prefilter() -> None:
+    """`reject_reason` — единственный след решения, и дубликат заставлял
+    его врать про число различных причин: «стоп-слово в заголовке: junior,
+    junior». Ловится на старте, там же, где дубликат накручивал насыщение
+    в скоринге."""
+    with pytest.raises(ValidationError):
+        make_profile(["junior", "junior"])
+
+
+def test_reason_names_each_matched_spelling_of_a_group_once() -> None:
+    """Группа в стоп-словах — это по-прежнему список причин отказать: в
+    заголовке совпало два написания, оба и названы, каждое по разу."""
+    reason = Prefilter(make_profile([["оператор пк", "оператор станка"]])).reason_to_reject(
+        make_vacancy("Оператор ПК / оператор станка ЧПУ")
+    )
+    assert reason == "стоп-слово в заголовке: оператор пк, оператор станка"
+
+
+def test_reason_carries_no_stray_spacing() -> None:
+    reason = Prefilter(make_profile([" junior "])).reason_to_reject(
+        make_vacancy("Junior Python Developer")
+    )
+    assert reason == "стоп-слово в заголовке: junior"
+
+
+def test_one_letter_cyrillic_stop_word_no_longer_rejects_half_the_listing() -> None:
+    """`negative: ["с"]` компилировался в матч по основе `c\\w*` и после
+    схлопывания омоглифов отбраковывал ЛЮБОЕ слово на латинскую `c` или
+    кириллическую `с`: одиннадцать живых заголовков из двадцати уходили в
+    `rejected` навсегда, с правдоподобной причиной в логе. Это
+    единственная категория опечатки в `negative`, чей эффект и необратим,
+    и невидим."""
+    prefilter = Prefilter(make_profile(["с"]))
+    vacancies = parse_listing(load(LIVE_LISTING), "programmist")
+    rejected = [v.title for v in vacancies if prefilter.reason_to_reject(v) is not None]
+    assert rejected == []
 
 
 def test_no_good_title_is_lost_on_the_live_listing() -> None:

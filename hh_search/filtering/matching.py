@@ -26,14 +26,32 @@ def normalize(text: str) -> str:
     return text.lower().translate(_TRANSLATION)
 
 
+# Ниже этой длины основа перестаёт быть основой. `negative: ["с"]`
+# компилировалось в `(?<![\w+#.])c\w*` и после схлопывания омоглифов
+# совпадало с любым словом на латинскую `c` или кириллическую `с` —
+# одиннадцать живых заголовков из двадцати уходили в необратимый
+# `rejected` с правдоподобной причиной в логе; `по` ловило «поиск»,
+# «поддержку» и «подготовку». Три символа выбраны как первая длина, на
+# которой префикс уже что-то значит: `пк` из живого сигнала «оператор пк»
+# ниже предела и матчится целым словом, оставаясь рабочим.
+_MIN_STEM_LENGTH = 3
+
+
 def _is_stem_word(word: str) -> bool:
     """Кириллическое слово без цифр склоняется, поэтому матчится по основе.
 
     Решение принимается по исходному написанию слова, до нормализации.
     Цифры исключены из правила, чтобы короткие коды вроде «1С» не превращались
-    в неограниченный префиксный матч (1С не должно ловить 1Cats).
+    в неограниченный префиксный матч (1С не должно ловить 1Cats), а слишком
+    короткие слова — потому что их «основа» не отличает ничего от всего.
+    Слово ниже предела не выбрасывается, а матчится целым словом: в конфиге
+    написано именно оно, и молча игнорировать его нельзя.
     """
-    return bool(_CYRILLIC.search(word)) and not any(ch.isdigit() for ch in word)
+    return (
+        len(word) >= _MIN_STEM_LENGTH
+        and bool(_CYRILLIC.search(word))
+        and not any(ch.isdigit() for ch in word)
+    )
 
 
 def _compile(pattern: str) -> re.Pattern[str]:
@@ -55,21 +73,54 @@ def _compile(pattern: str) -> re.Pattern[str]:
     return re.compile(_LEFT_BOUNDARY + body + tail)
 
 
-class SignalMatcher:
-    """Ищет в тексте вхождения списка сигналов, возвращая исходные написания."""
+# Разделитель написаний внутри одной сработавшей группы. Совпавшие
+# написания склеиваются в ОДИН элемент результата, поэтому длина списка
+# равна числу засчитанных сигналов, а сам элемент по-прежнему называет
+# конкретные слова, из-за которых сигнал засчитан (спека §6).
+GROUP_SEPARATOR = " / "
 
-    def __init__(self, patterns: Sequence[str]) -> None:
-        self._patterns = list(patterns)
-        self._compiled = [_compile(pattern) for pattern in self._patterns]
+
+class SignalGroupMatcher:
+    """Ищет в тексте сигналы, каждый из которых задан группой написаний.
+
+    Группа — это одна сущность, записанная несколькими паттернами
+    вынужденно: правая граница §6.1 запрещает букву и цифру вплотную,
+    поэтому `arm`, `arm64`, `armv7`, `armv8` не сводятся к одному
+    паттерну. Считать их четырьмя сигналами значит выдавать одно
+    семейство процессоров за четыре разные технологии — насыщение
+    §6 считает именно группы.
+    """
+
+    def __init__(self, groups: Sequence[Sequence[str]]) -> None:
+        self._groups = [list(group) for group in groups]
+        self._compiled = [[_compile(pattern) for pattern in group] for group in self._groups]
 
     def find(self, text: str) -> list[str]:
+        """По одному элементу на СОВПАВШУЮ группу, в порядке конфига."""
         haystack = normalize(text)
-        return [
-            original
-            for original, regex in zip(self._patterns, self._compiled, strict=True)
-            if regex.search(haystack)
-        ]
+        found: list[str] = []
+        for group, regexes in zip(self._groups, self._compiled, strict=True):
+            matched = [
+                original
+                for original, regex in zip(group, regexes, strict=True)
+                if regex.search(haystack)
+            ]
+            if matched:
+                found.append(GROUP_SEPARATOR.join(matched))
+        return found
 
     def has_any(self, text: str) -> bool:
         haystack = normalize(text)
-        return any(regex.search(haystack) for regex in self._compiled)
+        return any(regex.search(haystack) for group in self._compiled for regex in group)
+
+
+class SignalMatcher(SignalGroupMatcher):
+    """Плоский список сигналов: каждое написание само себе группа.
+
+    Нужен префильтру: там сигнал не участвует ни в каком насыщении, а
+    попадает в `reject_reason` как отдельная причина отказа, и склеивать
+    причины не во что.
+    """
+
+    def __init__(self, patterns: Sequence[str]) -> None:
+        super().__init__([[pattern] for pattern in patterns])

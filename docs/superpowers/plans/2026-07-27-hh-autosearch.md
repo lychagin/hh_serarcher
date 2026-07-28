@@ -6821,16 +6821,22 @@ weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, domain: 0.10}
 saturation: {stack: 5, responsibilities: 3}
 penalty_per_signal: 15
 signals:
-  title_roles: [team lead, tech lead, teamlead, team-lead, tech-lead, тимлид, техлид,
-                senior, сеньор, ведущ, старш, руководител]
-  title_tech:  [backend, embedded, linux, c++, python, node, node.js, nodejs, firmware]
-  stack:       [yocto, buildroot, openwrt, bsp, kernel, arm, arm64, armv7, armv8,
+  # Вложенный список — ГРУППА написаний одной сущности, считающаяся ОДНИМ
+  # сигналом насыщения (спека §6). Простая строка — группа из одного элемента,
+  # поэтому оба написания законны и старые профили не переписываются.
+  title_roles: [[team lead, tech lead, teamlead, team-lead, tech-lead, тимлид, техлид],
+                [senior, сеньор], ведущ, старш, руководител]
+  title_tech:  [backend, embedded, linux, c++, python,
+                [node, node.js, nodejs], firmware]
+  stack:       [yocto, buildroot, openwrt, bsp, kernel,
+                [arm, arm64, armv7, armv8],
                 c++, python, node.js, typescript, docker, kubernetes, kafka,
-                postgresql, clickhouse, llm, llms, rag, mcp]
-  responsibilities: [архитектур, менторинг, код-ревью, code review, проектирован, техдолг]
-  domain:      [телеком, встраиваем, embedded, iot, iiot, микросервис]
-negative: [junior, стажёр, intern, 1c, продаж, рекрутер, ручн тестиров,
-           оператор пк, оператор call, оператор колл, оператор станка, курьер]
+                postgresql, clickhouse, [llm, llms], rag, mcp]
+  responsibilities: [архитектур, менторинг, [код-ревью, code review],
+                     проектирован, техдолг]
+  domain:      [телеком, встраиваем, embedded, [iot, iiot], микросервис]
+negative: [[junior, стажёр, intern], 1c, продаж, рекрутер, ручн тестиров,
+           [оператор пк, оператор call, оператор колл, оператор станка], курьер]
 report_threshold: 60
 ```
 
@@ -6842,17 +6848,26 @@ report_threshold: 60
 | `ведущий` | `ведущ` | Словоформа не ловит косвенные падежи: «Ведущего разработчика C++», «Ведущему инженеру» проходили мимо |
 | `старший` | `старш` | То же: «Старшего разработчика Python» не совпадал |
 | `ручное тестирование` | `ручн тестиров` | Не совпадал ни с «Инженер ручного тестирования», ни с «по ручному тестированию» — стоп-слово почти не работало |
-| `arm` | `arm`, `arm64`, `armv7`, `armv8` | Правая граница запрещает букву и цифру вплотную, поэтому `arm` не ловит `ARM64`/`ARMv7`. `armv` в роли префикса не работает **ни с чем**: латинские паттерны не префиксные, `\w*` дописывается только кириллическим |
-| `node` | `node`, `node.js`, `nodejs` | `node` сознательно не ловит `Node.js` (иначе ловил бы и лишнее), а `NodeJS` не ловит ни один из двух |
-| `llm` | `llm`, `llms` | `LLMs engineer` не совпадал: та же правая граница |
-| `iot` | `iot`, `iiot` | `IIoT` не совпадал: левая граница обрывается на предшествующей букве |
+| `arm` | `[arm, arm64, armv7, armv8]` | Правая граница запрещает букву и цифру вплотную, поэтому `arm` не ловит `ARM64`/`ARMv7`. `armv` в роли префикса не работает **ни с чем**: латинские паттерны не префиксные, `\w*` дописывается только кириллическим. В группе, потому что это одна архитектура: четырьмя сигналами она давала `stack = 0.8` за одно упоминание семейства |
+| `node` | `[node, node.js, nodejs]` | `node` сознательно не ловит `Node.js` (иначе ловил бы и лишнее), а `NodeJS` не ловит ни один из двух |
+| `llm` | `[llm, llms]` | `LLMs engineer` не совпадал: та же правая граница |
+| `iot` | `[iot, iiot]` | `IIoT` не совпадал: левая граница обрывается на предшествующей букве |
 | — | `тимлид`, `техлид`, `сеньор`, `team-lead`, `tech-lead` | Частые формы, не покрытые ничем: `teamlead` не ловит «Тимлид», `team lead` не ловит «Team-Lead» (дефис — не пробел), `senior` не ловит «Сеньор» |
 | `оператор` | `оператор пк`, `оператор call`, `оператор колл`, `оператор станка` | **Отбраковывал целевой телеком**: «Ведущий разработчик C++ в крупный оператор связи» получал −15. Проверено, что после правки этот заголовок чист, а «Оператор ПК», «Оператор call-центра», «Оператор колл-центра», «Оператор станка ЧПУ» по-прежнему отбраковываются |
 
 Два повторяющихся правила, которые объясняют почти всю таблицу: **кириллический сигнал
 задаётся ОСНОВОЙ** (`ведущ`, а не `ведущий`), а **латинский — точной формой**, потому что
 `\w*` дописывается только к кириллическим словам. И там, и там паттерн не срабатывает,
-если сразу за ним стоит буква или цифра.
+если сразу за ним стоит буква или цифра. У матча по основе есть минимальная длина в три
+символа (§6.1): `с` и `по` матчились по основе и отбраковывали 11 и 1 живой заголовок из
+20 соответственно, поэтому короткое кириллическое слово теперь матчится целым словом.
+
+Третье правило — следствие первых двух: раз написания одной сущности приходится
+перечислять, они собираются в **группу**, и насыщение считает группы, а не паттерны
+(спека §6). Иначе `[arm, arm64, armv7, armv8]` выдавали бы одну архитектуру за четыре
+технологии, а `[оператор пк, оператор станка]` в одном заголовке стоили бы двух штрафов.
+Дубликат написания внутри одного поля конфиг отвергает на старте — он накручивал бы то же
+самое насыщение.
 
 Семь сигналов (`тимлид`, `техлид`, `сеньор`, `team-lead`, `tech-lead`, `llms`, `iiot`)
 идут **сверх** образца §7 спеки: их отсутствие проверено прогоном, спека их пока не
@@ -6951,20 +6966,26 @@ def example_config() -> Config:
     return load_config(CONFIG_EXAMPLE)
 
 
-def _signal_groups(config: Config) -> dict[str, list[str]]:
-    groups = config.profile.signals
+def _signal_fields(config: Config) -> dict[str, list[list[str]]]:
+    """Каждое поле — список ГРУПП написаний (спека §6, §7)."""
+    signals = config.profile.signals
     return {
-        "title_roles": groups.title_roles,
-        "title_tech": groups.title_tech,
-        "stack": groups.stack,
-        "responsibilities": groups.responsibilities,
-        "domain": groups.domain,
+        "title_roles": signals.title_roles,
+        "title_tech": signals.title_tech,
+        "stack": signals.stack,
+        "responsibilities": signals.responsibilities,
+        "domain": signals.domain,
         "negative": config.profile.negative,
     }
 
 
 def _all_signals(config: Config) -> list[str]:
-    return [signal for group in _signal_groups(config).values() for signal in group]
+    return [
+        signal
+        for field in _signal_fields(config).values()
+        for group in field
+        for signal in group
+    ]
 
 
 def test_example_config_loads(example_config: Config) -> None:

@@ -2,7 +2,20 @@ import re
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    model_validator,
+)
+
+# Нормализация берётся у матчера, а не пишется здесь заново: уникальность
+# сигналов обязана проверяться в той же форме, в которую они компилируются,
+# иначе `yocto` и ` YOCTO ` окажутся «разными» сигналами, будучи одной и
+# той же регуляркой. Зависимость односторонняя — matching не знает о конфиге.
+from hh_search.filtering.matching import normalize
 
 
 class Base(BaseModel):
@@ -19,16 +32,70 @@ class Base(BaseModel):
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 
 
-def _reject_blank(value: str) -> str:
+def _reject_blank_and_collapse_spacing(value: str) -> str:
     if not value.strip():
         raise ValueError("пустой или пробельный сигнал недопустим: он совпадёт с любым текстом")
-    return value
+    # Пробелы по краям и лишние внутри на матч не влияют (паттерн всё равно
+    # режется по словам), но уезжают как есть в `reject_reason` и в разбивку
+    # оценки, а ещё делают ` yocto ` и `yocto` внешне разными сигналами.
+    return " ".join(value.split())
 
 
 # Пустой сигнал компилируется в регулярку из одних границ слова и матчит почти
 # любой заголовок. В отсеве это необратимо (status='rejected' навсегда) и с
 # пустой причиной в логе, поэтому ловится на старте.
-Signal = Annotated[str, AfterValidator(_reject_blank)]
+Signal = Annotated[str, AfterValidator(_reject_blank_and_collapse_spacing)]
+
+
+def _as_group(value: object) -> object:
+    """Простое написание — это группа из одного написания.
+
+    Благодаря этому `stack: [yocto, docker]` и `stack: [[yocto], [docker]]` —
+    один и тот же конфиг, и профили, написанные до появления групп, не
+    переписываются.
+    """
+    return [value] if isinstance(value, str) else value
+
+
+# Группа — несколько написаний ОДНОЙ сущности, считающихся одним сигналом
+# насыщения (§6). Пустая группа так же бессмысленна, как пустой сигнал.
+SignalGroup = Annotated[list[Signal], BeforeValidator(_as_group), Field(min_length=1)]
+
+
+def _reject_duplicate_signals(groups: list[list[str]]) -> list[list[str]]:
+    """Одно и то же написание в списке дважды — всегда опечатка.
+
+    Дубликат накручивает насыщение: `stack: [yocto, yocto, yocto, yocto,
+    yocto]` при `saturation.stack = 5` даёт 1.0 на описании с одним словом,
+    а `negative: [junior, junior]` — двойной штраф и причину отказа,
+    врущую про число различных причин. Мотивация та же, что у
+    `_UniqueKeyLoader` для повторного ключа YAML: имя правильное, значение
+    законное, а результат — тихо испорченная оценка.
+
+    Сравниваются НОРМАЛИЗОВАННЫЕ формы, потому что дубликатом сигнал
+    делает не написание, а регулярка, в которую он компилируется: `1c` и
+    `1С` (кириллическая) — один и тот же паттерн. Внутри группы и между
+    группами повтор одинаково бессмыслен, поэтому проверка одна на весь
+    список.
+    """
+    seen: dict[str, str] = {}
+    for group in groups:
+        for signal in group:
+            key = normalize(signal)
+            first = seen.get(key)
+            if first is not None:
+                raise ValueError(
+                    f"сигнал {signal!r} повторяет {first!r}: это один и тот же паттерн, "
+                    "а повтор накручивает насыщение и штраф"
+                )
+            seen[key] = signal
+    return groups
+
+
+# Список групп. Уникальность проверяется внутри одного списка, а не поперёк
+# профиля: `python` законно стоит и в `title_tech`, и в `stack` — это разные
+# компоненты формулы с разным насыщением.
+SignalGroups = Annotated[list[SignalGroup], AfterValidator(_reject_duplicate_signals)]
 
 
 class ScheduleConfig(Base):
@@ -98,20 +165,32 @@ class Saturation(Base):
 
 
 class Signals(Base):
-    title_roles: list[Signal]
-    title_tech: list[Signal]
-    stack: list[Signal]
-    responsibilities: list[Signal]
-    domain: list[Signal]
+    # Пустой список молча обнуляет свой компонент оценки и не роняет ничего:
+    # `stack: []` навсегда держит стек на нуле (потолок 70), `title_roles: []`
+    # — заголовок на 0.5 (потолок 80), а все пять пустых дают ровный ноль
+    # каждой вакансии и пустой отчёт без единой ошибки в логе. Спека §7
+    # обещает обратное: опечатка в конфиге роняет процесс на старте.
+    title_roles: SignalGroups = Field(min_length=1)
+    title_tech: SignalGroups = Field(min_length=1)
+    stack: SignalGroups = Field(min_length=1)
+    responsibilities: SignalGroups = Field(min_length=1)
+    domain: SignalGroups = Field(min_length=1)
 
 
 class ProfileConfig(Base):
     weights: Weights
     saturation: Saturation
-    # Отрицательный штраф превращает стоп-слово в бонус: «junior» повышал бы балл.
-    penalty_per_signal: float = Field(ge=0)
+    # Отрицательный штраф превращает стоп-слово в бонус: «junior» повышал бы
+    # балл. Верхняя граница — та же, что у порога и у самой оценки: штраф
+    # в 100 очков уже обнуляет вакансию с одним стоп-словом, а всё, что
+    # больше, — опечатка (`1500` вместо `15`), которая обнуляет отчёт целиком
+    # и никак себя не проявляет. У предела float отказ и вовсе прилетал
+    # `ValidationError`'ом изнутри `score()`, то есть после похода в сеть.
+    penalty_per_signal: float = Field(ge=0, le=100)
     signals: Signals
-    negative: list[Signal]
+    # Единственный список сигналов, которому пустота к лицу: профиль без
+    # стоп-слов означает «локально не отсеиваем ничего», и это осмысленно.
+    negative: SignalGroups
     report_threshold: float = Field(default=60.0, ge=0, le=100)
 
 

@@ -121,6 +121,12 @@ WEIGHTS_LINE = "weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, doma
          "saturation: {stack: 5, responsibilities: 0}"),
         # Отрицательный штраф превращает стоп-слово в бонус.
         ("profile.yaml", "penalty_per_signal: 15", "penalty_per_signal: -100"),
+        # Верхней границы не было вовсе: опечатка в одну цифру обнуляет
+        # ЛЮБУЮ вакансию с одним случайным стоп-словом, а у предела float
+        # отказ прилетает ValidationError'ом уже изнутри score(), то есть
+        # после похода в сеть.
+        ("profile.yaml", "penalty_per_signal: 15", "penalty_per_signal: 1500"),
+        ("profile.yaml", "penalty_per_signal: 15", "penalty_per_signal: 1e400"),
         ("profile.yaml", "report_threshold: 60", "report_threshold: 101"),
         ("profile.yaml", "report_threshold: 60", "report_threshold: -1"),
         # Веса: NaN проходил сквозь abs(nan - 1.0) > 1e-6, отрицательные — сквозь сумму.
@@ -268,6 +274,108 @@ def test_control_character_in_slug_is_rejected(slug: str, case: str) -> None:
     и уже после старта."""
     with pytest.raises(ValidationError):
         QuerySpec(slug=slug, cluster="embedded")
+
+
+# --- Раунд исправлений: группы синонимов и границы списков сигналов -------
+
+
+def test_plain_string_signal_is_a_group_of_one(tmp_path: Path) -> None:
+    """Простое написание остаётся простым написанием в YAML: старые
+    профили не переписываются, но внутри всё уже группы."""
+    cfg = load_config(write_config(tmp_path))
+    assert cfg.profile.signals.stack == [["yocto"]]
+    assert cfg.profile.negative == [["junior"]]
+
+
+def test_nested_list_is_a_group_of_spellings(tmp_path: Path) -> None:
+    """Написания одной технологии перечисляются вынужденно (§6.1), а
+    считаться должны за один сигнал — для этого и вложенный список."""
+    body = PROFILE_YAML.replace("stack: [yocto]", "stack: [[arm, arm64, armv7], yocto]")
+    cfg = load_config(write_config(tmp_path, **{"profile.yaml": body}))
+    assert cfg.profile.signals.stack == [["arm", "arm64", "armv7"], ["yocto"]]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "title_roles: [team lead]",
+        "title_tech: [backend]",
+        "stack: [yocto]",
+        "responsibilities: [архитектур]",
+        "domain: [телеком]",
+    ],
+)
+def test_empty_signal_list_is_rejected(tmp_path: Path, line: str) -> None:
+    """Пустой список молча обнуляет компонент: `stack: []` навсегда держит
+    стек на нуле (потолок 70), `title_roles: []` — заголовок на 0.5
+    (потолок 80), а все пять пустых дают ровный ноль каждой вакансии и
+    пустой отчёт без единой ошибки в логе. Спека §7 обещает, что опечатка
+    в конфиге роняет процесс на старте."""
+    field = line.split(":")[0]
+    body = PROFILE_YAML.replace(line, f"{field}: []")
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, **{"profile.yaml": body}))
+
+
+def test_empty_group_is_rejected(tmp_path: Path) -> None:
+    body = PROFILE_YAML.replace("stack: [yocto]", "stack: [[], yocto]")
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, **{"profile.yaml": body}))
+
+
+def test_empty_negative_list_is_allowed(tmp_path: Path) -> None:
+    """Профиль без стоп-слов осмыслен: конвейер тогда не отсеивает ничего
+    локально. Это единственный список сигналов, которому пустота к лицу."""
+    body = PROFILE_YAML.replace("negative: [junior]", "negative: []")
+    cfg = load_config(write_config(tmp_path, **{"profile.yaml": body}))
+    assert cfg.profile.negative == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "case"),
+    [
+        ("stack: [yocto]", "stack: [yocto, yocto]", "буквальный повтор"),
+        ("stack: [yocto]", 'stack: [yocto, "YOCTO"]', "регистр"),
+        ("stack: [yocto]", 'stack: [yocto, " yocto "]', "пробелы по краям"),
+        ("stack: [yocto]", "stack: [[yocto, bsp], [kernel, yocto]]", "написание в двух группах"),
+        ("stack: [yocto]", "stack: [[yocto, yocto], bsp]", "повтор внутри одной группы"),
+        ("negative: [junior]", "negative: [junior, junior]", "повтор в стоп-словах"),
+        ("negative: [junior]", 'negative: [1c, "1С"]', "кириллический омоглиф"),
+        ("title_roles: [team lead]", 'title_roles: [team lead, "team  lead"]', "двойной пробел"),
+    ],
+)
+def test_duplicate_signal_is_rejected(tmp_path: Path, old: str, new: str, case: str) -> None:
+    """Дубликат накручивает насыщение: `stack: [yocto] * 5` при насыщении 5
+    даёт 1.0 на описании с одним словом. Отвергается по НОРМАЛИЗОВАННОЙ
+    форме — той самой, в которую сигнал компилируется, — иначе `yocto`,
+    ` YOCTO ` и `Yocto` считались бы разными сигналами, будучи одной и той
+    же регуляркой. Мотивация та же, что у `_UniqueKeyLoader` для ключей."""
+    assert old in PROFILE_YAML, "текст подстановки разошёлся с эталонным конфигом"
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, **{"profile.yaml": PROFILE_YAML.replace(old, new)}))
+
+
+def test_same_signal_in_two_different_fields_is_allowed(tmp_path: Path) -> None:
+    """`python` законно стоит и в `title_tech`, и в `stack`: это разные
+    компоненты формулы, и насыщение у них разное. Проверка уникальности
+    работает внутри одного списка, а не поперёк профиля."""
+    body = PROFILE_YAML.replace("title_tech: [backend]", "title_tech: [python]").replace(
+        "stack: [yocto]", "stack: [python]"
+    )
+    cfg = load_config(write_config(tmp_path, **{"profile.yaml": body}))
+    assert cfg.profile.signals.title_tech == [["python"]]
+    assert cfg.profile.signals.stack == [["python"]]
+
+
+def test_stray_spacing_is_stripped_from_a_signal(tmp_path: Path) -> None:
+    """Пробелы по краям на матч не влияют (паттерн всё равно режется по
+    словам), но уезжают в `reject_reason` и в разбивку как есть."""
+    body = PROFILE_YAML.replace("negative: [junior]", 'negative: [" junior "]').replace(
+        "title_roles: [team lead]", 'title_roles: ["team  lead"]'
+    )
+    cfg = load_config(write_config(tmp_path, **{"profile.yaml": body}))
+    assert cfg.profile.negative == [["junior"]]
+    assert cfg.profile.signals.title_roles == [["team lead"]]
 
 
 @pytest.mark.parametrize("slug", ["programmist", "devops", "web-programmist", "1c-programmist"])

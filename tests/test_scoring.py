@@ -10,7 +10,20 @@ FIXTURES = Path(__file__).parent / "fixtures"
 LIVE_VACANCY = "vacancy.html.gz"
 
 
-def make_profile() -> ProfileConfig:
+# Элемент списка сигналов — либо одно написание, либо группа написаний
+# одной сущности (спека §6, §7).
+SignalList = list[str | list[str]]
+
+DEFAULT_STACK: SignalList = ["yocto", "buildroot", "c++", "kubernetes", "kafka", "docker"]
+DEFAULT_DOMAIN: SignalList = ["телеком"]
+DEFAULT_NEGATIVE: SignalList = ["junior", "1c", "продаж"]
+
+
+def make_profile(
+    stack: SignalList | None = None,
+    domain: SignalList | None = None,
+    negative: SignalList | None = None,
+) -> ProfileConfig:
     """Стенд для арифметики §6: в stack шесть сигналов при насыщении 5, в
     responsibilities четыре при насыщении 3 — иначе «насыщение» проверить
     нечем, `min(n/n, 1.0)` и `n/n` неразличимы."""
@@ -21,11 +34,11 @@ def make_profile() -> ProfileConfig:
         signals=Signals(
             title_roles=["team lead", "senior"],
             title_tech=["backend", "embedded"],
-            stack=["yocto", "buildroot", "c++", "kubernetes", "kafka", "docker"],
+            stack=DEFAULT_STACK if stack is None else stack,
             responsibilities=["архитектур", "менторинг", "код-ревью", "проектирован"],
-            domain=["телеком"],
+            domain=DEFAULT_DOMAIN if domain is None else domain,
         ),
-        negative=["junior", "1c", "продаж"],
+        negative=DEFAULT_NEGATIVE if negative is None else negative,
     )
 
 
@@ -34,6 +47,9 @@ def score_for(
     description: str,
     company: str | None = None,
     page_company: str | None = None,
+    stack: SignalList | None = None,
+    domain: SignalList | None = None,
+    negative: SignalList | None = None,
 ) -> ScoreBreakdown:
     discovered = DiscoveredVacancy(
         id="1",
@@ -43,7 +59,8 @@ def score_for(
         found_by_query="programmist",
     )
     details = VacancyDetails(description=description, company=page_company)
-    return KeywordScorer(make_profile()).score(discovered, details)
+    profile = make_profile(stack=stack, domain=domain, negative=negative)
+    return KeywordScorer(profile).score(discovered, details)
 
 
 def load(name: str) -> str:
@@ -146,6 +163,89 @@ def test_total_never_goes_below_zero() -> None:
     assert score_for("Junior 1C", "Junior 1C, продажи").total == 0.0
 
 
+def test_stop_word_only_in_the_title_is_penalised() -> None:
+    """Штраф считается по склейке заголовка и описания. Единственный
+    прежний тест с заголовочным стоп-словом дублировал его в описании,
+    поэтому «ищем только в описании» не краснело нигде."""
+    result = score_for("Junior Engineer", "Разработка сервисов на C++")
+    assert result.matched["negative"] == ["junior"]
+    assert result.penalty == 15.0
+
+
+def test_stop_word_only_in_the_description_is_penalised() -> None:
+    result = score_for("Инженер", "Ищем junior-разработчика в команду")
+    assert result.matched["negative"] == ["junior"]
+    assert result.penalty == 15.0
+
+
+def test_stop_word_in_both_fields_costs_one_penalty() -> None:
+    """Один сигнал — один штраф. Если считать поля по отдельности, слово,
+    встретившееся и в заголовке, и в описании (самый частый случай),
+    стоило бы вакансии тридцать очков вместо пятнадцати."""
+    result = score_for("Junior Engineer", "Ищем junior-разработчика в команду")
+    assert result.matched["negative"] == ["junior"]
+    assert result.penalty == 15.0
+
+
+def test_stack_and_responsibilities_are_read_from_the_description_only() -> None:
+    """§6: stack и responsibilities считаются ПО ПОЛНОМУ ОПИСАНИЮ, заголовок
+    отработан отдельным компонентом `title`. Если искать стек ещё и в
+    заголовке, «Yocto/C++/Docker» в названии добавит 30 очков сверх тех 40,
+    которые за то же самое уже начислил `title`."""
+    result = score_for("Yocto Buildroot C++ Kubernetes Kafka Docker, архитектура", "")
+    assert result.matched["stack"] == []
+    assert result.matched["responsibilities"] == []
+    assert (result.stack, result.responsibilities) == (0.0, 0.0)
+
+
+def test_components_of_the_breakdown_are_not_rounded() -> None:
+    """Округляется только `total`. Компоненты остаются как есть: по ним
+    арифметика §6 должна сходиться обратно, а 0.33 вместо 1/3 её ломает —
+    и ломает молча, потому что нецелого компонента не проверял ни один
+    прежний тест."""
+    result = score_for("Инженер", "Участие в архитектуре подсистем")
+    assert result.responsibilities == 1 / 3
+    assert result.responsibilities != round(1 / 3, 2)
+    # С округлением компонентов до двух знаков было бы 6.6.
+    assert result.total == 6.7
+
+
+def test_total_is_rounded_and_not_rounded_up() -> None:
+    """13.333… → 13.3, а не 13.4. Направление округления фиксируется
+    отдельно: «округлить» и «округлить вверх» совпадают на большинстве
+    входов и расходятся ровно там, где балл сравнивают с порогом."""
+    result = score_for("Инженер", "Архитектура сервисов и менторинг команды")
+    assert result.responsibilities == 2 / 3
+    assert result.total == 13.3
+
+
+def test_breakdown_names_the_words_behind_every_component() -> None:
+    """Шесть списков разбивки — это ответ на вопрос «почему 87?» (§6).
+    Три из них (`domain`, `title_tech`, `responsibilities`) не проверялись
+    на непустоту ни разу: подмена любого из них пустым списком проходила
+    весь набор тестов зелёной."""
+    result = score_for(
+        "Senior Embedded Engineer",
+        "Архитектура сервисов, опыт Yocto",
+        company="Телеком Решения",
+    )
+    assert result.matched["title_roles"] == ["senior"]
+    assert result.matched["title_tech"] == ["embedded"]
+    assert result.matched["stack"] == ["yocto"]
+    assert result.matched["responsibilities"] == ["архитектур"]
+    assert result.matched["domain"] == ["телеком"]
+
+
+def test_company_from_the_listing_wins_over_the_one_from_the_page() -> None:
+    """Порядок именно такой, потому что в отчёт печатается
+    `discovered.company`: балл обязан объясняться той же строкой, которую
+    читатель отчёта видит глазами. `details.company` — не приоритет, а
+    запасной вариант на первый прогон, когда листинг компании не дал."""
+    result = score_for("Инженер", "", company="Рога и Копыта", page_company="Телеком Решения")
+    assert result.matched["domain"] == []
+    assert result.domain == 0.0
+
+
 def test_matched_lists_follow_config_order() -> None:
     """Порядок в разбивке — порядок КОНФИГА, а не порядок вхождения в текст.
     В описании сначала Kafka, в конфиге сначала yocto."""
@@ -154,36 +254,156 @@ def test_matched_lists_follow_config_order() -> None:
     assert result.matched["title_roles"] == ["senior"]
 
 
+# --- группы синонимов -----------------------------------------------------
+
+ARM_STACK: SignalList = [
+    ["arm", "arm64", "armv7", "armv8"],
+    "yocto",
+    "docker",
+    "kafka",
+    "python",
+]
+
+
+def test_spellings_of_one_technology_count_as_one_signal() -> None:
+    """§6.1 обязывает писать `arm`, `arm64`, `armv7`, `armv8` отдельными
+    паттернами: правая граница запрещает букву и цифру вплотную. Если
+    считать их четырьмя сигналами, описание, упоминающее ОДНО семейство
+    процессоров, набирает столько же, сколько описание с четырьмя разными
+    технологиями. Группа — один сигнал насыщения."""
+    result = score_for("Инженер", "Опыт ARM, ARM64, ARMv7 и ARMv8", stack=ARM_STACK)
+    assert result.matched["stack"] == ["arm / arm64 / armv7 / armv8"]
+    assert result.stack == 0.2
+    # Прежде было 4/5 = 0.8 и 24 очка из 30 за одну архитектуру.
+    assert result.total == 6.0
+
+
+def test_five_different_technologies_still_saturate() -> None:
+    """Обратная сторона той же проверки: группировка не должна занижать
+    вакансию, в которой технологии действительно разные."""
+    result = score_for("Инженер", "ARM, Yocto, Docker, Kafka, Python в проекте", stack=ARM_STACK)
+    assert result.matched["stack"] == ["arm", "yocto", "docker", "kafka", "python"]
+    assert result.stack == 1.0
+
+
+def test_matched_shows_the_spellings_and_the_number_of_counted_signals() -> None:
+    """Разбивка обязана отвечать и «какие слова совпали», и «сколько
+    сигналов засчитано». Совпавшие написания одной группы склеены в один
+    элемент, поэтому длина списка — это ровно числитель насыщения."""
+    result = score_for("Инженер", "Сборка под ARM64 и ARMv7, Docker", stack=ARM_STACK)
+    assert result.matched["stack"] == ["arm64 / armv7", "docker"]
+    assert len(result.matched["stack"]) == 2
+    assert result.stack == 0.4
+
+
+def test_spellings_of_one_stop_word_cost_one_penalty() -> None:
+    """Три написания одного стоп-слова — не три причины отказать."""
+    result = score_for(
+        "Оператор ПК",
+        "Оператор call-центра, он же оператор колл-центра",
+        negative=[["оператор пк", "оператор call", "оператор колл"]],
+    )
+    assert result.matched["negative"] == ["оператор пк / оператор call / оператор колл"]
+    assert result.penalty == 15.0
+
+
+# --- склейка полей --------------------------------------------------------
+
+
+def test_multiword_signal_does_not_match_across_title_and_description() -> None:
+    """Поля склеиваются в одну строку, и `\\s+` между словами паттерна
+    считает перевод строки обычным пробелом. Заголовок, кончающийся на
+    «оператор», и описание, начинающееся с «ПК», давали стоп-слову
+    «оператор пк» совпасть через стык — минус пятнадцать очков ниоткуда."""
+    result = score_for(
+        "Ведущий оператор",
+        "ПК и серверы в парке компании",
+        negative=[["оператор пк"]],
+    )
+    assert result.matched["negative"] == []
+    assert result.penalty == 0.0
+
+
+def test_multiword_signal_does_not_match_across_description_and_company() -> None:
+    result = score_for(
+        "Инженер",
+        "Телефонная связь",
+        company="Москва",
+        domain=[["связь москва"]],
+    )
+    assert result.matched["domain"] == []
+    assert result.domain == 0.0
+
+
 # --- живая страница -------------------------------------------------------
 
 
 def spec_profile() -> ProfileConfig:
     """Образец profile.yaml из спеки §7 — тот, что поедет в прод.
 
-    Списки заданы через `|`, потому что среди сигналов есть многословные
-    («team lead», «ручн тестиров»), а вертикальная простыня из шестидесяти
-    строк не читается.
+    Написания одной сущности собраны в группы: `arm`/`arm64`/`armv7`/`armv8`
+    перечислены отдельными паттернами вынужденно (§6.1), но означают одну
+    архитектуру и считаются одним сигналом.
     """
     return ProfileConfig(
         weights=Weights(title=0.40, stack=0.30, responsibilities=0.20, domain=0.10),
         saturation=Saturation(stack=5, responsibilities=3),
         penalty_per_signal=15,
         signals=Signals(
-            title_roles="team lead|tech lead|teamlead|senior|ведущ|старш|руководител".split("|"),
-            title_tech="backend|embedded|linux|c++|python|node|node.js|nodejs|firmware".split("|"),
-            stack=(
-                "yocto|buildroot|openwrt|bsp|kernel|arm|arm64|armv7|armv8|c++|python|node.js|"
-                "typescript|docker|kubernetes|kafka|postgresql|clickhouse|llm|rag|mcp"
-            ).split("|"),
-            responsibilities=(
-                "архитектур|менторинг|код-ревью|code review|проектирован|техдолг"
-            ).split("|"),
-            domain="телеком|встраиваем|embedded|iot|микросервис".split("|"),
+            title_roles=[
+                ["team lead", "tech lead", "teamlead"],
+                "senior",
+                "ведущ",
+                "старш",
+                "руководител",
+            ],
+            title_tech=[
+                "backend",
+                "embedded",
+                "linux",
+                "c++",
+                "python",
+                ["node", "node.js", "nodejs"],
+                "firmware",
+            ],
+            stack=[
+                "yocto",
+                "buildroot",
+                "openwrt",
+                "bsp",
+                "kernel",
+                ["arm", "arm64", "armv7", "armv8"],
+                "c++",
+                "python",
+                "node.js",
+                "typescript",
+                "docker",
+                "kubernetes",
+                "kafka",
+                "postgresql",
+                "clickhouse",
+                "llm",
+                "rag",
+                "mcp",
+            ],
+            responsibilities=[
+                "архитектур",
+                "менторинг",
+                ["код-ревью", "code review"],
+                "проектирован",
+                "техдолг",
+            ],
+            domain=["телеком", "встраиваем", "embedded", "iot", "микросервис"],
         ),
-        negative=(
-            "junior|стажёр|intern|1c|продаж|рекрутер|ручн тестиров|оператор пк|"
-            "оператор call|оператор колл|оператор станка|курьер"
-        ).split("|"),
+        negative=[
+            ["junior", "стажёр", "intern"],
+            "1c",
+            "продаж",
+            "рекрутер",
+            "ручн тестиров",
+            ["оператор пк", "оператор call", "оператор колл", "оператор станка"],
+            "курьер",
+        ],
         report_threshold=60,
     )
 
@@ -199,7 +419,8 @@ def test_live_vacancy_page_scores_as_measured() -> None:
     по пустому разделу «Топ».
 
     Заодно это второй, независимый от синтетики свидетель насыщения:
-    совпало семь сигналов стека при насыщении 5.
+    совпало шесть сигналов стека при насыщении 5 — семь написаний, из
+    которых `arm` и `arm64` считаются одной архитектурой.
     """
     details = parse_vacancy_page(load(LIVE_VACANCY))
     discovered = DiscoveredVacancy(
@@ -209,7 +430,14 @@ def test_live_vacancy_page_scores_as_measured() -> None:
         found_by_query="programmist",
     )
     result = KeywordScorer(spec_profile()).score(discovered, details)
-    assert result.matched["stack"] == ["yocto", "buildroot", "bsp", "kernel", "arm", "arm64", "c++"]
+    assert result.matched["stack"] == [
+        "yocto",
+        "buildroot",
+        "bsp",
+        "kernel",
+        "arm / arm64",
+        "c++",
+    ]
     assert result.matched["responsibilities"] == []
     assert (result.title, result.stack, result.responsibilities, result.domain) == (
         1.0,
