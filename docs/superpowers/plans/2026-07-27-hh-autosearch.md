@@ -3481,7 +3481,7 @@ end-to-end: она вызывала три несуществующих мето
 шагов значим» от разбиения не размазывается — он целиком живёт в `run_once`, который стал
 короче и читается за один экран.
 
-- [ ] **Step 1: Правка Task 6 — `finished_at` только по имени**
+- [x] **Step 1: Правка Task 6 — `finished_at` только по имени**
 
 `finish_run` принимает счётчики через `**counters`, а `finished_at` стоял третьим позиционным
 параметром: значение счётчика, переданное позиционно, молча уезжало в дату завершения, а имя
@@ -3516,7 +3516,7 @@ Run: `uv run mypy --strict hh_search && uv run pytest tests/test_repository.py -
 Expected: `Success: no issues found`, `56 passed` (тесты хранилища не менялись: все
 существующие вызовы уже передают `finished_at` по имени)
 
-- [ ] **Step 2: Написать падающий тест**
+- [x] **Step 2: Написать падающий тест**
 
 Создать `tests/test_pipeline.py`:
 
@@ -4244,12 +4244,12 @@ def test_more_than_half_failed_pages_raise_the_canary(
     assert "сменил вёрстку" in caplog.text
 ```
 
-- [ ] **Step 3: Запустить тест и убедиться, что он падает**
+- [x] **Step 3: Запустить тест и убедиться, что он падает**
 
 Run: `uv run pytest tests/test_pipeline.py -q`
 Expected: `ModuleNotFoundError: No module named 'hh_search.pipeline'`, «1 error»
 
-- [ ] **Step 4: Реализовать `hh_search/pipeline/stats.py`**
+- [x] **Step 4: Реализовать `hh_search/pipeline/stats.py`**
 
 ```python
 """Счётчики прогона и его статус.
@@ -4356,7 +4356,7 @@ class RunStats(BaseModel):
         return EXIT_CODES[self.status]
 ```
 
-- [ ] **Step 5: Реализовать `hh_search/pipeline/discovery.py`**
+- [x] **Step 5: Реализовать `hh_search/pipeline/discovery.py`**
 
 ```python
 """Шаги 1–3: листинги, дедупликация, префильтр (спека §4.1).
@@ -4499,7 +4499,7 @@ def prefilter(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
             stats.rejected += 1
 ```
 
-- [ ] **Step 6: Реализовать `hh_search/pipeline/enrichment.py`**
+- [x] **Step 6: Реализовать `hh_search/pipeline/enrichment.py`**
 
 ```python
 """Шаги 4–6: страница вакансии, оценка и локальный пересчёт (спека §4.1).
@@ -4696,7 +4696,7 @@ def rescore(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> int:
     return rescored
 ```
 
-- [ ] **Step 7: Реализовать `hh_search/pipeline/reporting.py`**
+- [x] **Step 7: Реализовать `hh_search/pipeline/reporting.py`**
 
 ```python
 """Шаг 7: отправка готового в приёмники (спека §4.1, §5.2).
@@ -4827,7 +4827,7 @@ def _complain(
     )
 ```
 
-- [ ] **Step 8: Реализовать `hh_search/pipeline/__init__.py`**
+- [x] **Step 8: Реализовать `hh_search/pipeline/__init__.py`**
 
 ```python
 """Оркестрация семи шагов конвейера (спека §4.1).
@@ -4920,13 +4920,13 @@ def run_once(
     return stats
 ```
 
-- [ ] **Step 9: Запустить тесты, типы и линтер**
+- [x] **Step 9: Запустить тесты, типы и линтер**
 
 Run: `uv run pytest tests/test_pipeline.py -q && uv run mypy --strict hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/pipeline tests/test_pipeline.py`
 Expected: `23 passed`, `Success: no issues found`, `All checks passed!`,
 `6 files already formatted`
 
-- [ ] **Step 10: Проверочные прогоны — то, чего pytest не видит**
+- [x] **Step 10: Проверочные прогоны — то, чего pytest не видит**
 
 Три Critical этой задачи ревьюер нашёл не тестами, а прогонами. Их обязательно выполнить
 руками: `pytest` проверяет ожидания, а эти три проверки проверяют ФАКТЫ — число запросов к
@@ -5235,7 +5235,7 @@ Expected (фактический вывод, числа настоящие):
 
 Удалить скрипт: `rm check_pipeline.py`
 
-- [ ] **Step 11: Мутационная проверка — каждый тест обязан краснеть**
+- [x] **Step 11: Мутационная проверка — каждый тест обязан краснеть**
 
 Восемь тестов прежней редакции проходили при полностью неработающем конвейере (один проверял
 отсутствие одного URL и был зелен, даже если не скачано ни одной страницы). Чтобы это не
@@ -5268,13 +5268,13 @@ Expected (фактический вывод, числа настоящие):
 единственная, которая на первом заходе ВЫЖИЛА (её маскировал `reset_cache`), из-за чего в
 набор добавлен отдельный тест на сам порядок записи.
 
-- [ ] **Step 12: Прогнать весь набор**
+- [x] **Step 12: Прогнать весь набор**
 
 Run: `uv run pytest -q && uv run mypy --strict hh_search tests && uv run ruff check .`
 Expected: `343 passed` (281 на `f9f77bd` + 39 за задачи 7–9 + 23 здесь), `Success: no issues
 found`, `All checks passed!`
 
-- [ ] **Step 13: Коммит**
+- [x] **Step 13: Коммит**
 
 ```bash
 git add hh_search/pipeline hh_search/storage/repository.py hh_search/storage/run_log.py \

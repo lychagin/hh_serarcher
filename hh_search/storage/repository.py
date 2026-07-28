@@ -390,10 +390,11 @@ class SqliteRepository:
         self,
         run_id: int,
         status: str,
+        *,
         finished_at: datetime | None = None,
         **counters: int | str | None,
     ) -> None:
-        self._run_log.finish_run(run_id, status, finished_at, **counters)
+        self._run_log.finish_run(run_id, status, finished_at=finished_at, **counters)
 
     def last_successful_run(self) -> datetime | None:
         return self._run_log.last_successful_run()
