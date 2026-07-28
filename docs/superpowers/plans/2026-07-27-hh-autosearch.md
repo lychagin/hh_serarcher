@@ -5372,7 +5372,7 @@ robots.txt больше не жгут enrich_attempts, иначе двенадц
 до `init_schema()` — каталог базы создавал только `init-db`. Порядок команд, которого нигде не
 обещано. Теперь каталог создаёт и `_execute`.
 
-- [ ] **Step 1: Правки хранилища, нужные CLI**
+- [x] **Step 1: Правки хранилища, нужные CLI**
 
 В `hh_search/storage/repository.py`: `set_status` возвращает `bool`, и добавляется
 `reported_since` рядом с `unreported` (тем же способом чтения — `CAST(... AS BLOB)` плюс
@@ -5456,7 +5456,7 @@ def test_reported_since_takes_only_reported_rows_inside_the_window(tmp_path: obj
 Run: `uv run pytest tests/test_repository.py -q && uv run mypy --strict hh_search`
 Expected: `57 passed` (56 + один новый), `Success: no issues found`
 
-- [ ] **Step 2: Написать падающие тесты**
+- [x] **Step 2: Написать падающие тесты**
 
 Создать `tests/test_cli.py`:
 
@@ -6082,13 +6082,13 @@ def test_waiting_is_interrupted_by_the_signal() -> None:
     assert elapsed < 5.0
 ```
 
-- [ ] **Step 3: Запустить тесты и убедиться, что они падают**
+- [x] **Step 3: Запустить тесты и убедиться, что они падают**
 
 Run: `uv run pytest tests/test_cli.py tests/test_scheduler.py -q`
 Expected: `ModuleNotFoundError: No module named 'hh_search.__main__'` и
 `No module named 'hh_search.scheduler'`, «2 errors»
 
-- [ ] **Step 4: Реализовать `hh_search/logging_setup.py`**
+- [x] **Step 4: Реализовать `hh_search/logging_setup.py`**
 
 ```python
 """Логи одновременно в stdout (их забирает `docker logs`) и в файл с ротацией."""
@@ -6140,7 +6140,7 @@ def setup_logging(logs_dir: Path, level: int = logging.INFO) -> None:
         root.error("логи пишутся только в stdout: каталог %s недоступен (%s)", logs_dir, file_error)
 ```
 
-- [ ] **Step 5: Реализовать `hh_search/scheduler.py`**
+- [x] **Step 5: Реализовать `hh_search/scheduler.py`**
 
 ```python
 """Цикл режима `serve`: расписание, остановка по сигналу, устойчивый 403."""
@@ -6287,7 +6287,7 @@ def _wait_until(signal_: StopSignal, remaining: float, interval: float) -> None:
     signal_.wait(remaining)
 ```
 
-- [ ] **Step 6: Реализовать `hh_search/__main__.py`**
+- [x] **Step 6: Реализовать `hh_search/__main__.py`**
 
 ```python
 """CLI (спека §8.3). Конфиг читается ЛЕНИВО, внутри команды.
@@ -6499,7 +6499,7 @@ if __name__ == "__main__":
     app()
 ```
 
-- [ ] **Step 7: Запустить тесты, типы и линтер**
+- [x] **Step 7: Запустить тесты, типы и линтер**
 
 Run: `uv run pytest tests/test_cli.py tests/test_scheduler.py -q && uv run mypy --strict hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/scheduler.py hh_search/logging_setup.py hh_search/__main__.py tests/test_cli.py tests/test_scheduler.py`
 Expected: `32 passed` (23 + 9), `Success: no issues found`, `All checks passed!`,
@@ -6509,7 +6509,7 @@ Expected: `32 passed` (23 + 9), `Success: no issues found`, `All checks passed!`
 подменить его нечем), поэтому `delay_between_requests_sec` в тестовом `app.yaml` понижен до
 минимально разрешённых 0.1 с: с секундой файл шёл 23 секунды вместо трёх.
 
-- [ ] **Step 8: Мутационная проверка**
+- [x] **Step 8: Мутационная проверка**
 
 Двадцать две мутации, все обязаны быть убиты:
 
@@ -6543,13 +6543,13 @@ Expected: `32 passed` (23 + 9), `Success: no issues found`, `All checks passed!`
 внутри `CliRunner` тоже даёт единицу; поэтому тест теперь проверяет и сообщение, и что
 исключение не улетело наружу.
 
-- [ ] **Step 9: Прогнать весь набор**
+- [x] **Step 9: Прогнать весь набор**
 
 Run: `uv run pytest -q && uv run mypy --strict hh_search tests && uv run ruff check .`
 Expected: `376 passed` (343 после задачи 10 + 32 здесь + 1 в тестах хранилища),
 `Success: no issues found`, `All checks passed!`
 
-- [ ] **Step 10: Коммит**
+- [x] **Step 10: Коммит**
 
 ```bash
 git add hh_search/__main__.py hh_search/scheduler.py hh_search/logging_setup.py \

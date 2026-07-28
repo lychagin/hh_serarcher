@@ -1572,3 +1572,28 @@ def test_details_round_trip_through_the_scoring_queue(repo: SqliteRepository) ->
 
     _, details = repo.pending_scoring()[0]
     assert details == written
+
+
+def test_reported_since_takes_only_reported_rows_inside_the_window(tmp_path: object) -> None:
+    """`report --since N` — выборка по окну, а не «всё, что есть».
+
+    Проверяются обе границы сразу: неотправленная вакансия в отчёт не
+    попадает (её отправит конвейер, и повтор был бы задвоением), а
+    отправленная раньше окна — не попадает тоже, иначе `--since` не значит
+    ничего.
+    """
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    for vacancy_id in ("1", "2", "3"):
+        repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+        repository.save_enriched(vacancy_id, VacancyDetails(description="текст"), make_score())
+    repository.mark_reported(["1", "2"])
+    repository.close()
+    long_ago = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    corrupt(db_path, "UPDATE vacancy SET reported_at = ? WHERE id = '2'", long_ago)
+
+    repository = SqliteRepository(db_path)
+    window = datetime.now(UTC) - timedelta(days=7)
+    assert [item.discovered.id for item in repository.reported_since(window)] == ["1"]
+    repository.close()

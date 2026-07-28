@@ -15,7 +15,7 @@ from hh_search.storage.mappers import to_discovered, to_scored, to_scoring_task
 from hh_search.storage.migrations import apply_schema
 from hh_search.storage.quarantine import Quarantine, safe_rows
 from hh_search.storage.run_log import RunLog
-from hh_search.storage.time_utils import now_iso, to_utc_iso_optional
+from hh_search.storage.time_utils import now_iso, to_utc_iso, to_utc_iso_optional
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
@@ -161,11 +161,18 @@ class SqliteRepository:
         )
         self._connection.commit()
 
-    def set_status(self, vacancy_id: str, status: str) -> None:
-        self._connection.execute(
+    def set_status(self, vacancy_id: str, status: str) -> bool:
+        """Ручная смена статуса. `False` — такой вакансии в базе нет.
+
+        Результат возвращается, потому что вызывающий — CLI, а id туда
+        вводит человек: `mark 999999 applied` на несуществующей вакансии
+        без этого печатал бы «готово» и отдавал код 0.
+        """
+        cursor = self._connection.execute(
             "UPDATE vacancy SET status = ? WHERE id = ?", (status, vacancy_id)
         )
         self._connection.commit()
+        return cursor.rowcount > 0
 
     # --- 1: обогащение, единственная выборка, ходящая в сеть -------------
 
@@ -344,6 +351,29 @@ class SqliteRepository:
             "FROM vacancy WHERE status = ? AND description IS NOT NULL "
             "AND score_detail IS NOT NULL ORDER BY score DESC",
             (STATUS_NEW,),
+        ).fetchall()
+        return safe_rows(rows, to_scored, self._quarantine)
+
+    def reported_since(self, cutoff: datetime) -> list[ScoredVacancy]:
+        """Уже отправленное — для повторной генерации отчёта командой `report`.
+
+        Читается ровно теми же средствами, что `unreported()`:
+        `CAST(... AS BLOB)` плюс `safe_rows`. Без них одна испорченная
+        строка роняла бы весь курсор (sqlite3 декодирует TEXT на этапе
+        fetch, до того как код увидит хоть одну строку) — то есть
+        единственный способ пользователя вернуть историю ломался бы от
+        того, что конвейер переживает. Запрос, которым вакансия найдена,
+        берётся из колонки `primary_query`, а не подзапросом по
+        `vacancy_query`: подзапрос без ORDER BY недетерминирован и мог
+        разойтись с кластером в том же отчёте.
+        """
+        rows = self._connection.execute(
+            f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
+            "CAST(valid_through AS BLOB) AS valid_through, "
+            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
+            "FROM vacancy WHERE status = ? AND reported_at >= ? "
+            "AND description IS NOT NULL AND score_detail IS NOT NULL ORDER BY score DESC",
+            (STATUS_REPORTED, to_utc_iso(cutoff)),
         ).fetchall()
         return safe_rows(rows, to_scored, self._quarantine)
 
