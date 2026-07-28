@@ -67,9 +67,7 @@ def test_whole_word_pattern_matches_at_end_of_sentence() -> None:
     # не совпадало.
     assert SignalMatcher(["python"]).find("Требуется Python.") == ["python"]
     assert SignalMatcher(["lead"]).find("Ищем опытного Team Lead.") == ["lead"]
-    assert SignalMatcher(["django"]).find("Опыт: Python. Знание Django.") == [
-        "django"
-    ]
+    assert SignalMatcher(["django"]).find("Опыт: Python. Знание Django.") == ["django"]
 
 
 def test_dotted_suffix_still_excluded_from_whole_word_match() -> None:
@@ -83,9 +81,7 @@ def test_multiword_cyrillic_stem_declines_every_word() -> None:
     # Раньше \w* приклеивался только к последнему слову фразы, поэтому
     # промежуточные слова требовали точного совпадения без учёта склонения.
     matcher = SignalMatcher(["информацион безопасн"])
-    assert matcher.find("информационной безопасности данных") == [
-        "информацион безопасн"
-    ]
+    assert matcher.find("информационной безопасности данных") == ["информацион безопасн"]
 
 
 def test_cyrillic_word_with_digit_requires_whole_word_match() -> None:

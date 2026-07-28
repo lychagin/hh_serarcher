@@ -30,6 +30,10 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Форматтер понимает python-блоки внутри markdown. Без исключения зелёный CI
+# зависел бы от вёрстки примеров в документах — в том числе в файле плана,
+# который ruff переформатирует наравне с кодом.
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 # BLE и SLF включены намеренно: широкий except и доступ к приватным атрибутам

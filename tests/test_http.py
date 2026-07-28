@@ -343,9 +343,7 @@ def test_redirect_to_another_host_rechecks_that_hosts_robots() -> None:
     respx.get("https://hh.ru/vacancy/1").mock(
         return_value=httpx.Response(302, headers={"Location": "https://hh.kz/vacancy/1"})
     )
-    target = respx.get("https://hh.kz/vacancy/1").mock(
-        return_value=httpx.Response(200, text="ok")
-    )
+    target = respx.get("https://hh.kz/vacancy/1").mock(return_value=httpx.Response(200, text="ok"))
     client, _ = make_client(respect_robots=True)
     with client, pytest.raises(RobotsDisallowed):
         client.get("https://hh.ru/vacancy/1")
@@ -510,9 +508,7 @@ def counting_transport(sent: list[str]) -> httpx.MockTransport:
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/robots.txt":
-            return httpx.Response(
-                200, text=LIVE_ROBOTS, headers={"Content-Type": "text/plain"}
-            )
+            return httpx.Response(200, text=LIVE_ROBOTS, headers={"Content-Type": "text/plain"})
         sent.append(str(request.url))
         return httpx.Response(200, text="ok")
 

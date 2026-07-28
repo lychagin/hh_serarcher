@@ -199,8 +199,7 @@ def test_extract_salary_ignores_a_renamed_attribute() -> None:
 
 DRIFTED_BLOCKS = {
     "вложенный div перед суммой": (
-        '<div data-qa="vacancy-salary"><div class="wrapper"></div>'
-        "<span>от 100 000 ₽</span></div>"
+        '<div data-qa="vacancy-salary"><div class="wrapper"></div><span>от 100 000 ₽</span></div>'
     ),
     "пустой блок": '<div data-qa="vacancy-salary"></div>',
     "блок из одной разметки": '<div data-qa="vacancy-salary"><span></span></div>',
@@ -214,9 +213,7 @@ def test_salary_block_without_text_is_drift_and_not_a_salary(case: str) -> None:
 
 
 @pytest.mark.parametrize("case", sorted(DRIFTED_BLOCKS))
-def test_drifted_block_is_not_counted_as_found(
-    case: str, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_drifted_block_is_not_counted_as_found(case: str, caplog: pytest.LogCaptureFixture) -> None:
     """Прогон, где блок отдал только разметку, обязан включать тот же сторож,
     что и прогон, где атрибут переименован: наблюдаемо это одно и то же —
     зарплата потеряна у всех."""

@@ -133,9 +133,7 @@ class Robots:
             collecting_agents = False
             if field not in ("allow", "disallow") or not current or not value:
                 continue
-            rule = _Rule(
-                allow=field == "allow", pattern=value, matcher=_compile_pattern(value)
-            )
+            rule = _Rule(allow=field == "allow", pattern=value, matcher=_compile_pattern(value))
             for agent in current:
                 groups[agent].append(rule)
         return cls(groups)

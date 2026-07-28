@@ -105,8 +105,7 @@ def _extract_description(posting: dict[str, Any]) -> str:
     raw_description = posting["description"]
     if not isinstance(raw_description, str):
         raise FetchFailed(
-            "поле description в JSON-LD JobPosting не строка, "
-            f"а {type(raw_description).__name__}"
+            f"поле description в JSON-LD JobPosting не строка, а {type(raw_description).__name__}"
         )
     text = html_to_text(raw_description)
     if not text:

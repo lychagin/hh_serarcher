@@ -49,10 +49,14 @@ def page(slug: str, items: object, canonical: str | None = None) -> str:
     """Синтетическая страница листинга: canonical + один блок ItemList."""
     href = canonical if canonical is not None else f"https://hh.ru/vacancies/{slug}"
     link = f'<link rel="canonical" href="{href}">' if canonical != "" else ""
-    payload = json.dumps({"@context": "http://schema.org", "@type": "ItemList",
-                          "itemListElement": items}, ensure_ascii=False)
-    return f'<html><head>{link}</head><body>' \
-           f'<script type="application/ld+json">{payload}</script></body></html>'
+    payload = json.dumps(
+        {"@context": "http://schema.org", "@type": "ItemList", "itemListElement": items},
+        ensure_ascii=False,
+    )
+    return (
+        f"<html><head>{link}</head><body>"
+        f'<script type="application/ld+json">{payload}</script></body></html>'
+    )
 
 
 def item(vacancy_id: str, name: str = "Инженер") -> dict[str, object]:
@@ -224,7 +228,9 @@ def test_url_is_always_rebuilt_and_never_taken_from_the_feed() -> None:
 def test_canonical_on_a_foreign_host_does_not_confirm_the_listing() -> None:
     """Сравнивался только путь, поэтому canonical чужого хоста подтверждал
     наш листинг: страница с evil.example.com проходила как своя."""
-    html = page("programmist", [item("1")], canonical="https://evil.example.com/vacancies/programmist")
+    html = page(
+        "programmist", [item("1")], canonical="https://evil.example.com/vacancies/programmist"
+    )
     with pytest.raises(FetchFailed, match="evil.example.com"):
         parse_listing(html, "programmist")
 
@@ -259,8 +265,10 @@ def test_item_from_a_foreign_host_is_not_laundered_into_an_hh_url() -> None:
     """Хост элемента не проверялся, а url собирается канонический — поэтому
     ссылка чужого хоста «отмывалась» в https://hh.ru/vacancy/{id} и уходила
     в базу как настоящая вакансия hh.ru."""
-    items = [item("1"), {"@type": "ListItem", "url": "https://evil.example.com/vacancy/2",
-                         "name": "Чужая"}]
+    items = [
+        item("1"),
+        {"@type": "ListItem", "url": "https://evil.example.com/vacancy/2", "name": "Чужая"},
+    ]
     assert [v.id for v in parse_listing(page("programmist", items), "programmist")] == ["1"]
 
 

@@ -111,14 +111,23 @@ WEIGHTS_LINE = "weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, doma
         # max_attempts: 0 отправляет вакансию в enrich_failed, не попытавшись.
         ("app.yaml", "max_attempts: 3", "max_attempts: 0"),
         ("app.yaml", "sinks: [csv, markdown]", "sinks: []"),
-        ("app.yaml", 'user_agent: "hh-search/0.1 (personal job search; {contact_email})"',
-         'user_agent: ""'),
+        (
+            "app.yaml",
+            'user_agent: "hh-search/0.1 (personal job search; {contact_email})"',
+            'user_agent: ""',
+        ),
         ("app.yaml", 'contact_email: "me@example.com"', 'contact_email: "не почта вовсе"'),
         # saturation: 0 -> ZeroDivisionError в скоринге, уже ПОСЛЕ похода в сеть.
-        ("profile.yaml", "saturation: {stack: 5, responsibilities: 3}",
-         "saturation: {stack: 0, responsibilities: 3}"),
-        ("profile.yaml", "saturation: {stack: 5, responsibilities: 3}",
-         "saturation: {stack: 5, responsibilities: 0}"),
+        (
+            "profile.yaml",
+            "saturation: {stack: 5, responsibilities: 3}",
+            "saturation: {stack: 0, responsibilities: 3}",
+        ),
+        (
+            "profile.yaml",
+            "saturation: {stack: 5, responsibilities: 3}",
+            "saturation: {stack: 5, responsibilities: 0}",
+        ),
         # Отрицательный штраф превращает стоп-слово в бонус.
         ("profile.yaml", "penalty_per_signal: 15", "penalty_per_signal: -100"),
         # Верхней границы не было вовсе: опечатка в одну цифру обнуляет
@@ -130,10 +139,16 @@ WEIGHTS_LINE = "weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, doma
         ("profile.yaml", "report_threshold: 60", "report_threshold: 101"),
         ("profile.yaml", "report_threshold: 60", "report_threshold: -1"),
         # Веса: NaN проходил сквозь abs(nan - 1.0) > 1e-6, отрицательные — сквозь сумму.
-        ("profile.yaml", WEIGHTS_LINE,
-         "weights: {title: .nan, stack: .nan, responsibilities: .nan, domain: .nan}"),
-        ("profile.yaml", WEIGHTS_LINE,
-         "weights: {title: 1.4, stack: -0.2, responsibilities: -0.1, domain: -0.1}"),
+        (
+            "profile.yaml",
+            WEIGHTS_LINE,
+            "weights: {title: .nan, stack: .nan, responsibilities: .nan, domain: .nan}",
+        ),
+        (
+            "profile.yaml",
+            WEIGHTS_LINE,
+            "weights: {title: 1.4, stack: -0.2, responsibilities: -0.1, domain: -0.1}",
+        ),
         # Пустой сигнал компилируется в регулярку, совпадающую почти с любым текстом.
         ("profile.yaml", "stack: [yocto]", 'stack: [yocto, ""]'),
         ("profile.yaml", "stack: [yocto]", 'stack: ["   "]'),
@@ -148,9 +163,7 @@ WEIGHTS_LINE = "weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, doma
         ("queries.yaml", "pages: 2", "pages: 21"),
     ],
 )
-def test_out_of_range_value_is_rejected(
-    tmp_path: Path, file_name: str, old: str, new: str
-) -> None:
+def test_out_of_range_value_is_rejected(tmp_path: Path, file_name: str, old: str, new: str) -> None:
     body = SOURCES[file_name]
     assert old in body, "текст подстановки разошёлся с эталонным конфигом"
     with pytest.raises(ValidationError):

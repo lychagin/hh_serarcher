@@ -216,8 +216,7 @@ def _indexes_of(connection: sqlite3.Connection, table: str) -> list[str]:
     """Только явно созданные индексы: у автоиндексов первичного ключа
     `sql IS NULL`, и удалить их нельзя (да и не нужно — они уедут с таблицей)."""
     rows = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? "
-        "AND sql IS NOT NULL",
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL",
         (table,),
     ).fetchall()
     return [str(row[0]) for row in rows]

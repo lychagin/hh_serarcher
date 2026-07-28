@@ -151,7 +151,7 @@ def _check_slug(html: str, slug: str) -> None:
     actual = _canonical_targets(html)
     if not actual:
         raise FetchFailed(
-            f"на странице листинга {expected} нет тега <link rel=\"canonical\">: "
+            f'на странице листинга {expected} нет тега <link rel="canonical">: '
             "проверить, что hh.ru отдал запрошенный листинг, а не общий индекс, нечем"
         )
     if actual != {expected}:

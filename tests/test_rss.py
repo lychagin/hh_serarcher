@@ -59,7 +59,7 @@ def test_parse_feed_skips_item_with_invalid_pub_date() -> None:
 
 
 def _feed(items: str) -> str:
-    return f"<rss version=\"2.0\"><channel><title>t</title>{items}</channel></rss>"
+    return f'<rss version="2.0"><channel><title>t</title>{items}</channel></rss>'
 
 
 _ITEM_RFC822 = """

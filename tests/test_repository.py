@@ -282,8 +282,7 @@ def test_unreported_recovers_from_invalid_utf8_score_detail(
     # записанная напрямую в TEXT-колонку мимо Python (сам Python никогда
     # не породит такую строку).
     raw.execute(
-        "UPDATE vacancy SET score_detail = CAST(x'FFFEFA696E76616C6964' AS TEXT) "
-        "WHERE id = ?",
+        "UPDATE vacancy SET score_detail = CAST(x'FFFEFA696E76616C6964' AS TEXT) WHERE id = ?",
         ("2",),
     )
     raw.commit()
@@ -1362,9 +1361,7 @@ def test_migration_makes_published_at_nullable_without_losing_rows(tmp_path: obj
     db_path = str(tmp_path) + "/old.db"
     raw = sqlite3.connect(db_path)
     raw.executescript(FIRST_GENERATION_SCHEMA)
-    raw.executescript(
-        "CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);"
-    )
+    raw.executescript("CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);")
     raw.execute(
         "INSERT INTO vacancy (id, url, title, company, area, salary_raw, salary_from, "
         "published_at, status, first_seen_at, cluster, cluster_weight) "
@@ -1407,9 +1404,12 @@ def test_migration_makes_published_at_nullable_without_losing_rows(tmp_path: obj
     notnull = {r["name"]: r["notnull"] for r in raw.execute("PRAGMA table_info(vacancy)")}
     assert notnull["published_at"] == 0
     assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
-    indexes = {r[0] for r in raw.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='vacancy'"
-    )}
+    indexes = {
+        r[0]
+        for r in raw.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='vacancy'"
+        )
+    }
     assert "idx_vacancy_status" in indexes, "индекс уехал с отодвинутой таблицей"
     tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert not any(name.startswith("vacancy_before") for name in tables)
