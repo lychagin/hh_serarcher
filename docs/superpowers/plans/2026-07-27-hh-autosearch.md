@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Собрать сервис, который по расписанию ищет новые вакансии на hh.ru через публичную RSS-ленту, оценивает их по профилю и выгружает только новинки в CSV и Markdown.
+**Goal:** Собрать сервис, который по расписанию ищет новые вакансии на hh.ru через курируемые листинги `/vacancies/{slug}` (и `?page=N`), оценивает их по профилю и выгружает только новинки в CSV и Markdown.
+
+**Про источник.** RSS-поиск, с которого план начинался, **запрещён** живым `robots.txt` hh.ru: в группе `User-agent: *` стоит `Disallow: *?*` — запрет любого URL с query-строкой, под который целиком попадает `/search/vacancy/rss?text=...`. Разрешены ровно две формы: `/vacancies/{slug}` (не совпадает ни с одним правилом) и `/vacancies/{slug}?page=N` (`Allow: /vacancies/*?page=` длиннее запрета, поэтому побеждает). Код `sources/rss.py` сохранён выключенным как документация решения. Цена переезда: листинг отдаёт только id, url и заголовок — компания, регион, зарплата и дата приходят на шаге обогащения; узких запросов нет, у hh.ru нет slug'ов вроде `yocto`, поэтому отсев делает локальный префильтр по заголовку.
 
 **Architecture:** Семишаговый конвейер (discovery → dedup → prefilter → enrich → score → persist → emit). Дешёвые шаги отсева стоят до дорогого скачивания страниц. Состояние в SQLite, весь SQL изолирован в одном модуле-репозитории, вся работа с сетью — в одном HTTP-клиенте. Три протокола (`Scorer`, `Sink`, `Repository`) — точки расширения под LLM, Telegram и Postgres.
 
@@ -10,18 +12,29 @@
 
 **Спека:** `docs/superpowers/specs/2026-07-27-hh-autosearch-design.md`
 
+**Состояние на `c3bc4b7`:** задачи 1–6 исполнены, 281 тест зелёный, `mypy --strict` и
+`ruff check` чисты. Код внутри задач 1–6 — **исторический**: он показывает, что писалось
+на том шаге, а не то, что лежит в репозитории сегодня. Пять раундов исправлений
+переписали часть из него (самое заметное — `urllib.robotparser` заменён собственным
+матчером RFC 9309, а discovery переехал с RSS на листинги). Источник правды о текущем
+коде — сам код и спека; исполнению подлежат задачи 7–13.
+
 ## Global Constraints
 
 - Python `>=3.12`. Все аннотации в современном стиле (`str | None`, `list[str]`).
-- Рантайм-зависимости строго: `httpx`, `pydantic`, `pyyaml`, `typer`. Ничего больше добавлять нельзя.
-- Сознательно **не** используем: `feedparser` (хватает `xml.etree`), HTML-парсер (JSON-LD достаётся регуляркой), `pandas` (хватает `csv`), `pymorphy` (хватает префикса основы).
-- `pydantic-settings` появится только вместе с `TelegramSink` — в этом плане секретов нет, читать нечего.
-- Все pydantic-модели конфига объявляются с `model_config = ConfigDict(extra="forbid")`. Опечатка в YAML обязана ронять процесс на старте.
-- Вежливый HTTP — обязателен: честный `User-Agent` с контактом, `robots.txt` через `urllib.robotparser`, одно соединение за раз, пауза между запросами, соблюдение `429`/`Retry-After`. Устойчивый `403` останавливает прогон; **обходить блокировки запрещено**.
+- Рантайм-зависимости строго: `httpx`, `pydantic`, `pyyaml`, `typer`. Ничего больше добавлять нельзя. Проверка факта на `c3bc4b7`: `[project].dependencies` в `pyproject.toml` содержит ровно эти четыре.
+- Dev-зависимости: `pytest`, `respx`, `ruff`, `mypy`, `types-PyYAML` — в `[project.optional-dependencies].dev`.
+- `uv.lock` коммитится и **используется**: и Docker, и CI ставят зависимости через `uv sync --frozen`. `uv pip install .` резолвит заново по `>=`-границам и делает lock декорацией.
+- Сознательно **не** используем: `feedparser` (лента выключена, а `xml.etree` остаётся у выключенного кода), HTML-парсер, `pandas` (хватает `csv`), `pymorphy` (хватает префикса основы).
+- HTML разбирается регулярками, и это осознанная граница, а не лень: JSON-LD (`ItemList` листинга, `JobPosting` страницы) — это JSON внутри `<script>`, а из самой вёрстки берётся ровно **один** блок, `data-qa="vacancy-salary"` (решение владельца: поля `baseSalary` в JSON-LD hh.ru не существует вовсе, а зарплата нужна). Дрейф этого атрибута обязан быть громким — за ним следит `SalaryBlockStats`.
+- `pydantic-settings` появится только вместе с `TelegramSink` — в этом плане секретов нет, читать нечего. В `pyproject.toml` его нет.
+- Все pydantic-модели конфига объявляются с `model_config = ConfigDict(extra="forbid", allow_inf_nan=False)`. `extra="forbid"` ловит опечатку в ИМЕНИ ключа; опечатка в ЗНАЧЕНИИ так же тиха и так же дорога, поэтому все числовые поля имеют границы, а дублирующийся ключ YAML отвергается загрузчиком. Опечатка обязана ронять процесс на старте, до первого сетевого запроса.
+- Вежливый HTTP — обязателен: честный `User-Agent` с контактом, `robots.txt` **собственным матчером RFC 9309** (`sources/http.py`), одно соединение за раз, пауза между запросами, соблюдение `429`/`Retry-After`. Устойчивый `403` останавливает прогон; **обходить блокировки запрещено**.
+- `urllib.robotparser` из stdlib для этого непригоден и был заменён по итогам ревью: его `RuleLine.applies_to` — это `startswith`, подстановочные знаки он не поддерживает вовсе. Живое правило `Disallow: *?*` он не видел, то есть проверка была декоративной и разрешала запрещённое. Свой матчер умеет `*` и якорь `$`, сверяет путь вместе с query-строкой, выбирает правило с самым длинным совпавшим шаблоном (при равной длине побеждает `Allow`), кэширует правила по origin и перепроверяет их **после каждого редиректа** — hh.ru уводит на `hh.kz`/`rabota.by`/региональные поддомены. Недоступный или непонятный `robots.txt` — полный запрет (fail-closed).
 - Секретов в YAML нет. Только переменные окружения.
-- Ориентир по размеру файла — ~150 строк. Исключение: `storage/repository.py` (~200), он намеренно собирает весь SQL в одном месте.
+- Ориентир по размеру файла — ~150 строк. Замер на `c3bc4b7` (`wc -l`): его держат 9 файлов из 16, семь вышли за него, и это зафиксировано, а не забыто — `storage/repository.py` (408, весь SQL в одном месте), `sources/http.py` (403, вся работа с сетью вместе с матчером robots), `sources/listing.py` (228), `sources/vacancy_page.py` (221), `storage/migrations.py` (207), `config/models.py` (177), `sources/rss.py` (170, выключен). Четверть-половина объёма каждого из них — комментарии и докстроки (от 25% в `http.py` до 53% в `migrations.py`), объясняющие, какой отказ закрывает код; резать по такому счётчику нечего. Прежняя запись «исключение — `repository.py` (~200)» была желаемым, а не измеренным. Новый файл, перешагнувший ориентир без такой причины, — повод делить.
 - Каждая задача заканчивается коммитом. Сообщения коммитов — на русском, в формате Conventional Commits.
-- `mypy` запускается в строгом режиме и обязан проходить.
+- `mypy --strict hh_search tests` и `ruff check .` обязаны проходить. `ruff format --check` вводится в CI задачей 13 — и только после отдельного коммита форматирования (Task 13, Step 1), иначе шаг красный с первого дня.
 
 ## Структура файлов
 
@@ -60,8 +73,10 @@
 | `hh_search/logging_setup.py` | Логи в stdout + файл с ротацией | 11 |
 | `hh_search/scheduler.py` | Цикл режима `serve` | 11 |
 | `hh_search/__main__.py` | CLI | 11 |
-| `Dockerfile`, `compose.yaml` | Развёртывание | 12 |
+| `Dockerfile`, `compose.yaml`, `.dockerignore` | Развёртывание | 12 |
+| `config.example/*.yaml` | Образцы конфигурации | 12 |
 | `.github/workflows/ci.yml` | CI | 13 |
+| `README.md` | Инструкция, включая правила записи сигналов | 13 |
 
 ---
 
@@ -2593,6 +2608,29 @@ BOM пишутся только при создании.
    `published_at` при этом **необязателен** (листинг даты не отдаёт): неизвестная дата —
    пустая ячейка, а не строка `None` и не падение.
 
+**Дозапись обязана дедуплицировать — это чинится здесь, и только здесь.** Доставка в
+приёмник — at-least-once **по построению**: `mark_reported()` вызывается ПОСЛЕ всех
+приёмников, иначе упавший приёмник потерял бы вакансию навсегда. Отсюда два сценария,
+проверенные ревью Task 10 фактом:
+
+- `sinks: [csv, markdown]` — значение по умолчанию. Markdown упал, csv отработал →
+  вакансии остаются `new`, и следующий прогон отдаёт csv тот же список второй раз.
+  Замер ревью: `ДУБЛИ в CSV: 20 шт.`;
+- контейнер убит между `emit` и `mark_reported` → ровно то же.
+
+Ни один из них не лечится со стороны конвейера: единственная альтернатива —
+`mark_reported` ДО отправки, а это обмен дублей на тихую безвозвратную потерю, что
+строго хуже (спека §5.2: из `unreported()` вакансия уходит навсегда). Значит, дубли
+снимает приёмник, и снимает **по факту записанного в файл**, а не по состоянию в
+памяти: между прогонами процесс перезапускается, а `serve` живёт неделями. Для CSV
+источник истины — колонка `id` существующего файла, для Markdown — уже вписанные ссылки
+на вакансии. Оба чтения стоят один `read` файла текущего дня, то есть килобайты.
+
+Тонкость Markdown: ссылку в отчёт может вписать и работодатель — заголовком вида
+`Инженер](https://hh.ru/vacancy/2)`. Экранирование делает её текстом, и дедупликация
+обязана считать её текстом тоже (отрицательный lookbehind по `\`), иначе чужой заголовок
+прячет настоящую вакансию из следующего отчёта. Это отдельный тест.
+
 **Колонка `found_by_query` переименована в `listing`.** После переезда discovery в этом
 поле лежит slug листинга (`programmist`), а не текст поискового запроса; прежнее имя
 вводило бы в заблуждение читателя отчёта. Имя поля модели не меняется — оно фигурирует в
@@ -2891,6 +2929,78 @@ def test_build_sinks_rejects_unknown_name_before_anything_is_written(tmp_path: P
     with pytest.raises(ValueError, match="telegram"):
         build_sinks(["csv", "telegram"], tmp_path, threshold=60.0)
     assert list(tmp_path.iterdir()) == []
+
+
+# --- дедупликация: доставка at-least-once по построению -------------------
+
+
+def test_csv_does_not_repeat_a_vacancy_already_in_todays_file(tmp_path: Path) -> None:
+    """Пересекающиеся наборы двух emit дают файл БЕЗ дублей.
+
+    `sinks: [csv, markdown]` по умолчанию, а `mark_reported()` вызывается
+    ПОСЛЕ всех приёмников. Упавший markdown при отработавшем csv оставляет
+    вакансии `new`, и следующий прогон отдаёт csv тот же список второй раз
+    (замер ревью Task 10: «ДУБЛИ в CSV: 20 шт.»); авария контейнера между
+    `emit` и `mark_reported` даёт ровно то же. Доставка at-least-once
+    неустранима, поэтому дубли снимает приёмник — по факту записанного.
+    """
+    sink = CsvSink(tmp_path)
+    sink.emit([make_scored(vacancy_id="1"), make_scored(vacancy_id="2")], NOW)
+    sink.emit([make_scored(vacancy_id="2"), make_scored(vacancy_id="3")], NOW)
+    assert [row["id"] for row in read_rows(tmp_path / "2026-07-27-new.csv")] == ["1", "2", "3"]
+
+
+def test_csv_writes_nothing_when_the_whole_batch_is_already_in_the_file(tmp_path: Path) -> None:
+    """Полный повтор не добавляет к файлу ни байта."""
+    sink = CsvSink(tmp_path)
+    sink.emit([make_scored(vacancy_id="1")], NOW)
+    before = (tmp_path / "2026-07-27-new.csv").read_bytes()
+    sink.emit([make_scored(vacancy_id="1")], NOW)
+    assert (tmp_path / "2026-07-27-new.csv").read_bytes() == before
+
+
+def test_csv_deduplicates_by_the_file_not_by_the_sink_instance(tmp_path: Path) -> None:
+    """Источником истины обязан быть файл, а не состояние в памяти:
+    между прогонами процесс перезапускается, и множество отправленного,
+    накопленное в приёмнике, не переживает ни рестарт контейнера, ни
+    падение `serve` посреди итерации."""
+    CsvSink(tmp_path).emit([make_scored(vacancy_id="1")], NOW)
+    CsvSink(tmp_path).emit([make_scored(vacancy_id="1")], NOW)
+    assert [row["id"] for row in read_rows(tmp_path / "2026-07-27-new.csv")] == ["1"]
+
+
+def test_markdown_does_not_repeat_a_vacancy_already_in_todays_file(tmp_path: Path) -> None:
+    """То же для markdown, но искать приходится по вписанным ссылкам:
+    структурированного поля с id в отчёте для человека нет."""
+    sink = MarkdownSink(tmp_path, threshold=60.0)
+    sink.emit([make_scored(vacancy_id="1", title="Первая"), make_scored(vacancy_id="2")], NOW)
+    sink.emit([make_scored(vacancy_id="2"), make_scored(vacancy_id="3", title="Третья")], NOW)
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert text.count("https://hh.ru/vacancy/1") == 1
+    assert text.count("https://hh.ru/vacancy/2") == 1
+    assert text.count("https://hh.ru/vacancy/3") == 1
+
+
+def test_markdown_writes_no_empty_section_when_the_whole_batch_repeats(tmp_path: Path) -> None:
+    """Иначе вечерний прогон дописывал бы «# Новые вакансии» с пустыми
+    разделами: отчёт читают глазами, и такой хвост — это шум."""
+    sink = MarkdownSink(tmp_path, threshold=60.0)
+    sink.emit([make_scored(vacancy_id="1")], NOW)
+    before = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    sink.emit([make_scored(vacancy_id="1")], NOW.replace(hour=18))
+    assert (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8") == before
+
+
+def test_markdown_dedup_is_not_fooled_by_a_link_from_the_employer(tmp_path: Path) -> None:
+    """Ссылку в отчёт может вписать работодатель — заголовком вида
+    `Инженер](https://hh.ru/vacancy/2)`. Экранирование делает её текстом, и
+    дедупликация обязана считать её текстом тоже, иначе чужой заголовок
+    прячет настоящую вакансию из следующего отчёта."""
+    sink = MarkdownSink(tmp_path, threshold=60.0)
+    sink.emit([make_scored(vacancy_id="1", title="Инженер](https://hh.ru/vacancy/2)")], NOW)
+    sink.emit([make_scored(vacancy_id="2", title="Настоящая вторая")], NOW)
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert "Настоящая вторая" in text
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
@@ -2989,6 +3099,16 @@ class CsvSink:
         self._reports_dir.mkdir(parents=True, exist_ok=True)
         path = self._reports_dir / f"{now:%Y-%m-%d}-new.csv"
         first_write = not path.exists()
+        written = self._written_ids(path)
+        fresh: list[ScoredVacancy] = []
+        for item in vacancies:
+            if item.discovered.id in written:
+                continue
+            # Пополняем на ходу: дубль может прийти и внутри одной пачки.
+            written.add(item.discovered.id)
+            fresh.append(item)
+        if not fresh:
+            return
         # BOM обязан быть ровно один: кодек utf-8-sig пишет его при каждом
         # открытии файла, поэтому второй прогон того же дня вставил бы
         # ещё один U+FEFF посреди данных.
@@ -2997,8 +3117,23 @@ class CsvSink:
             writer = csv.DictWriter(handle, fieldnames=COLUMNS, delimiter=";")
             if first_write:
                 writer.writeheader()
-            for item in vacancies:
+            for item in fresh:
                 writer.writerow(self._row(item))
+
+    def _written_ids(self, path: Path) -> set[str]:
+        """id, уже лежащие в файле текущего дня.
+
+        Доставка в приёмник — at-least-once по построению: `mark_reported()`
+        вызывается ПОСЛЕ всех приёмников, иначе упавший приёмник терял бы
+        вакансию навсегда. Значит, повтор возможен всегда — при частичном
+        отказе приёмников и при аварии между `emit` и `mark_reported`, — и
+        снять его может только сам приёмник. Источник истины — файл, а не
+        поле объекта: между прогонами процесс перезапускается.
+        """
+        if not path.exists():
+            return set()
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return {row["id"] for row in csv.DictReader(handle, delimiter=";") if row.get("id")}
 
     def _row(self, item: ScoredVacancy) -> dict[str, str]:
         discovered = item.discovered
@@ -3043,6 +3178,13 @@ SNIPPET_LENGTH = 200
 # чужой сайт. Экранируется то, что меняет структуру строки.
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_\[\]])")
 
+# Ссылки, уже вписанные в отчёт текущего дня. Отрицательный lookbehind по
+# `\` обязателен: заголовок вида `Инженер](https://hh.ru/vacancy/2)` пишет
+# работодатель, `_escape` превращает его в текст — и дедупликация обязана
+# считать его текстом тоже, иначе чужой заголовок прячет настоящую
+# вакансию из следующего отчёта.
+_WRITTEN_LINK_RE = re.compile(r"(?<!\\)\]\((https?://[^\s)]+)\)")
+
 
 def _collapse(text: str) -> str:
     """Одна строка вместо любого числа: перевод строки внутри пункта списка
@@ -3078,7 +3220,20 @@ class MarkdownSink:
             return
         self._reports_dir.mkdir(parents=True, exist_ok=True)
         path = self._reports_dir / f"{now:%Y-%m-%d}-new.md"
-        ordered = sorted(vacancies, key=lambda item: item.score.total, reverse=True)
+        # Дедупликация по уже вписанным ссылкам: доставка сюда at-least-once
+        # по построению (см. преамбулу задачи), и повтор снимается по факту
+        # содержимого файла, а не по состоянию в памяти приёмника.
+        written = self._written_urls(path)
+        ordered: list[ScoredVacancy] = []
+        for item in sorted(vacancies, key=lambda item: item.score.total, reverse=True):
+            if item.discovered.url in written:
+                continue
+            written.add(item.discovered.url)
+            ordered.append(item)
+        if not ordered:
+            # Иначе к отчёту дописывался бы «# Новые вакансии» с пустыми
+            # разделами — шум в файле, который читают глазами.
+            return
         top = [item for item in ordered if item.score.total >= self._threshold]
         rest = [item for item in ordered if item.score.total < self._threshold]
 
@@ -3103,6 +3258,12 @@ class MarkdownSink:
         # навсегда.
         with path.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines).rstrip() + "\n\n")
+
+    def _written_urls(self, path: Path) -> set[str]:
+        """Ссылки на вакансии, уже вписанные в отчёт текущего дня."""
+        if not path.exists():
+            return set()
+        return set(_WRITTEN_LINK_RE.findall(path.read_text(encoding="utf-8")))
 
     def _full_entry(self, item: ScoredVacancy) -> str:
         discovered = item.discovered
@@ -3161,8 +3322,30 @@ def build_sinks(names: Sequence[str], reports_dir: Path, threshold: float) -> li
 - [ ] **Step 7: Запустить все проверки**
 
 Run: `uv run pytest tests/test_sinks.py -v && uv run pytest -q && uv run mypy hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/sinks tests/test_sinks.py`
-Expected: `18 passed`, затем `277 passed`, `Success: no issues found`, `All checks passed!`,
-`5 files already formatted`
+Expected: `24 passed`, затем `305 passed`, `Success: no issues found in 36 source files`,
+`All checks passed!`, `5 files already formatted`
+
+Числа проверены сборкой кода этой задачи против рабочего дерева на `c3bc4b7` (281 тест
+до задачи, 24 в `test_sinks.py`).
+
+- [ ] **Step 7a: Убедиться, что сторожа дедупликации настоящие**
+
+Мутация: заменить в `csv_sink.emit` и `markdown_sink.emit` строку
+`written = self._written_ids(path)` / `self._written_urls(path)` на `written = set()`.
+
+Run: `uv run pytest tests/test_sinks.py -q`
+Expected: `5 failed, 19 passed` — краснеют `..._does_not_repeat_...` (csv и markdown),
+`..._writes_nothing_when_the_whole_batch_is_already_in_the_file`,
+`..._deduplicates_by_the_file_not_by_the_sink_instance`,
+`..._writes_no_empty_section_when_the_whole_batch_repeats`. Первый из них даёт
+`assert ['1', '2', '2', '3'] == ['1', '2', '3']` — это и есть тот самый дубль отчёта.
+
+Шестой тест (`..._is_not_fooled_by_a_link_from_the_employer`) на этой мутации остаётся
+зелёным намеренно: он сторожит не наличие дедупликации, а её взаимодействие с
+экранированием. Его мутация — убрать `(?<!\\)` из `_WRITTEN_LINK_RE`; проверено, что
+тогда падает ровно он один (`1 failed, 23 passed`).
+
+Вернуть обе строки и убедиться, что снова `24 passed`.
 
 - [ ] **Step 8: Коммит**
 
@@ -3180,7 +3363,14 @@ git commit -m "feat: отчёты в CSV и Markdown
 начинающихся с '=', '+', '-', '@' (заголовок пишет работодатель),
 экранирование markdown в заголовке и сниппете, явный формат даты
 вместо isoformat с микросекундами. Второй прогон дня дописывает
-отчёт, а не затирает: переотправки нет по построению."
+отчёт, а не затирает: переотправки нет по построению.
+
+Дозапись при этом пропускает id, уже лежащие в файле дня. Доставка
+в приёмник at-least-once по построению — mark_reported вызывается
+после всех приёмников, — поэтому упавший markdown при отработавшем
+csv или авария между emit и mark_reported задваивали отчёт. Снять
+дубль может только приёмник и только по факту записанного: между
+прогонами процесс перезапускается."
 ```
 
 ---
@@ -6394,47 +6584,140 @@ report читает историю через safe_rows и CAST AS BLOB: еди�
 **Files:**
 - Create: `Dockerfile`, `compose.yaml`, `.dockerignore`
 - Create: `config.example/app.yaml`, `config.example/profile.yaml`, `config.example/queries.yaml`
+- Test: `tests/test_config_example.py`
 
 **Interfaces:**
 - Consumes: CLI из Task 11
-- Produces: рабочий образ с точкой входа `python -m hh_search serve`
+- Produces: рабочий образ с точкой входа `python -m hh_search serve`; образцы конфигов,
+  которые действительно грузятся и действительно ловят то, ради чего написаны
+
+**Что здесь переписано и почему.** Прежняя редакция задачи была собрана и запущена; пять
+дефектов воспроизведены исполнением 2026-07-28, каждый — «настроено правильно, но не
+работает».
+
+1. **Образ не собирался вообще.** `COPY pyproject.toml ./` кладёт один манифест, а
+   следующая строка просит hatchling собрать колесо — при том что в `pyproject.toml` есть
+   `force-include` для `hh_search/storage/schema.sql`, которого в слое ещё нет:
+
+   ```
+   FileNotFoundError: Forced include not found: /app/hh_search/storage/schema.sql
+   ERROR: process "/bin/sh -c uv pip install --system --no-cache ." did not complete
+   successfully: exit code: 1
+   ```
+
+   Замысел «слой зависимостей отдельно от кода» верен, но выражается через
+   `uv sync --no-install-project`, а не сборкой колеса без исходников.
+2. **Контейнер не мог писать в `/data`.** `chown -R hh:hh /data` внутри образа
+   бесполезен: bind-mount подменяет каталог хостовым вместе с его владельцем. Ломалась
+   первая же команда README —
+   `PermissionError: [Errno 13] Permission denied: '/data/state/hh.db'`, следом
+   `OperationalError: unable to open database file`. Если каталог создаёт сам Docker,
+   он root'ов (`drwxr-xr-x 2 0 0 /data`), и `touch /data/probe` тоже отказывает.
+3. **`docker stop` убивал `serve` по SIGKILL.** Python становится PID 1, а сигнал с
+   диспозицией по умолчанию ядро PID'у 1 не доставляет. Решающий замер — сравнение с
+   явным `SIG_IGN`, который доказывает, что дело не в «сигнал пришёл и был
+   проигнорирован», а в «не пришёл вовсе»:
+
+   | Вариант (`--stop-timeout 25`) | `docker stop` | код выхода |
+   |---|---|---|
+   | без обработчика | 23 933 мс | 137 (SIGKILL) |
+   | `signal.signal(SIGTERM, SIG_IGN)` | 23 932 мс | 137 (то же самое) |
+   | с обработчиком SIGTERM | **254 мс** | **0**, в логах `handled SIGTERM` |
+
+   Сам обработчик — часть Task 11 (`StopSignal`, ожидание на `threading.Event`, потому
+   что по PEP 475 прерванный `sleep` возобновляется); здесь он **проверяется фактом**.
+4. **Образец `queries.yaml` не проходил `load_config`.** Он состоял из `text`, `area`,
+   `experience`, `employment`, `schedule` и `period` — полей, удалённых вместе с
+   RSS-запросом. `extra="forbid"` роняет такой файл целиком, то есть первое, что видел бы
+   новый пользователь после `cp config.example/*.yaml data/config/`, — `ValidationError`.
+5. **Образец `profile.yaml` содержал сигналы, которые молча не работают.** Это худший из
+   пяти дефектов: он не роняет ничего. Прогон прежнего образца через фактический
+   `SignalMatcher` дал **1 срабатывание из 21 обязательного** плюс одно ложное
+   отбраковывание целевой вакансии (`оператор` съедал «крупный оператор связи»). Разбор
+   — в Step 4.
+
+**Про воспроизводимость сборки.** `ghcr.io/astral-sh/uv:latest` — плавающий тег, а
+`uv pip install .` игнорирует `uv.lock` и резолвит заново по `>=`-границам. Task 1
+специально постановил коммитить lock; чтобы он не был декорацией, версия uv пинуется, а
+установка идёт через `uv sync --frozen`.
+
+**Про размер образа.** Ориентир «~150 МБ» из первой редакции спеки недостижим
+арифметически: `python:3.12-slim` сам весит 177 МБ. Спека §8.2 заменила его фактом —
+**220 МБ** для многостадийной сборки. Замер ниже совпадает с ним; сверяться нужно со
+спекой, а не с прежним ориентиром.
 
 - [ ] **Step 1: Создать `.dockerignore`**
 
 ```
 .git
+.gitignore
 .venv
+.env
 data
 tests
 docs
+compose.yaml
+config.example
+*.egg-info
 .mypy_cache
 .pytest_cache
 .ruff_cache
 __pycache__
 ```
 
+`.env`, `compose.yaml`, `config.example` и `*.egg-info` добавлены к прежнему списку: в
+образ они не нужны никогда, а `.env` — это ещё и файл с секретами, которому нечего делать
+в слоях.
+
 - [ ] **Step 2: Создать `Dockerfile`**
 
 ```dockerfile
+# Стадия сборки: uv, кэш колёс и инструменты сборки не должны доехать до рантайма.
+FROM python:3.12-slim AS builder
+
+# Версия uv пинуется. `latest` — плавающий тег, при котором «собиралось вчера»
+# и «собирается сегодня» — разные сборки одного коммита.
+COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /usr/local/bin/uv
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/install
+
+WORKDIR /src
+
+# Слой зависимостей отдельно от кода — но именно --no-install-project, а НЕ
+# сборка колеса без исходников: hatchling обязан найти force-include
+# hh_search/storage/schema.sql, которого в этом слое ещё нет, и падает
+# FileNotFoundError. --frozen требует, чтобы ставилось ровно то, что в uv.lock:
+# без него lock игнорируется и версии разъезжаются между сборками.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Код — вторым слоем: его правки не пересобирают зависимости.
+COPY hh_search ./hh_search
+RUN uv sync --frozen --no-dev --no-editable
+
+# Стадия рантайма.
 FROM python:3.12-slim
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/install/bin:$PATH" \
     HH_CONFIG_DIR=/data/config
 
-WORKDIR /app
+COPY --from=builder /install /install
 
-# Слой зависимостей отдельно от кода, чтобы правки кода не пересобирали его.
-COPY pyproject.toml ./
-RUN uv pip install --system --no-cache .
+RUN useradd --create-home --uid 10001 hh
+USER 10001:10001
 
-COPY hh_search ./hh_search
-RUN uv pip install --system --no-cache --no-deps .
+# Корень, а не /app с копией исходников рядом: текущий каталог опережает
+# site-packages, и `python -m hh_search` исполнял бы исходник вместо
+# установленного пакета. Тогда force-include схемы в колесе не проверяется
+# исполнением НИКОГДА, и регрессия упаковки вылезает не в контейнере.
+WORKDIR /
 
-RUN useradd --create-home --uid 10001 hh && mkdir -p /data && chown -R hh:hh /data
-USER hh
+# Явно, хотя и совпадает с умолчанием: сигнал остановки — часть контракта
+# с обработчиком из Task 11, и менять его молча нельзя.
+STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["python", "-m", "hh_search"]
 CMD ["serve"]
@@ -6448,6 +6731,10 @@ services:
     build: .
     image: hh-search:latest
     restart: unless-stopped
+    # uid контейнера обязан совпадать с владельцем ./data на хосте: bind-mount
+    # подменяет каталог образа хостовым ВМЕСТЕ с владельцем, и chown внутри
+    # Dockerfile до него не доезжает. Значения берутся из .env (см. README).
+    user: "${HH_UID:-1000}:${HH_GID:-1000}"
     env_file:
       - path: .env
         required: false
@@ -6455,6 +6742,9 @@ services:
       - ./data:/data
     environment:
       TZ: Europe/Moscow
+    # Больше, чем стоит остановка с обработчиком (0.26 с), но достаточно, чтобы
+    # прогон успел закрыть транзакцию, если SIGTERM пришёл в середине.
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "python", "-m", "hh_search", "healthcheck"]
       interval: 15m
@@ -6463,7 +6753,110 @@ services:
       start_period: 5m
 ```
 
+Выбран **bind-mount с сопоставлением uid**, а не именованный том. Обоснование: три из
+четырёх каталогов `/data` (`config`, `reports`, `logs`) пользователь открывает и правит
+руками — конфиг он редактирует, отчёты читает, логи смотрит. Именованный том закрыл бы
+вопрос прав ценой `docker cp` за каждым отчётом; вариант «том для `state`/`reports`/`logs`
+плюс read-only bind для `config`» оставляет ту же проблему для отчётов и вдобавок
+раздваивает раскладку `/data`, зафиксированную спекой §8.1. Цена выбранного решения —
+две переменные в `.env`, и она платится один раз.
+
+Две честные оговорки, обе проверены исполнением:
+
+- **`env_file` в длинной форме (`path`/`required`) требует Docker Compose ≥ 2.24.**
+  На более старом Compose файл не разберётся. Проверено на 5.1.4.
+- **`restart: unless-stopped` НЕ перезапускает контейнер по проваленному healthcheck.**
+  Docker, в отличие от Swarm, на `unhealthy` не реагирует: замер спеки §8.2 —
+  `t=24s health=unhealthy restarts=0`, `StartedAt` не менялся. Healthcheck здесь —
+  индикатор для того, кто смотрит, а не механизм самолечения. Обещать иное README не
+  должен.
+
 - [ ] **Step 4: Создать образцы конфигов**
+
+`config.example/queries.yaml`. Все slug'и проверены живым GET 2026-07-28 — hh.ru отдал
+`<link rel="canonical">` на запрошенный путь, а не на общий индекс:
+
+```yaml
+# Slug — это НЕ поисковый запрос: hh.ru отдаёт только курируемые листинги.
+# На несуществующий slug он отвечает 200 и общим индексом (спека §3.3), а
+# сторож canonical превращает это в громкий FetchFailed уже ПОСЛЕ запроса —
+# поэтому каждый свой slug подтверждайте одним GET заранее.
+# Проверено 2026-07-28: перечисленные ниже существуют.
+queries:
+  - slug: programmist
+    cluster: backend
+    weight: 8
+    pages: 3
+  - slug: razrabotchik
+    cluster: backend
+    weight: 8
+    pages: 3
+  - slug: lead-developer
+    cluster: lead
+    weight: 10
+    pages: 1
+  - slug: rukovoditel-komandy-razrabotki
+    cluster: lead
+    weight: 10
+    pages: 1
+  - slug: devops
+    cluster: infra
+    weight: 5
+    pages: 1
+```
+
+Прежний образец брал карту из `hh_autosearch_plan.md` и разворачивал «регион плюс
+удалёнка» в два запроса. Ни того, ни другого больше нет: query-строка запрещена, фильтра
+по региону на discovery не существует, а узких slug'ов (`yocto`, `embedded-linux`) у hh.ru
+нет — их роль выполняет локальный префильтр по заголовку из Task 7.
+
+Отдельно проверено и зафиксировано: `programmist-python` и `sistemnyj-administrator`,
+которыми образец §7 спеки помечен как «НЕ проверен», **не существуют** — hh.ru отдаёт по
+ним canonical `/vacancies` (общий индекс). В образец они не попадают.
+
+`config.example/profile.yaml`:
+
+```yaml
+weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, domain: 0.10}
+saturation: {stack: 5, responsibilities: 3}
+penalty_per_signal: 15
+signals:
+  title_roles: [team lead, tech lead, teamlead, team-lead, tech-lead, тимлид, техлид,
+                senior, сеньор, ведущ, старш, руководител]
+  title_tech:  [backend, embedded, linux, c++, python, node, node.js, nodejs, firmware]
+  stack:       [yocto, buildroot, openwrt, bsp, kernel, arm, arm64, armv7, armv8,
+                c++, python, node.js, typescript, docker, kubernetes, kafka,
+                postgresql, clickhouse, llm, llms, rag, mcp]
+  responsibilities: [архитектур, менторинг, код-ревью, code review, проектирован, техдолг]
+  domain:      [телеком, встраиваем, embedded, iot, iiot, микросервис]
+negative: [junior, стажёр, intern, 1c, продаж, рекрутер, ручн тестиров,
+           оператор пк, оператор call, оператор колл, оператор станка, курьер]
+report_threshold: 60
+```
+
+**Что было сломано и почему.** Каждая строка проверена прогоном `SignalMatcher`
+(правила — §6.1 спеки и Task 2):
+
+| Было | Стало | Что было не так |
+|---|---|---|
+| `ведущий` | `ведущ` | Словоформа не ловит косвенные падежи: «Ведущего разработчика C++», «Ведущему инженеру» проходили мимо |
+| `старший` | `старш` | То же: «Старшего разработчика Python» не совпадал |
+| `ручное тестирование` | `ручн тестиров` | Не совпадал ни с «Инженер ручного тестирования», ни с «по ручному тестированию» — стоп-слово почти не работало |
+| `arm` | `arm`, `arm64`, `armv7`, `armv8` | Правая граница запрещает букву и цифру вплотную, поэтому `arm` не ловит `ARM64`/`ARMv7`. `armv` в роли префикса не работает **ни с чем**: латинские паттерны не префиксные, `\w*` дописывается только кириллическим |
+| `node` | `node`, `node.js`, `nodejs` | `node` сознательно не ловит `Node.js` (иначе ловил бы и лишнее), а `NodeJS` не ловит ни один из двух |
+| `llm` | `llm`, `llms` | `LLMs engineer` не совпадал: та же правая граница |
+| `iot` | `iot`, `iiot` | `IIoT` не совпадал: левая граница обрывается на предшествующей букве |
+| — | `тимлид`, `техлид`, `сеньор`, `team-lead`, `tech-lead` | Частые формы, не покрытые ничем: `teamlead` не ловит «Тимлид», `team lead` не ловит «Team-Lead» (дефис — не пробел), `senior` не ловит «Сеньор» |
+| `оператор` | `оператор пк`, `оператор call`, `оператор колл`, `оператор станка` | **Отбраковывал целевой телеком**: «Ведущий разработчик C++ в крупный оператор связи» получал −15. Проверено, что после правки этот заголовок чист, а «Оператор ПК», «Оператор call-центра», «Оператор колл-центра», «Оператор станка ЧПУ» по-прежнему отбраковываются |
+
+Два повторяющихся правила, которые объясняют почти всю таблицу: **кириллический сигнал
+задаётся ОСНОВОЙ** (`ведущ`, а не `ведущий`), а **латинский — точной формой**, потому что
+`\w*` дописывается только к кириллическим словам. И там, и там паттерн не срабатывает,
+если сразу за ним стоит буква или цифра.
+
+Семь сигналов (`тимлид`, `техлид`, `сеньор`, `team-lead`, `tech-lead`, `llms`, `iiot`)
+идут **сверх** образца §7 спеки: их отсутствие проверено прогоном, спека их пока не
+содержит. Синхронизация — Task 13, Step 7.
 
 `config.example/app.yaml` — подставьте свой email перед первым запуском:
 
@@ -6486,84 +6879,251 @@ paths:
   logs: /data/logs
 ```
 
-`config.example/profile.yaml`:
+- [ ] **Step 5: Написать тест, который прогоняет образец через `load_config` и `SignalMatcher`**
 
-```yaml
-weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, domain: 0.10}
-saturation: {stack: 5, responsibilities: 3}
-penalty_per_signal: 15
-signals:
-  title_roles: [team lead, tech lead, teamlead, ведущий, senior, старший, руководител]
-  title_tech: [backend, embedded, linux, c++, python, node, firmware]
-  stack:
-    [yocto, buildroot, openwrt, bsp, arm, kernel, c++, python, node.js, typescript,
-     docker, kubernetes, kafka, postgresql, clickhouse, llm, rag, mcp]
-  responsibilities: [архитектур, менторинг, код-ревью, code review, проектирован, техдолг]
-  domain: [телеком, встраиваем, embedded, iot, микросервис]
-negative:
-  [junior, стажёр, intern, 1c, продаж, рекрутер, ручное тестирование, оператор, курьер]
-report_threshold: 60
+Без него класс дефекта №5 не ловится ничем: молчащий сигнал не роняет загрузку, не пишет
+в лог и просто не приносит вакансий. Создать `tests/test_config_example.py`:
+
+```python
+"""Образцы конфигурации обязаны работать, а не только выглядеть работающими.
+
+Два разных класса дефекта, и оба тихие:
+
+1. Образец не проходит `load_config` — тогда первое, что видит новый
+   пользователь после `cp config.example/*.yaml data/config/`, это падение
+   на старте. Прежняя редакция `queries.yaml` содержала поля `text`,
+   `area`, `experience`, `employment`, `schedule`, `period`, удалённые
+   вместе с RSS-запросом, и `extra="forbid"` роняла её целиком.
+2. Образец грузится, но сигналы в нём **молча не срабатывают**. Такой
+   сигнал ничем не отличается от отсутствующего: он не роняет загрузку, не
+   пишет в лог и просто не приносит вакансий. Ни ревью, ни исполнение
+   этот класс не ловят — только прогон через фактический `SignalMatcher`.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from hh_search.config.loader import load_config
+from hh_search.config.models import Config
+from hh_search.filtering.matching import SignalMatcher
+
+CONFIG_EXAMPLE = Path(__file__).resolve().parent.parent / "config.example"
+
+# Слева — заголовок в живой по форме записи, справа — сигнал, который обязан
+# сработать. Каждая пара взята из находки: прежняя редакция образца молчала
+# на всех, кроме одной.
+MUST_MATCH = [
+    ("Ведущий разработчик C++", "ведущ"),
+    ("Ведущего разработчика C++", "ведущ"),
+    ("Ведущему инженеру-программисту", "ведущ"),
+    ("Старшего разработчика Python", "старш"),
+    ("Тимлид backend-разработки", "тимлид"),
+    ("Техлид платформы", "техлид"),
+    ("Сеньор разработчик", "сеньор"),
+    ("Team-Lead разработки", "team-lead"),
+    ("Tech-Lead платформы", "tech-lead"),
+    ("Разработчик под ARM64", "arm64"),
+    ("Firmware-инженер ARMv7", "armv7"),
+    ("Node.js разработчик", "node.js"),
+    ("NodeJS backend developer", "nodejs"),
+    ("LLMs engineer", "llms"),
+    ("Инженер IIoT-платформы", "iiot"),
+    ("Инженер ручного тестирования", "ручн тестиров"),
+    ("Специалист по ручному тестированию", "ручн тестиров"),
+    ("Оператор ПК", "оператор пк"),
+    ("Оператор call-центра", "оператор call"),
+    ("Оператор колл-центра", "оператор колл"),
+    ("Оператор станка ЧПУ", "оператор станка"),
+]
+
+# Ложное срабатывание стоп-слова необратимо: вакансия уходит в `rejected`
+# навсегда и в отчёт уже не попадёт никогда.
+MUST_NOT_BE_REJECTED = [
+    "Ведущий разработчик C++ в крупный оператор связи",
+    "Старший инженер-программист, телеком",
+    "Тимлид backend (микросервисы, Kafka)",
+]
+
+
+@pytest.fixture(scope="module")
+def example_config() -> Config:
+    return load_config(CONFIG_EXAMPLE)
+
+
+def _signal_groups(config: Config) -> dict[str, list[str]]:
+    groups = config.profile.signals
+    return {
+        "title_roles": groups.title_roles,
+        "title_tech": groups.title_tech,
+        "stack": groups.stack,
+        "responsibilities": groups.responsibilities,
+        "domain": groups.domain,
+        "negative": config.profile.negative,
+    }
+
+
+def _all_signals(config: Config) -> list[str]:
+    return [signal for group in _signal_groups(config).values() for signal in group]
+
+
+def test_example_config_loads(example_config: Config) -> None:
+    """`cp config.example/*.yaml data/config/` обязан давать рабочий конфиг."""
+    assert example_config.queries.queries
+    assert example_config.app.sinks == ["csv", "markdown"]
+
+
+def test_every_example_signal_compiles(example_config: Config) -> None:
+    """Пустой или неразбираемый сигнал упал бы прямо здесь."""
+    SignalMatcher(_all_signals(example_config))
+
+
+@pytest.mark.parametrize("group", sorted(_signal_groups(load_config(CONFIG_EXAMPLE))))
+def test_example_group_has_no_duplicate_signals(example_config: Config, group: str) -> None:
+    """Повтор ВНУТРИ группы удваивает вклад и штраф. Повтор МЕЖДУ группами
+    (`python` в title_tech и в stack) — наоборот, замысел: это разные
+    слагаемые формулы (спека §6)."""
+    signals = _signal_groups(example_config)[group]
+    assert len(signals) == len(set(signals))
+
+
+@pytest.mark.parametrize(("title", "signal"), MUST_MATCH)
+def test_example_signal_actually_fires(example_config: Config, title: str, signal: str) -> None:
+    """Сигнал есть в образце И срабатывает на заголовке, ради которого внесён."""
+    assert signal in _all_signals(example_config), f"{signal!r} пропал из образца"
+    assert SignalMatcher([signal]).has_any(title)
+
+
+@pytest.mark.parametrize("title", MUST_NOT_BE_REJECTED)
+def test_example_stop_words_do_not_reject_the_target(example_config: Config, title: str) -> None:
+    """«крупный оператор связи» — это целевой телеком, а не колл-центр."""
+    assert SignalMatcher(example_config.profile.negative).find(title) == []
 ```
 
-`config.example/queries.yaml` — перенесите сюда карту из `hh_autosearch_plan.md`,
-разворачивая «регион плюс удалёнка» в два запроса:
+Run: `uv run pytest tests/test_config_example.py -q`
+Expected: `32 passed`
 
-```yaml
-defaults:
-  experience: [between3And6, moreThan6]
-  employment: full
-queries:
-  - {text: "Backend Team Lead", cluster: backend, weight: 10, area: [66]}
-  - {text: "Backend Team Lead", cluster: backend, weight: 10, schedule: remote}
-  - {text: "Tech Lead backend", cluster: backend, weight: 10, area: [66]}
-  - {text: "Tech Lead backend", cluster: backend, weight: 10, schedule: remote}
-  - {text: "Senior Backend Developer", cluster: backend, weight: 8, area: [66]}
-  - {text: "Senior Backend Developer", cluster: backend, weight: 8, schedule: remote}
-  - {text: "Node.js backend", cluster: backend, weight: 8, area: [66]}
-  - {text: "Node.js backend", cluster: backend, weight: 8, schedule: remote}
-  - {text: "Python backend", cluster: backend, weight: 8, area: [66]}
-  - {text: "Python backend", cluster: backend, weight: 8, schedule: remote}
-  - {text: "C++ Embedded Linux", cluster: embedded, weight: 10, area: [66]}
-  - {text: "C++ Embedded Linux", cluster: embedded, weight: 10, schedule: remote}
-  - {text: "Embedded Linux BSP", cluster: embedded, weight: 10, area: [66]}
-  - {text: "Embedded Linux BSP", cluster: embedded, weight: 10, schedule: remote}
-  - {text: "Yocto", cluster: embedded, weight: 9, area: [66]}
-  - {text: "Yocto", cluster: embedded, weight: 9, schedule: remote}
-  - {text: "Buildroot", cluster: embedded, weight: 9, schedule: remote}
-  - {text: "Firmware developer", cluster: embedded, weight: 7, area: [66]}
-  - {text: "Linux kernel module", cluster: embedded, weight: 8, schedule: remote}
-  - {text: "Telecom C++", cluster: telecom, weight: 9, area: [66]}
-  - {text: "Telecom C++", cluster: telecom, weight: 9, schedule: remote}
-  - {text: "AI engineer", cluster: ai, weight: 8, schedule: remote}
-  - {text: "LLM engineer", cluster: ai, weight: 9, schedule: remote}
-  - {text: "RAG", cluster: ai, weight: 9, schedule: remote}
-  - {text: "MCP", cluster: ai, weight: 8, schedule: remote}
-  - {text: "Agentic AI", cluster: ai, weight: 9, schedule: remote}
-```
+- [ ] **Step 5a: Убедиться, что тест — настоящий сторож**
 
-- [ ] **Step 5: Проверить сборку и запуск образа**
+Временно подставить в `config.example/profile.yaml` прежнюю редакцию сигналов
+(`ведущий`, `старший`, `arm`, `node`, `ручное тестирование`, `оператор`, без
+`тимлид`/`техлид`/`сеньор`/`team-lead`/`tech-lead`/`llms`/`iiot`/`nodejs`/`arm64`).
+
+Run: `uv run pytest tests/test_config_example.py -q`
+Expected: `21 failed, 11 passed` — из 21 обязательного срабатывания уцелевает ровно
+одно (`node.js`: он и в прежнем образце был), а
+`test_example_stop_words_do_not_reject_the_target` падает с
+`AssertionError: assert ['оператор'] == []` на «Ведущий разработчик C++ в крупный
+оператор связи». Вернуть исправленный образец: снова `32 passed`.
+
+Тот же приём с прежним `queries.yaml` (`text`/`area`/`experience`/…) даёт
+`ValidationError: 4 validation errors for Config` ещё на сборе тестов.
+
+- [ ] **Step 6: Собрать образ и проверить его содержимое фактом**
 
 ```bash
 docker build -t hh-search:latest .
-mkdir -p data/config data/state data/reports data/logs
-cp config.example/*.yaml data/config/
-# подставьте реальный email в data/config/app.yaml перед следующей командой
-docker run --rm -v "$PWD/data:/data" hh-search:latest init-db
-docker run --rm -v "$PWD/data:/data" hh-search:latest healthcheck; echo "код возврата: $?"
+docker images hh-search:latest --format '{{.Size}}'
+docker inspect hh-search:latest \
+  --format '{{.Config.StopSignal}} {{.Config.User}} {{.Config.WorkingDir}}'
+docker run --rm --entrypoint python hh-search:latest -c "
+import hh_search, pathlib, os
+p = pathlib.Path(hh_search.__file__).parent
+print('пакет:', p)
+print('schema.sql на месте:', (p / 'storage' / 'schema.sql').exists())
+print('uid:gid:', f'{os.getuid()}:{os.getgid()}', '| cwd:', os.getcwd())
+"
 ```
 
-Expected: `init-db` печатает путь к базе; `healthcheck` возвращает 1 (прогонов ещё не было) — это корректное поведение.
+Expected (проверено 2026-07-28):
 
-- [ ] **Step 6: Коммит**
+```
+220MB
+SIGTERM 10001:10001 /
+пакет: /install/lib/python3.12/site-packages/hh_search
+schema.sql на месте: True
+uid:gid: 10001:10001 | cwd: /
+```
+
+Три вещи, которые здесь проверяются, а не декларируются: размер совпадает с фактом спеки
+§8.2 (220 МБ, из них 177 МБ — сама база `python:3.12-slim`); пакет исполняется **из
+`site-packages`**, а не из копии исходников, поэтому `force-include` схемы проверен
+исполнением; процесс — непривилегированный.
+
+- [ ] **Step 7: Проверить, что контейнер РЕАЛЬНО пишет в смонтированный каталог**
+
+Печать пути к базе доказательством не является — `init-db` печатал его и в той сборке,
+где запись отказывала. Проверять надо файл на хосте.
 
 ```bash
-git add Dockerfile compose.yaml .dockerignore config.example
+mkdir -p data/config data/state data/reports data/logs
+cp config.example/*.yaml data/config/
+$EDITOR data/config/app.yaml            # подставьте настоящий contact_email
+printf 'HH_UID=%s\nHH_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+docker compose run --rm hh-search init-db
+ls -ln data/state/hh.db
+```
+
+Expected: `init-db` печатает путь, а `ls` показывает **существующий** файл, владелец
+которого — ваш uid:
+
+```
+-rw-r--r-- 1 1000 1000 8192 Jul 28 11:42 data/state/hh.db
+```
+
+Контрольный вопрос к самому себе: если убрать строку `user:` из `compose.yaml`, эта же
+команда обязана снова упасть `PermissionError: [Errno 13] Permission denied` — проверено.
+И `TZ` внутри контейнера обязан быть `MSK` (`time.tzname[0]`), а не `UTC`: без него
+имена файлов отчёта (`{now:%Y-%m-%d}-new.csv`) переключаются на новый день на три часа
+позже.
+
+- [ ] **Step 8: Замерить `docker stop`**
+
+```bash
+docker compose up -d
+cid=$(docker compose ps -q hh-search)
+start=$(date +%s%N); docker stop "$cid" >/dev/null; end=$(date +%s%N)
+echo "stop=$(( (end - start) / 1000000 ))ms exit=$(docker inspect -f '{{.State.ExitCode}}' "$cid")"
+docker logs "$cid" | tail -2
+```
+
+Expected: `stop=` доли секунды (замер: **263 мс**), `exit=0`, и в логах — строка
+обработчика о завершении после текущего прогона. Проверено, что без обработчика тот же
+контейнер стоит весь grace period и уходит кодом 137; см. таблицу в преамбуле задачи.
+
+Если здесь `exit=137` — обработчик из Task 11 не установлен или установлен не в PID 1,
+и дальше идти нельзя: `serve` держит открытое `sqlite3.Connection`.
+
+- [ ] **Step 9: Прогнать полную проверку**
+
+Run: `uv run pytest -q && uv run mypy hh_search tests && uv run ruff check . && uv run ruff format --check tests/test_config_example.py`
+Expected: всё зелёное; `tests/test_config_example.py` добавляет 32 теста.
+
+`ruff format --check` здесь, как и в задачах 7–11, запускается **по новому файлу, а не по
+репозиторию**: форматтер по нему не гонялся ни разу, и первый прогон — отдельный шаг
+Task 13 с отдельным коммитом.
+
+- [ ] **Step 10: Коммит**
+
+```bash
+git add Dockerfile compose.yaml .dockerignore config.example tests/test_config_example.py
 git commit -m "feat: Docker-образ и образцы конфигурации
 
-Слой зависимостей отделён от слоя кода, запуск от непривилегированного
-пользователя, конфиг и состояние живут на volume. Комбинации
-«регион плюс удалёнка» развёрнуты в отдельные запросы: RSS не умеет
-ИЛИ по региону и формату, а дедупликация по id склеит пересечения."
+Многостадийная сборка: зависимости ставятся uv sync --frozen из
+uv.lock отдельным слоем, проект — вторым. Сборка колеса без
+исходников была невозможна в принципе: hatchling требует
+force-include schema.sql, которого в том слое нет.
+
+Рантайм запускается от uid 10001 из корня, а не из /app с копией
+исходников: иначе исполнялся бы исходник, а не установленный пакет,
+и упаковка схемы не проверялась бы никогда. uid контейнера в compose
+сопоставляется владельцу ./data — chown внутри образа bind-mount
+перекрывает, и запись в том отказывала.
+
+Образцы конфигов прогоняются тестом через фактические load_config и
+SignalMatcher: прежний queries.yaml не грузился вовсе, а из 21
+сигнала profile.yaml срабатывал один, причём стоп-слово 'оператор'
+отбраковывало целевой телеком."
 ```
 
 ---
@@ -6571,80 +7131,383 @@ git commit -m "feat: Docker-образ и образцы конфигураци�
 ### Task 13: CI, контрактный тест и README
 
 **Files:**
-- Create: `.github/workflows/ci.yml`, `README.md`
+- Modify: `pyproject.toml` (`extend-exclude` у ruff), плюс первый прогон `ruff format` по репозиторию
+- Modify: `hh_search/sources/listing.py` (региональные поддомены hh.ru), `tests/test_listing.py`
 - Create: `tests/test_contract_network.py`
-- Modify: `docs/superpowers/specs/2026-07-27-hh-autosearch-design.md` (зафиксировать два отклонения)
+- Create: `.github/workflows/ci.yml`, `README.md`
+- Modify: `docs/superpowers/specs/2026-07-27-hh-autosearch-design.md` (§7 — догнать образцы)
+- Modify: `tests/test_config_example.py` (сверка спеки с кодом)
+- Modify: `.superpowers/sdd/2026-07-27-hh-autosearch/progress.md` (триаж отложенных Minor)
 
 **Interfaces:**
 - Consumes: всё предыдущее
-- Produces: зелёный CI без сети; ручной контрактный тест `pytest -m network`
+- Produces: зелёный CI без сети; контрактный тест-канарейка `pytest -m network`; README,
+  выполняющий обязательства Task 2; разобранный хвост отложенных Minor
 
-- [ ] **Step 1: Написать контрактный тест**
+**Что здесь переписано и почему.** Прежняя редакция задачи прогонялась целиком; пять
+дефектов воспроизведены исполнением 2026-07-28.
+
+1. **CI падал на первом же шаге.** `uv pip install --system ".[dev]"` на `ubuntu-latest`
+   упирается в PEP 668:
+
+   ```
+   error: The interpreter at /usr is externally managed, and indicates the following:
+     To install Python packages system-wide, try apt install python3-xyz...
+   hint: Virtual environments were not considered due to the `--system` flag
+   ```
+
+   Та же команда стояла в README, то есть был сломан и рецепт разработчика.
+2. **`ruff format --check` был красным с первого дня.** Шаг форматирования вводился
+   впервые здесь, а сам форматтер до этого не запускался ни разу. Факт на `c3bc4b7`:
+   `14 files would be reformatted, 22 files already formatted` — тринадцать файлов кода
+   **и сам файл плана** (ruff 0.16 форматирует python-блоки внутри markdown). Хорошая
+   новость: после форматирования `ruff check` остаётся зелёным и все тесты проходят,
+   конфликта между линтером и форматтером нет.
+3. **Контрактный тест сторожил RSS**, которого больше нет, и делал это невежливо:
+   `User-Agent` без контактного адреса вопреки спеке §3.5 и вопреки README двумя экранами
+   ниже, лента качалась дважды, три запроса без пауз, URL зашит строкой вместо функций
+   проекта, `robots.txt` не спрашивался вообще. И главное — при отсутствии сети он
+   **падал**, а не пропускался: `httpx.ConnectError` наружу превращает канарейку из
+   сигнала «источник сменил формат» в сигнал «у меня нет интернета».
+4. **Step 6 «зафиксировать отклонения» устарел.** Спека приведена в соответствие с кодом
+   отдельным раундом, все четыре пункта прежней редакции в ней уже есть. Фиксировать
+   нечего — нужно **проверять**, и проверять автоматически, иначе следующий раунд правок
+   разведёт их снова.
+5. **README не выполнял обязательств Task 2.** Блок «Известные ограничения, вынести в
+   README на Task 13» перечисляет три пункта, README покрывал один и наполовину. При этом
+   в тексте задачи не было ни одного шага, который отсылал бы к этому блоку, — исполнитель
+   обязательств просто не увидел бы.
+
+Плюс найденное самим переписанным контрактным тестом — см. Step 3: **discovery не
+работает против живого hh.ru ни на одном не-московском IP.**
+
+- [ ] **Step 1: Первый прогон `ruff format` — отдельным коммитом, ДО всего остального**
+
+Сначала исключить документы: форматтер понимает python-блоки внутри markdown, и без
+исключения зелёный CI зависел бы от вёрстки примеров — включая примеры в самом файле
+плана. В `pyproject.toml`:
+
+```toml
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Форматтер понимает python-блоки внутри markdown. Без исключения зелёный CI
+# зависел бы от вёрстки примеров в документах — в том числе в файле плана,
+# который ruff 0.16 переформатирует наравне с кодом.
+extend-exclude = ["docs"]
+```
+
+Затем:
+
+```bash
+uv run ruff format .
+uv run ruff check . && uv run mypy hh_search tests && uv run pytest -q
+git add -A && git commit -m "style: первый прогон ruff format
+
+Форматтер не запускался ни разу, а Task 13 вводит ruff format --check в
+CI — то есть шаг был бы красным с первого дня. Отдельным коммитом, чтобы
+диффы задач не смешивались с механической переразметкой.
+
+Документы исключены: ruff форматирует python-блоки внутри markdown, и
+зелёный CI зависел бы от вёрстки примеров."
+```
+
+Expected: `13 files reformatted`, затем `All checks passed!`,
+`Success: no issues found`, вся база тестов зелёная. Числа замерены на `c3bc4b7`
+(`13 files reformatted, 20 files left unchanged`, `281 passed`); переформатировать нужно
+ровно эти тринадцать — файлы задач 7–12 уже отформатированы своими Step 7. Без
+`extend-exclude` файлов было бы четырнадцать: четырнадцатый — сам файл плана. Заметная
+правка одна: таблица
+`_CONFUSABLES` в `filtering/matching.py` разворачивается с двух строк на тринадцать.
+Это принимается: если компактность таблицы важнее, её закрывают `# fmt: off`/`# fmt: on`,
+но отдельного основания для исключения здесь нет.
+
+Версия форматтера фиксируется тем же `uv.lock`, что и всё остальное, — при условии, что
+CI ставит зависимости через `uv sync --frozen` (Step 6). Иначе следующая минорная версия
+ruff перекрасит шаг сама.
+
+- [ ] **Step 2: Написать контрактный тест — по листингу и странице вакансии**
 
 Создать `tests/test_contract_network.py`:
 
 ```python
-"""Ходит в живой hh.ru. В CI пропускается, запускается вручную: pytest -m network."""
+"""Канарейка на смену формата источника. Ходит в живой hh.ru.
 
-import re
+В CI пропускается настройкой `addopts = "-m 'not network'"` из Task 1,
+запускается руками: `pytest -m network`.
 
-import httpx
+Четыре решения, каждое — следствие того, что тест ходит наружу.
+
+1. **Проверяется листинг и страница вакансии, а не RSS.** RSS-поиск
+   запрещён живым `robots.txt` (`Disallow: *?*`, спека §3.2), discovery
+   работает через `/vacancies/{slug}`. Канарейка обязана сторожить тот
+   источник, который используется.
+2. **Ходим клиентом проекта, а не `httpx` напрямую.** Тогда тест
+   спрашивает `robots.txt`, выдерживает паузу и представляется тем же
+   `User-Agent` с контактным адресом, что и прод (спека §3.5). Тест,
+   который ведёт себя невежливее сервиса, — способ получить бан на
+   ровном месте. Заодно проверяется, что запрещённый URL мы бы и не
+   построили: `build_listing_url` и `vacancy_url` — функции проекта, а
+   не строки, склеенные в тесте.
+3. **Отсутствие сети — это `skip`, а не `fail`.** Красный тест обязан
+   значить «источник сменил формат»; `httpx.ConnectError` наружу лишает
+   канарейку смысла. Связность проверяется TCP-соединением, без единого
+   HTTP-запроса к hh.ru. `403`, наоборот, именно `fail`: это блокировка,
+   и узнать о ней надо громко.
+4. **Три запроса за прогон, с паузами**: `robots.txt`, одна страница
+   листинга, одна страница вакансии; id берётся из первого ответа, а не
+   зашивается в тест.
+"""
+
+import socket
+from collections.abc import Iterator
+
 import pytest
 
-from hh_search.sources.vacancy_page import extract_job_posting
+from hh_search.config.models import HttpConfig, QuerySpec
+from hh_search.errors import AccessForbidden
+from hh_search.sources.http import PoliteClient
+from hh_search.sources.listing import build_listing_url, parse_listing
+from hh_search.sources.vacancy_page import extract_salary, find_ld_json, vacancy_url
 
-USER_AGENT = "hh-search/0.1 (contract test)"
-RSS_URL = "https://hh.ru/search/vacancy/rss?text=Yocto&order_by=publication_time"
+CONTACT = "serg.lychagin.usa@gmail.com"
+USER_AGENT = f"hh-search/0.1 (contract test; {CONTACT})"
+QUERY = QuerySpec(slug="programmist", cluster="backend")
+
+pytestmark = pytest.mark.network
 
 
-@pytest.mark.network
-def test_rss_feed_still_returns_vacancy_items() -> None:
-    response = httpx.get(RSS_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
-    assert response.status_code == 200, "RSS-лента закрылась — см. §3.2 спеки"
-    assert "<item>" in response.text
-    assert re.search(r"https://hh\.ru/vacancy/\d+", response.text)
+@pytest.fixture(scope="module")
+def client() -> Iterator[PoliteClient]:
+    try:
+        socket.create_connection(("hh.ru", 443), timeout=5).close()
+    except OSError as error:
+        pytest.skip(f"нет сети до hh.ru ({error}) — это не смена формата источника")
+    config = HttpConfig(delay_between_requests_sec=2.0)
+    with PoliteClient(config, USER_AGENT) as polite:
+        yield polite
 
 
-@pytest.mark.network
-def test_vacancy_page_still_exposes_json_ld() -> None:
-    feed = httpx.get(RSS_URL, headers={"User-Agent": USER_AGENT}, timeout=30).text
-    match = re.search(r"https://hh\.ru/vacancy/(\d+)", feed)
-    assert match is not None
-    page = httpx.get(
-        f"https://hh.ru/vacancy/{match.group(1)}",
-        headers={"User-Agent": USER_AGENT},
-        timeout=30,
-        follow_redirects=True,
-    )
-    assert page.status_code == 200
-    posting = extract_job_posting(page.text)
-    assert posting is not None, "JSON-LD с JobPosting пропал — см. §3.4 спеки"
-    assert posting.get("description")
+@pytest.fixture(scope="module")
+def listing_html(client: PoliteClient) -> str:
+    try:
+        response = client.get(build_listing_url(QUERY))
+    except AccessForbidden as error:
+        pytest.fail(f"hh.ru закрыл доступ: {error}")
+    assert response.status_code == 200, f"листинг отдал {response.status_code}"
+    return response.text
+
+
+def test_listing_still_exposes_item_list(listing_html: str) -> None:
+    """`ItemList` в ld+json — единственный источник id для всего конвейера."""
+    item_list = find_ld_json(listing_html, "ItemList")
+    assert item_list is not None, "на странице листинга пропал ld+json ItemList — см. §3.2"
+    assert isinstance(item_list.get("itemListElement"), list)
+
+
+def test_listing_items_still_parse_into_vacancies(listing_html: str) -> None:
+    vacancies = parse_listing(listing_html, QUERY.slug)
+    assert vacancies, "ни один элемент листинга не разобрался — см. §3.2"
+    assert all(item.url.startswith("https://hh.ru/vacancy/") for item in vacancies)
+    assert all(item.id.isdigit() and item.title for item in vacancies)
+
+
+def test_vacancy_page_still_exposes_job_posting(client: PoliteClient, listing_html: str) -> None:
+    """`JobPosting.description` — единственное, за чем мы идём на страницу."""
+    vacancy = parse_listing(listing_html, QUERY.slug)[0]
+    try:
+        page = client.get(vacancy_url(vacancy.id))
+    except AccessForbidden as error:
+        pytest.fail(f"hh.ru закрыл доступ: {error}")
+    assert page.status_code == 200, f"страница вакансии отдала {page.status_code}"
+    posting = find_ld_json(page.text, "JobPosting")
+    assert posting is not None, "JSON-LD JobPosting пропал — см. §3.4"
+    description = posting.get("description")
+    assert isinstance(description, str) and description.strip(), "description пуст или не строка"
+    # Зарплата живёт в разметке, а не в JSON-LD (§3.4): отсутствие блока у
+    # конкретной вакансии законно, отсутствие атрибута `data-qa` — дрейф.
+    assert 'data-qa="vacancy-salary' in page.text or extract_salary(page.text) is None
 ```
 
-- [ ] **Step 2: Убедиться, что контрактный тест пропускается по умолчанию**
+Про последнюю строку прямо: жёсткое «блок зарплаты обязан находиться» здесь было бы
+флаки. Проверено 2026-07-28 — у первой вакансии живого листинга блока
+`data-qa="vacancy-salary"` нет вовсе, и спека §3.4 называет это законным случаем. Роль
+сторожа за дрейфом атрибута играет агрегатный `SalaryBlockStats` («ни на одной странице
+прогона»), а не тест на одной случайной вакансии.
 
-Run: `uv run pytest tests/test_contract_network.py -v`
-Expected: `2 deselected` (сработала настройка `addopts = "-m 'not network'"` из Task 1)
-
-- [ ] **Step 3: Убедиться, что контрактный тест проходит вручную**
+- [ ] **Step 3: Прогнать контрактный тест вручную — и починить то, что он нашёл**
 
 Run: `uv run pytest tests/test_contract_network.py -m network -v`
-Expected: 2 passed. Если падает — источник изменился, дальше по плану идти нельзя, нужно перечитать §3 спеки.
 
-- [ ] **Step 4: Создать `.github/workflows/ci.yml`**
+Первый же прогон на `c3bc4b7` **красный**, и это настоящая находка, а не шум:
+
+```
+FAILED test_listing_items_still_parse_into_vacancies
+FAILED test_vacancy_page_still_exposes_job_posting
+hh_search.errors.FetchFailed: запрошен листинг /vacancies/programmist, а hh.ru отдал
+['https://nn.hh.ru/vacancies/programmist']. Скорее всего, slug 'programmist' не
+существует — hh.ru не отвечает на такой 404, а молча показывает общий индекс вакансий
+```
+
+**hh.ru редиректит `/vacancies/{slug}` на региональный поддомен по геолокации IP**
+(302 → `https://nn.hh.ru/vacancies/programmist` с нижегородского адреса). На отданной
+странице и `<link rel="canonical">`, и все двадцать ссылок элементов ведут на поддомен, а
+`LISTING_HOST` — это ровно `hh.ru`. Отказ двойной:
+
+```
+листинг 'programmist': пропущено 20 из 20 элементов; причины: ссылка ведёт на чужой
+хост 'nn.hh.ru': 'https://nn.hh.ru/vacancy/134577040'; ...
+```
+
+То есть **discovery не работает против живого hh.ru ни на одном не-московском IP** —
+фикстура `listing_programmist.html.gz` содержит canonical на `hh.ru` и этот случай не
+покрывает. Дальше по плану идти нельзя.
+
+Починка — в `hh_search/sources/listing.py`: своим считается не только `hh.ru`, но и любой
+его поддомен. Обе точки сравнения (`_canonical_targets` и `_parse_item`) идут через одну
+функцию, чтобы не разъехаться:
+
+```python
+def _is_own_host(netloc: str) -> bool:
+    """Свой ли хост. Региональные поддомены hh.ru — свои.
+
+    hh.ru отвечает на `/vacancies/{slug}` редиректом 302 на поддомен по
+    геолокации IP: с нижегородского адреса — на `nn.hh.ru`. На отданной
+    странице и `<link rel="canonical">`, и ВСЕ ссылки элементов ведут на
+    этот поддомен, поэтому сравнение с одним `hh.ru` отбраковывало
+    сначала canonical, а затем все двадцать элементов подряд.
+    """
+    return netloc == LISTING_HOST or netloc.endswith("." + LISTING_HOST)
+```
+
+и в обоих местах `parts.netloc != LISTING_HOST` заменяется на
+`not _is_own_host(parts.netloc)`. Проверка остаётся строгой: `evilhh.ru` и
+`hh.ru.evil.com` под суффикс `.hh.ru` не подходят, а `nn.hh.ru` и `hh.kz` различаются.
+
+Добавить в `tests/test_listing.py` два регрессионных теста на фикстуре с подменённым
+хостом: (1) листинг с canonical и ссылками на `nn.hh.ru` разбирается в двадцать вакансий,
+и `url` у них — канонический `https://hh.ru/vacancy/{id}`; (2) canonical на
+`evil.hh.ru.attacker.com` по-прежнему даёт `FetchFailed`.
+
+Run: `uv run pytest -q && uv run pytest tests/test_contract_network.py -m network -q`
+Expected: вся база зелёная, затем `3 passed in ~11s`.
+
+Проверено, что «нет сети» отличается от «формат сменился»: при недоступном хосте те же
+три теста дают `3 skipped` с причиной
+`нет сети до hh.ru ([Errno -2] Name or service not known)`.
+
+- [ ] **Step 4: Убедиться, что контрактный тест пропускается по умолчанию**
+
+Run: `uv run pytest tests/test_contract_network.py -q`
+Expected: `3 deselected` (сработала настройка `addopts = "-m 'not network'"` из Task 1)
+
+- [ ] **Step 5: Добавить в `tests/test_config_example.py` сверку спеки с кодом**
+
+Спека уже приведена в соответствие с кодом; задача этого шага — сделать так, чтобы они
+не разошлись снова, и сделать это **автоматически**, а не абзацем в чеклисте.
+
+```python
+import re
+
+import yaml
+
+SPEC = Path(__file__).resolve().parent.parent / "docs/superpowers/specs/2026-07-27-hh-autosearch-design.md"
+SCHEMA = Path(__file__).resolve().parent.parent / "hh_search/storage/schema.sql"
+
+
+def _statements(sql: str) -> list[str]:
+    """Операторы SQL без комментариев и без разницы в отступах."""
+    return [" ".join(part.split()) for part in re.sub(r"--[^\n]*", "", sql).split(";") if part.strip()]
+
+
+def _spec_section(start: str, end: str) -> str:
+    text = SPEC.read_text(encoding="utf-8")
+    return text[text.index(start) : text.index(end)]
+
+
+def test_spec_ddl_matches_schema_sql() -> None:
+    """§5.1 обещает «приведено дословно по schema.sql» — проверяем дословность.
+
+    Расхождение здесь дороже, чем кажется: спека — единственное описание
+    жизненного цикла строки, и колонка, которой в ней нет, при следующем
+    раунде правок «добавляется» второй раз миграцией.
+    """
+    block = re.search(r"```sql\n(.*?)\n```", _spec_section("### 5.1", "### 5.2"), re.S)
+    assert block is not None
+    assert _statements(block.group(1)) == _statements(SCHEMA.read_text(encoding="utf-8"))
+
+
+def test_spec_config_samples_match_config_example() -> None:
+    """Образцы §7 обязаны проходить фактический `load_config` и совпадать с
+    тем, что лежит в `config.example/`: два разных «образца конфига» — это
+    гарантированно один устаревший."""
+    section = _spec_section("## 7. Конфигурация", "## 8. Развёртывание")
+    blocks = {
+        m.group(1): yaml.safe_load(m.group(2))
+        for m in re.finditer(r"```yaml\n# (\w+\.yaml)\n(.*?)\n```", section, re.S)
+    }
+    assert sorted(blocks) == ["app.yaml", "profile.yaml", "queries.yaml"]
+    for name, spec_data in blocks.items():
+        example = yaml.safe_load((CONFIG_EXAMPLE / name).read_text(encoding="utf-8"))
+        if name == "app.yaml":
+            # Единственное осмысленное расхождение: в спеке настоящий адрес,
+            # в образце — плейсхолдер, который пользователь обязан заменить.
+            spec_data = {k: v for k, v in spec_data.items() if k != "contact_email"}
+            example = {k: v for k, v in example.items() if k != "contact_email"}
+        assert spec_data == example, f"§7 и config.example/{name} разошлись"
+```
+
+Run: `uv run pytest tests/test_config_example.py -q`
+Expected: `1 failed, 33 passed`.
+
+Первый тест на `c3bc4b7` зелёный сразу (проверено: пять операторов DDL там и пять здесь,
+совпадают посимвольно после снятия комментариев и отступов). Второй — красный, и это
+ожидаемо: §7 отстаёт от `config.example` ровно на находки Task 12. Расхождение
+печатается точно:
+
+```
+queries.yaml: §7 ['programmist', 'programmist-python', 'sistemnyj-administrator']
+              config.example ['programmist', 'razrabotchik', 'lead-developer',
+                              'rukovoditel-komandy-razrabotki', 'devops']
+profile.yaml: signals.title_roles — только в config.example
+              ['team-lead', 'tech-lead', 'сеньор', 'техлид', 'тимлид']
+              signals.stack — ['llms']; signals.domain — ['iiot']
+```
+
+- [ ] **Step 6: Догнать §7 спеки**
+
+Перенести в §7 образцы из `config.example` целиком: пять проверенных slug'ов вместо трёх
+(два из которых не существуют — hh.ru отдаёт по ним общий индекс) и семь недостающих
+сигналов ролей. Пометку «slug НЕ проверен» снять — теперь она неправда в обе стороны.
+
+Run: `uv run pytest tests/test_config_example.py -q`
+Expected: `34 passed` — обе сверки зелёные. Проверено: после подстановки
+`config.example/queries.yaml` и `config.example/profile.yaml` в §7 тест проходит.
+
+- [ ] **Step 7: Создать `.github/workflows/ci.yml`**
 
 ```yaml
 name: CI
 
 on:
   push:
-    branches: [main, master]
+    # Не [main, master]: работа идёт в feat/*, и CI, который не запускается
+    # на рабочей ветке, узнаёт о поломке в момент слияния — то есть поздно.
+    branches: ["**"]
   pull_request:
+
+# Пуш в ветку с открытым PR иначе запускает джобу дважды.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -6652,58 +7515,98 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Установить зависимости
-        run: uv pip install --system ".[dev]"
+      # Версия Python задаётся явно. Без этого шага `ubuntu-latest` даёт
+      # ту, которая на образе раннера сегодня, — сейчас это 3.12.3 по
+      # совпадению, а не по договорённости.
+      - name: Python
+        run: uv python install 3.12
+
+      # `uv pip install --system` здесь не работает в принципе: системный
+      # интерпретатор Ubuntu помечен externally-managed (PEP 668), и uv
+      # отказывается в него ставить. `uv sync --frozen` вдобавок берёт
+      # ровно те версии, что в uv.lock, — включая версию ruff, от которой
+      # зависит шаг форматирования.
+      - name: Зависимости
+        run: uv sync --frozen --extra dev --python 3.12
 
       - name: Линтер
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Форматирование
-        run: ruff format --check .
+        run: uv run ruff format --check .
 
       - name: Типы
-        run: mypy hh_search
+        run: uv run mypy hh_search tests
 
       - name: Тесты
-        run: pytest -v
+        run: uv run pytest -q
 ```
 
 Сеть в CI не используется: контрактные тесты отсеиваются меткой `network`.
 
-- [ ] **Step 5: Создать `README.md`**
+Рецепт проверен целиком в контейнере `ubuntu:24.04` (тот же базовый образ, что у
+`ubuntu-latest`) на `c3bc4b7`:
+
+```
+uv python install 3.12   -> + cpython-3.12.13-linux-x86_64-gnu
+uv sync --frozen --extra dev --python 3.12  -> ок
+uv run python --version  -> Python 3.12.13
+uv run ruff check .      -> All checks passed!
+uv run mypy hh_search tests -> Success: no issues found in 31 source files
+uv run pytest -q         -> 281 passed
+```
+
+Шаг `ruff format --check .` в этой проверке намеренно не участвовал: на `c3bc4b7` он
+красный, и зелёным его делает Step 1, а не CI.
+
+Прежний рецепт (`uv pip install --system ".[dev]"`) в том же контейнере воспроизводит
+отказ PEP 668 дословно — то есть шаг был бы красным при любом состоянии кода.
+
+- [ ] **Step 8: Создать `README.md`**
 
 ````markdown
 # hh-search
 
-Автопоиск вакансий на hh.ru для личного использования. Регулярно проверяет
-публичную RSS-ленту поиска, отсеивает нерелевантное, оценивает оставшееся по
-профилю и выгружает только новые находки в CSV и Markdown.
+Автопоиск вакансий на hh.ru для личного использования. Регулярно обходит
+курируемые листинги, отсеивает нерелевантное, оценивает оставшееся по профилю
+и выгружает только новые находки в CSV и Markdown.
 
 Дизайн: [`docs/superpowers/specs/2026-07-27-hh-autosearch-design.md`](docs/superpowers/specs/2026-07-27-hh-autosearch-design.md)
 
 ## Быстрый старт
 
 ```bash
-mkdir -p data/{config,state,reports,logs}
+mkdir -p data/config data/state data/reports data/logs
 cp config.example/*.yaml data/config/
 $EDITOR data/config/app.yaml     # укажите свой contact_email
+
+# uid контейнера обязан совпадать с владельцем ./data, иначе запись в том
+# отказывает: bind-mount подменяет каталог образа вашим вместе с владельцем.
+printf 'HH_UID=%s\nHH_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+
 docker compose build
 docker compose run --rm hh-search init-db
 docker compose run --rm hh-search run
 docker compose up -d
 ```
 
-Отчёты появятся в `data/reports/`, логи — в `data/logs/hh.log`.
+Отчёты появятся в `data/reports/`, логи — в `data/logs/hh.log`. Проверить, что
+запись в том действительно работает: после `init-db` файл `data/state/hh.db`
+обязан существовать и принадлежать вам.
 
 ## Источник данных
 
-Публичный API hh.ru для соискателей закрыт (403; поддержка прекращена 15.12.2025),
-поэтому используется публичная RSS-лента поиска и блок JSON-LD `JobPosting` со
-страницы вакансии. Авторизация, куки и эмуляция браузера не применяются.
+Публичный API hh.ru для соискателей закрыт (403; поддержка прекращена 15.12.2025).
+Поиск через RSS невозможен: `robots.txt` hh.ru запрещает правилом `Disallow: *?*`
+любой URL с query-строкой, а RSS-поиск — это `/search/vacancy/rss?text=...`.
+Используются курируемые листинги `/vacancies/{slug}` и `?page=N` (последний разрешён
+явным `Allow: /vacancies/*?page=`) плюс блок JSON-LD `JobPosting` со страницы
+вакансии. Авторизация, куки и эмуляция браузера не применяются.
 
-Ограничение источника: RSS отдаёт максимум 20 вакансий на запрос, пагинации нет.
-Поэтому все запросы идут с `order_by=publication_time` — окно всегда содержит
-самые свежие вакансии, что и требуется трекеру новинок.
+Ограничение источника: листинг отдаёт 20 вакансий на страницу и не умеет
+фильтровать по региону или опыту — всё это делает локальный фильтр по заголовку.
+Узких slug'ов у hh.ru нет: `/vacancies/yocto` молча отдаёт общий индекс, поэтому
+свои slug'и стоит проверить одним GET перед первым прогоном.
 
 ## Режим работы с hh.ru
 
@@ -6712,76 +7615,172 @@ docker compose up -d
 backoff. Устойчивый `403` останавливает прогон — обходные пути не применяются.
 Описание каждой вакансии скачивается ровно один раз за всё время.
 
+Про `robots.txt` честно: используется **собственный матчер RFC 9309**, а не
+`urllib.robotparser` из stdlib. Причина не в эстетике — stdlib не поддерживает
+подстановочные знаки (`RuleLine.applies_to` это `startswith`), поэтому правила
+`Disallow: *?*` он не видит вовсе и разрешает запрещённое. Свой матчер понимает
+`*` и `$`, сверяет путь вместе с query-строкой, при конфликте выбирает правило с
+самым длинным шаблоном и перепроверяет правила после каждого редиректа. Если
+`robots.txt` недоступен или не разобрался — запрещено всё.
+
 ## Настройка
 
 | Файл | Что менять |
 |---|---|
-| `data/config/queries.yaml` | Набор поисковых запросов, кластеры, веса |
+| `data/config/queries.yaml` | Набор листингов (`slug`), кластеры, веса, число страниц |
 | `data/config/profile.yaml` | Сигналы, веса скоринга, стоп-слова, порог |
 | `data/config/app.yaml` | Расписание, троттлинг, пути, контактный email |
 
 Опечатка в конфиге роняет процесс на старте с указанием поля — это сделано
-намеренно.
+намеренно, включая опечатки в значениях (границы у всех чисел) и повторные
+ключи YAML.
 
-**Про списки сигналов:** не используйте односимвольный латинский `c` — после
-нормализации русский предлог «с» превращается в него и даёт ложные срабатывания.
-Пишите `c++`, `c/c++` или `си`.
+### Как писать сигналы
+
+Четыре правила, каждое — следствие устройства матчера, а не вкуса. Нарушение
+любого из них даёт сигнал, который **молча не срабатывает**: он не роняет
+загрузку, не пишет в лог и просто не приносит вакансий.
+
+1. **Кириллический сигнал задаётся ОСНОВОЙ, а не словом.** Русские слова
+   склоняются, и матчер дописывает окончание сам — но только к тому, что вы
+   написали. `ведущий` не найдёт «Ведущего разработчика», `старший` не найдёт
+   «Старшего инженера». Пишите `ведущ`, `старш`, `архитектур`, `проектирован`.
+   Латинские сигналы, наоборот, ищутся точной формой: `armv` не найдёт ничего,
+   нужно `armv7` и `armv8` по отдельности.
+2. **Справа за сигналом не должно быть буквы или цифры.** `arm` не найдёт
+   `ARM64`, `python` не найдёт `python3`, `llm` не найдёт `LLMs`, `iot` не
+   найдёт `IIoT` (там мешает буква слева). Все нужные формы перечисляйте
+   явно — так и сделано в `config.example/profile.yaml`.
+3. **Многословный сигнал не терпит дефис вместо пробела и наоборот.**
+   `team lead` не найдёт `Team-Lead`, а `код-ревью` не найдёт «код ревью».
+   Если встречаются оба написания — вносите оба.
+4. **Не используйте односимвольный латинский `c`.** Матчер схлопывает
+   визуально одинаковые буквы, поэтому русский предлог «с» превращается в
+   него и даёт ложные срабатывания на каждой второй вакансии. Пишите `c++`,
+   `c/c++` или `си`.
+
+И про стоп-слова: ложное срабатывание необратимо — вакансия уходит в `rejected`
+навсегда. Общее слово в этом списке опаснее, чем кажется: `оператор`
+отбраковывал «Ведущий разработчик в крупный оператор связи», то есть ровно
+целевой телеком. Пишите узко: `оператор пк`, `оператор колл`.
 
 ## Команды
 
 ```bash
-docker compose run --rm hh-search run        # разовый прогон
-docker compose run --rm hh-search healthcheck       # свежесть последнего прогона
-docker compose run --rm hh-search report --since 7d # перегенерировать отчёт
+docker compose run --rm hh-search run          # разовый прогон
+docker compose run --rm hh-search init-db      # создать схему (первый запуск)
+docker compose run --rm hh-search healthcheck  # свежесть последнего прогона
+docker compose run --rm hh-search report --since 7d  # перегенерировать отчёт
 docker compose run --rm hh-search mark 12345 applied
+docker compose up -d                           # демон: serve по расписанию
 ```
+
+`serve` — точка входа контейнера: спит и раз в `schedule.interval_hours`
+вызывает тот же прогон, что и `run`. Останавливается по `docker stop` за доли
+секунды с кодом 0.
+
+Про `healthcheck` без иллюзий: он падает, если последний **успешный** прогон
+старше двух интервалов, и это индикатор для того, кто смотрит. Docker (в отличие
+от Swarm) контейнер по `unhealthy` **не перезапускает** — `restart: unless-stopped`
+реагирует только на выход процесса.
 
 ## Разработка
 
 ```bash
-uv pip install --system ".[dev]"
-pytest                    # без сети
-pytest -m network         # контрактные тесты против живого hh.ru
-ruff check . && mypy hh_search
+uv sync --frozen --extra dev
+uv run pytest                # без сети
+uv run pytest -m network     # контрактные тесты против живого hh.ru
+uv run ruff check . && uv run ruff format --check . && uv run mypy hh_search tests
 ```
 
-Контрактные тесты — ранняя система оповещения: если hh.ru изменит формат ленты
-или уберёт JSON-LD, они об этом скажут. В CI они не запускаются, чтобы сборка не
-зависела от живой выдачи.
+`uv pip install --system ".[dev]"` не сработает: системный интерпретатор Ubuntu
+помечен externally-managed (PEP 668).
+
+Контрактные тесты — ранняя система оповещения: если hh.ru изменит разметку
+листинга или уберёт JSON-LD, они об этом скажут. В CI не запускаются, чтобы
+сборка не зависела от живой выдачи; при отсутствии сети пропускаются, а не
+падают.
 ````
 
-- [ ] **Step 6: Зафиксировать отклонения в спеке**
+Про `mkdir -p data/config data/state data/reports data/logs` вместо
+`mkdir -p data/{config,state,reports,logs}`: фигурные скобки — расширение bash, а не
+POSIX. В `sh`/`dash` (то есть при копировании команды в скрипт) прежняя строка создаёт
+один каталог с буквальным именем `{config,state,reports,logs}` — проверено.
 
-В `docs/superpowers/specs/2026-07-27-hh-autosearch-design.md`:
+- [ ] **Step 9: Триаж отложенных Minor**
 
-1. В §5.1 после таблицы `run` добавить DDL таблицы `http_cache` (скопировать из
-   `hh_search/storage/schema.sql`) и строку: «`http_cache` — хранит `ETag` и
-   `Last-Modified` для условных запросов из §3.5.»
-2. В §5.1 в таблицу `vacancy` добавить колонку `cluster_weight INTEGER NOT NULL DEFAULT 0`
-   и пояснение: «вес запроса, назначившего кластер; нужен для правила из §6.2».
-3. В §11 заменить строку про зависимости на: «Рантайм: `httpx`, `pydantic`,
-   `PyYAML`, `typer`. `pydantic-settings` добавляется вместе с `TelegramSink` —
-   в первой версии секретов нет.»
-4. В §8.3 заменить `run --once` на `run` и добавить пояснение: «флаг `--once`
-   убран — команда всегда выполняет ровно один прогон, отдельный режим
-   задаёт `serve`».
+`HANDOFF.md` обещает, что отложенные Minor разберёт «финальное ревью ветки», но такой
+активности в плане не существует — то есть обещание не выполнялось бы никем. Разбор
+здесь.
 
-- [ ] **Step 7: Прогнать полную проверку**
+Счёт по ledger (`.superpowers/sdd/2026-07-27-hh-autosearch/progress.md`) на `c3bc4b7`:
 
-Run: `uv run pytest -v && uv run ruff check . && uv run ruff format --check . && uv run mypy hh_search`
-Expected: всё зелёное, контрактные тесты deselected
+| Источник | Записей |
+|---|---|
+| Task 1 | 2 |
+| Task 2 | 3 |
+| Task 3 | 4 |
+| Task 4 | 2 |
+| Task 5 | 4 |
+| Task 6 | 9 + 5 = 14 |
+| Ревью A (`A-minor`, M-1…M-7) | 7 |
+| Ревью B (`B-minor`) | 12 |
+| **Итого заведено** | **48** |
 
-- [ ] **Step 8: Коммит**
+Пять `D-minor` (дрейф расписания, отсутствие SIGTERM, `mark` на несуществующий id,
+`report --since 7days`, логи мимо файла) в счёт не входят: все пять закрыты переписанной
+Task 11, это проверяется её тестами.
+
+Часть из 48 закрыта походя и требует не решения, а вычёркивания: раунд 2 закрыл minor про
+fail-open на `robots.txt`, раунд 3 — три minor, раунд 4 удалил `apply_defaults` целиком
+(вместе с двумя записями про него), раунд 5 закрыл четыре. Сводка по Task 3 в ledger при
+этом заявляет «5 deferred minors» при четырёх записях — это тоже пункт разбора.
+
+По каждой записи принять одно из трёх решений:
+
+- **чиним здесь** — если дефект достижим на живых данных. Кандидаты первой очереди, все
+  подтверждены исполнением: `'₽.'` в `currency` (хвост вплотную к валюте попадает в токен
+  валюты), порча `enrich_attempts` выводит вакансию из всех трёх выборок молча,
+  `run_log`/`http_cache` не защищены от порчи, миграция не заполняет `primary_query` из
+  `vacancy_query` и не нормализует старые даты;
+- **заводим задачу** — если починка тянет за собой архитектуру (например, отказ от
+  регулярок в пользу парсера, чтобы `</script>` внутри строки JSON не обрывал блок);
+- **принимаем с обоснованием** — если вход недостижим на формате hh.ru. Обоснование
+  обязано ссылаться на факт, а не на мнение: так уже сделано с тремя `parked` из Task 3.
+
+Результат — таблица в конце ledger: `| запись | источник | решение | обоснование/коммит |`.
+Записей в таблице обязано быть столько же, сколько `(deferred)` в тексте выше: строка без
+решения — это не «отложено», а «потеряно».
+
+- [ ] **Step 10: Прогнать полную проверку**
+
+Run: `uv run pytest -q && uv run ruff check . && uv run ruff format --check . && uv run mypy hh_search tests`
+Expected: всё зелёное, контрактные тесты `deselected`.
+
+Отдельно, руками и с сетью: `uv run pytest -m network -q` → `3 passed`.
+
+- [ ] **Step 11: Коммит**
 
 ```bash
-git add .github README.md tests/test_contract_network.py docs/
+git add .github README.md tests docs/ hh_search/sources/listing.py
 git commit -m "ci: сборка, контрактные тесты и README
 
-CI гоняет линтер, типы и тесты без сети — живая выдача hh сделала бы
-сборку флаки. Контрактные тесты помечены network и запускаются руками;
-они ловят момент, когда hh изменит формат ленты или уберёт JSON-LD.
-В спеке зафиксированы два отклонения: таблица http_cache и колонка
-cluster_weight."
+CI ставит зависимости uv sync --frozen из uv.lock и гоняет всё через
+uv run: uv pip install --system упирался в PEP 668 и делал сборку
+красной на первом же шаге. Версия Python задана явно, добавлены
+concurrency, timeout и permissions: contents: read; ветки не сужены
+до main.
+
+Контрактный тест переписан с RSS на листинг и страницу вакансии,
+ходит клиентом проекта (значит спрашивает robots.txt, держит паузу и
+представляется контактным адресом) и пропускается при отсутствии
+сети, а не падает. Первым же прогоном он нашёл, что hh.ru редиректит
+листинг на региональный поддомен: canonical и все двадцать ссылок
+вели на nn.hh.ru и отбраковывались как чужой хост — discovery не
+работал ни на одном не-московском IP.
+
+Сверка спеки с кодом стала тестом: DDL §5.1 сравнивается со
+schema.sql, образцы §7 — с config.example."
 ```
 
 ---
@@ -6790,10 +7789,18 @@ cluster_weight."
 
 После Task 13 должно выполняться:
 
-- [ ] `docker compose build` собирается без ошибок
+- [ ] `docker compose build` собирается без ошибок, образ ~220 МБ, `schema.sql` внутри
+      установленного пакета в `site-packages`
+- [ ] `docker compose run --rm hh-search init-db` создаёт **файл** `data/state/hh.db` на
+      хосте, принадлежащий вашему uid (печать пути доказательством не является)
 - [ ] `docker compose run --rm hh-search run` с реальным конфигом создаёт
       `data/reports/<дата>-new.csv` и `.md`
-- [ ] Повторный `run` подряд не добавляет в отчёт ни одной вакансии
+- [ ] Повторный `run` подряд не добавляет в отчёт ни одной вакансии — и не добавляет её
+      повторно даже тогда, когда один из приёмников упал (дедупликация Task 9)
 - [ ] `docker compose run --rm hh-search healthcheck` возвращает 0 после успешного прогона
+- [ ] `docker compose up -d` поднимает контейнер, он переживает `docker restart`, а
+      `docker stop` укладывается в доли секунды с кодом 0 (не 137)
 - [ ] `pytest -m network` проходит — источник соответствует §3 спеки
-- [ ] `docker compose up -d` поднимает контейнер, он переживает `docker restart`
+- [ ] `pytest`, `ruff check .`, `ruff format --check .`, `mypy hh_search tests` зелёные, и
+      тот же набор проходит в CI
+- [ ] У каждой записи `(deferred)` в ledger есть строка в итоговой таблице триажа
