@@ -1,0 +1,25 @@
+weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, domain: 0.10}
+saturation: {stack: 5, responsibilities: 3}
+penalty_per_signal: 15
+signals:
+  # Вложенный список — ГРУППА написаний одной сущности, считающаяся ОДНИМ
+  # сигналом насыщения (спека §6). Простая строка — группа из одного элемента,
+  # поэтому оба написания законны и старые профили не переписываются.
+  #
+  # Кириллический сигнал задаётся ОСНОВОЙ (`ведущ`, а не `ведущий`), латинский —
+  # точной формой, и ни тот ни другой не срабатывает, если сразу за паттерном
+  # стоит буква или цифра (спека §6.1). Отсюда `arm64` рядом с `arm`.
+  title_roles: [[team lead, tech lead, teamlead, team-lead, tech-lead, тимлид, техлид],
+                [senior, сеньор], ведущ, старш, руководител]
+  title_tech:  [backend, embedded, linux, c++, python,
+                [node, node.js, nodejs], firmware]
+  stack:       [yocto, buildroot, openwrt, bsp, kernel,
+                [arm, arm64, armv7, armv8],
+                c++, python, node.js, typescript, docker, kubernetes, kafka,
+                postgresql, clickhouse, [llm, llms], rag, mcp]
+  responsibilities: [архитектур, менторинг, [код-ревью, code review],
+                     проектирован, техдолг]
+  domain:      [телеком, встраиваем, embedded, [iot, iiot], микросервис]
+negative: [[junior, стажёр, intern], 1c, продаж, рекрутер, ручн тестиров,
+           [оператор пк, оператор call, оператор колл, оператор станка], курьер]
+report_threshold: 60

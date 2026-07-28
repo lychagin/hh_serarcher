@@ -6657,6 +6657,7 @@ report читает историю через safe_rows и CAST AS BLOB: еди�
 **Files:**
 - Create: `Dockerfile`, `compose.yaml`, `.dockerignore`
 - Create: `config.example/app.yaml`, `config.example/profile.yaml`, `config.example/queries.yaml`
+- Modify: `.env.example` (HH_UID/HH_GID — их требует `compose.yaml`, а шаблон о них молчал)
 - Test: `tests/test_config_example.py`
 
 **Interfaces:**
@@ -6719,7 +6720,7 @@ report читает историю через safe_rows и CAST AS BLOB: еди�
 **220 МБ** для многостадийной сборки. Замер ниже совпадает с ним; сверяться нужно со
 спекой, а не с прежним ориентиром.
 
-- [ ] **Step 1: Создать `.dockerignore`**
+- [x] **Step 1: Создать `.dockerignore`**
 
 ```
 .git
@@ -6742,7 +6743,7 @@ __pycache__
 образ они не нужны никогда, а `.env` — это ещё и файл с секретами, которому нечего делать
 в слоях.
 
-- [ ] **Step 2: Создать `Dockerfile`**
+- [x] **Step 2: Создать `Dockerfile`**
 
 ```dockerfile
 # Стадия сборки: uv, кэш колёс и инструменты сборки не должны доехать до рантайма.
@@ -6796,7 +6797,7 @@ ENTRYPOINT ["python", "-m", "hh_search"]
 CMD ["serve"]
 ```
 
-- [ ] **Step 3: Создать `compose.yaml`**
+- [x] **Step 3: Создать `compose.yaml`**
 
 ```yaml
 services:
@@ -6844,7 +6845,7 @@ services:
   индикатор для того, кто смотрит, а не механизм самолечения. Обещать иное README не
   должен.
 
-- [ ] **Step 4: Создать образцы конфигов**
+- [x] **Step 4: Создать образцы конфигов**
 
 `config.example/queries.yaml`. Все slug'и проверены живым GET 2026-07-28 — hh.ru отдал
 `<link rel="canonical">` на запрошенный путь, а не на общий индекс:
@@ -6944,12 +6945,43 @@ report_threshold: 60
 
 Семь сигналов (`тимлид`, `техлид`, `сеньор`, `team-lead`, `tech-lead`, `llms`, `iiot`)
 идут **сверх** образца §7 спеки: их отсутствие проверено прогоном, спека их пока не
-содержит. Синхронизация — Task 13, Step 7.
+содержит. Синхронизация — Task 13, Step 7. Образец §7 спеки при этом сам по себе рабочий:
+проверено `load_config` 2026-07-28 — 47 групп, 60 написаний, ровно те числа, которые спека
+о себе и заявляет.
 
-`config.example/app.yaml` — подставьте свой email перед первым запуском:
+**Прогон образца по живым заголовкам.** 37 уникальных заголовков из
+`listing_programmist.html.gz` и `listing_regional_redirect.html.gz` (обе ленты — один и
+тот же `/vacancies/programmist`, снятый из Москвы и из региона). Срабатывает 9 написаний
+из 67: `ведущ` (2 заголовка), `backend`, `c++` (2), `python`, `junior` (3), `стажёр` (14),
+`1c` (11). Префильтр отбраковывает 21 заголовок из 37, ложных отказов ноль — «Ведущий
+программист» и «Инженер-программист» проходят.
+
+Остальные 58 написаний на этой ленте молчат **объяснимо, а не сломанно**, и это разные
+вещи, которые надо различать фактом: лента junior-1C-шная и заголовочная, поэтому в ней
+нет ни лидов, ни embedded-стека, ни ответственностей с доменом (они вообще живут в
+описании, а не в заголовке). Чтобы «кластера нет в ленте» не прикрывало «сигнал мёртв»,
+каждое из 67 написаний отдельно прогнано по фразе той формы, ради которой оно внесено
+(`yocto` → «сборка образа Yocto», `iiot` → «Инженер IIoT-платформы», `оператор станка` →
+«Оператор станка ЧПУ», …): **мёртвых 0 из 67**.
+
+Отдельно проверено, что `1c` ловит кириллическую `1С` (11 живых заголовков) — схлопывание
+омоглифов §6.1 работает. И отдельно замечено, что `1c` НЕ ловит «Программист 1 С» с
+пробелом: это одна живая вакансия, отдельным сигналом её не закрывают, потому что `1 с`
+после схлопывания стал бы двумя короткими словами, второе из которых — то самое `с`,
+выкашивавшее 11 заголовков из 20.
+
+`config.example/app.yaml` — подставьте свой email перед первым запуском. Заглушка
+**латинская, и это не косметика**: `contact_email` подставляется в `User-Agent`, а httpx
+кодирует заголовки в ascii, поэтому кириллическая заглушка роняла КАЖДЫЙ прогон
+`UnicodeEncodeError`'ом из глубины httpx — ещё до первого байта в сеть. Валидатор такую
+заглушку пропускает (это валидный адрес), `init-db` отрабатывает штатно (клиент ему не
+нужен), а в `serve` отказ ловится общим `except Exception`, и демон вечно крутит пустой
+цикл раз в четыре часа. Воспроизведено исполнением 2026-07-28:
+`UnicodeEncodeError: 'ascii' codec can't encode characters in position 36-38`. Сторож —
+`test_example_user_agent_builds_a_client`.
 
 ```yaml
-contact_email: "ВАШ_EMAIL@example.com"
+contact_email: "your-email@example.com"
 user_agent: "hh-search/0.1 (personal job search; {contact_email})"
 schedule:
   interval_hours: 4
@@ -6967,7 +6999,7 @@ paths:
   logs: /data/logs
 ```
 
-- [ ] **Step 5: Написать тест, который прогоняет образец через `load_config` и `SignalMatcher`**
+- [x] **Step 5: Написать тест, который прогоняет образец через `load_config` и `SignalMatcher`**
 
 Без него класс дефекта №5 не ловится ничем: молчащий сигнал не роняет загрузку, не пишет
 в лог и просто не приносит вакансий. Создать `tests/test_config_example.py`:
@@ -6995,6 +7027,7 @@ import pytest
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
 from hh_search.filtering.matching import SignalMatcher
+from hh_search.sources.http import PoliteClient
 
 CONFIG_EXAMPLE = Path(__file__).resolve().parent.parent / "config.example"
 
@@ -7025,8 +7058,9 @@ MUST_MATCH = [
     ("Оператор станка ЧПУ", "оператор станка"),
 ]
 
-# Ложное срабатывание стоп-слова необратимо: вакансия уходит в `rejected`
-# навсегда и в отчёт уже не попадёт никогда.
+# Ложное срабатывание стоп-слова стоит вакансии до ближайшей правки конфига:
+# она уходит в `rejected` и вернётся оттуда только следующим прогоном и только
+# если конфиг изменился (решение владельца, `requeue_prefiltered`).
 MUST_NOT_BE_REJECTED = [
     "Ведущий разработчик C++ в крупный оператор связи",
     "Старший инженер-программист, телеком",
@@ -7039,7 +7073,7 @@ def example_config() -> Config:
     return load_config(CONFIG_EXAMPLE)
 
 
-def _signal_fields(config: Config) -> dict[str, list[list[str]]]:
+def _signal_groups(config: Config) -> dict[str, list[list[str]]]:
     """Каждое поле — список ГРУПП написаний (спека §6, §7)."""
     signals = config.profile.signals
     return {
@@ -7052,13 +7086,27 @@ def _signal_fields(config: Config) -> dict[str, list[list[str]]]:
     }
 
 
+def _signals_by_field(config: Config) -> dict[str, list[str]]:
+    """То же самое, но плоско: группа для повтора не граница (спека §7)."""
+    return {
+        field: [signal for group in groups for signal in group]
+        for field, groups in _signal_groups(config).items()
+    }
+
+
 def _all_signals(config: Config) -> list[str]:
-    return [
-        signal
-        for field in _signal_fields(config).values()
-        for group in field
-        for signal in group
-    ]
+    return [signal for field in _signals_by_field(config).values() for signal in field]
+
+
+def _negative_matcher(config: Config) -> SignalMatcher:
+    """Ровно так же, как строит его `Prefilter`.
+
+    `profile.negative` — список ГРУПП, а не написаний, и передать его в
+    `SignalMatcher` как есть нельзя: `_compile` получил бы список вместо
+    строки. В отсеве группы разворачиваются, потому что там сигнал не
+    участвует ни в каком насыщении, а становится отдельной причиной отказа.
+    """
+    return SignalMatcher(_signals_by_field(config)["negative"])
 
 
 def test_example_config_loads(example_config: Config) -> None:
@@ -7067,17 +7115,35 @@ def test_example_config_loads(example_config: Config) -> None:
     assert example_config.app.sinks == ["csv", "markdown"]
 
 
+def test_example_user_agent_builds_a_client(example_config: Config) -> None:
+    """Заглушка `contact_email` обязана давать РАБОЧИЙ User-Agent.
+
+    Третий тихий класс дефекта, найденный запуском контейнера: адрес
+    проходит валидатор (`^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$` кириллицу не
+    запрещает), подставляется в `user_agent`, а httpx кодирует заголовки в
+    ascii — и КАЖДЫЙ прогон падает `UnicodeEncodeError` из глубины httpx,
+    ещё до первого байта в сеть. В `serve` этот отказ ловится общим
+    `except Exception`: демон вечно крутит пустой цикл раз в четыре часа, а
+    `init-db` (единственная команда, которой клиент не нужен) отрабатывает
+    штатно и создаёт иллюзию рабочей установки.
+
+    Сеть здесь не задействуется: конструктор только собирает `httpx.Client`.
+    """
+    with PoliteClient(example_config.app.http, example_config.app.user_agent):
+        pass
+
+
 def test_every_example_signal_compiles(example_config: Config) -> None:
     """Пустой или неразбираемый сигнал упал бы прямо здесь."""
     SignalMatcher(_all_signals(example_config))
 
 
-@pytest.mark.parametrize("group", sorted(_signal_groups(load_config(CONFIG_EXAMPLE))))
-def test_example_group_has_no_duplicate_signals(example_config: Config, group: str) -> None:
-    """Повтор ВНУТРИ группы удваивает вклад и штраф. Повтор МЕЖДУ группами
+@pytest.mark.parametrize("field", sorted(_signal_groups(load_config(CONFIG_EXAMPLE))))
+def test_example_field_has_no_duplicate_signals(example_config: Config, field: str) -> None:
+    """Повтор ВНУТРИ поля удваивает вклад и штраф. Повтор МЕЖДУ полями
     (`python` в title_tech и в stack) — наоборот, замысел: это разные
     слагаемые формулы (спека §6)."""
-    signals = _signal_groups(example_config)[group]
+    signals = _signals_by_field(example_config)[field]
     assert len(signals) == len(set(signals))
 
 
@@ -7091,21 +7157,34 @@ def test_example_signal_actually_fires(example_config: Config, title: str, signa
 @pytest.mark.parametrize("title", MUST_NOT_BE_REJECTED)
 def test_example_stop_words_do_not_reject_the_target(example_config: Config, title: str) -> None:
     """«крупный оператор связи» — это целевой телеком, а не колл-центр."""
-    assert SignalMatcher(example_config.profile.negative).find(title) == []
+    assert _negative_matcher(example_config).find(title) == []
 ```
 
-Run: `uv run pytest tests/test_config_example.py -q`
-Expected: `32 passed`
+Три правки против первой редакции этого шага, все — по факту исполнения:
 
-- [ ] **Step 5a: Убедиться, что тест — настоящий сторож**
+- `_signal_groups` в параметризации не был определён (определялся `_signal_fields`) —
+  `NameError` на сборе тестов. Функции разведены: `_signal_groups` отдаёт группы,
+  `_signals_by_field` — плоский список поля, а уникальность проверяется именно на
+  плоском (группа для повтора не граница, спека §7).
+- `SignalMatcher(config.profile.negative)` роняло
+  `AttributeError: 'list' object has no attribute 'strip'`: после введения групп
+  `negative` — это `list[list[str]]`, а `SignalMatcher` ждёт написания. Группы
+  разворачиваются ровно так же, как это делает `Prefilter`.
+- Добавлен `test_example_user_agent_builds_a_client` — сторож третьего тихого класса
+  (см. Step 4). Поэтому тестов 33, а не 32.
+
+Run: `uv run pytest tests/test_config_example.py -q`
+Expected: `33 passed`
+
+- [x] **Step 5a: Убедиться, что тест — настоящий сторож**
 
 Временно подставить в `config.example/profile.yaml` прежнюю редакцию сигналов
 (`ведущий`, `старший`, `arm`, `node`, `ручное тестирование`, `оператор`, без
 `тимлид`/`техлид`/`сеньор`/`team-lead`/`tech-lead`/`llms`/`iiot`/`nodejs`/`arm64`).
 
 Run: `uv run pytest tests/test_config_example.py -q`
-Expected: `21 failed, 11 passed` — из 21 обязательного срабатывания уцелевает ровно
-одно (`node.js`: он и в прежнем образце был), а
+Expected: `21 failed, 12 passed` (замер 2026-07-28) — из 21 обязательного срабатывания
+уцелевает ровно одно (`node.js`: он и в прежнем образце был), а
 `test_example_stop_words_do_not_reject_the_target` падает с
 `AssertionError: assert ['оператор'] == []` на «Ведущий разработчик C++ в крупный
 оператор связи». Вернуть исправленный образец: снова `32 passed`.
@@ -7113,7 +7192,7 @@ Expected: `21 failed, 11 passed` — из 21 обязательного сраб
 Тот же приём с прежним `queries.yaml` (`text`/`area`/`experience`/…) даёт
 `ValidationError: 4 validation errors for Config` ещё на сборе тестов.
 
-- [ ] **Step 6: Собрать образ и проверить его содержимое фактом**
+- [x] **Step 6: Собрать образ и проверить его содержимое фактом**
 
 ```bash
 docker build -t hh-search:latest .
@@ -7132,7 +7211,7 @@ print('uid:gid:', f'{os.getuid()}:{os.getgid()}', '| cwd:', os.getcwd())
 Expected (проверено 2026-07-28):
 
 ```
-220MB
+221MB
 SIGTERM 10001:10001 /
 пакет: /install/lib/python3.12/site-packages/hh_search
 schema.sql на месте: True
@@ -7140,11 +7219,12 @@ uid:gid: 10001:10001 | cwd: /
 ```
 
 Три вещи, которые здесь проверяются, а не декларируются: размер совпадает с фактом спеки
-§8.2 (220 МБ, из них 177 МБ — сама база `python:3.12-slim`); пакет исполняется **из
+§8.2 (замер 2026-07-28 — 221 МБ, из них 177 МБ — сама база `python:3.12-slim`;
+лишний мегабайт против прежнего замера даёт attestation-манифест buildx); пакет исполняется **из
 `site-packages`**, а не из копии исходников, поэтому `force-include` схемы проверен
 исполнением; процесс — непривилегированный.
 
-- [ ] **Step 7: Проверить, что контейнер РЕАЛЬНО пишет в смонтированный каталог**
+- [x] **Step 7: Проверить, что контейнер РЕАЛЬНО пишет в смонтированный каталог**
 
 Печать пути к базе доказательством не является — `init-db` печатал его и в той сборке,
 где запись отказывала. Проверять надо файл на хосте.
@@ -7171,36 +7251,54 @@ Expected: `init-db` печатает путь, а `ls` показывает **с
 имена файлов отчёта (`{now:%Y-%m-%d}-new.csv`) переключаются на новый день на три часа
 позже.
 
-- [ ] **Step 8: Замерить `docker stop`**
+- [x] **Step 8: Замерить `docker stop`**
+
+`serve` начинает прогон НЕМЕДЛЕННО при старте, поэтому голый `docker compose up -d`
+ради замера остановки отправил бы контейнер обходить hh.ru: пять листингов, до девяти
+страниц выдачи и по двадцать страниц вакансий с каждой. Замер к сети никакого отношения
+не имеет, поэтому контейнер поднимается без неё — прогон честно отказывает
+(«robots.txt недоступен, доступ запрещён по умолчанию»), а PID 1, обработчик и
+`docker stop` те же самые:
 
 ```bash
-docker compose up -d
-cid=$(docker compose ps -q hh-search)
+printf 'services:\n  hh-search:\n    network_mode: none\n' > /tmp/compose.offline.yaml
+docker compose -f compose.yaml -f /tmp/compose.offline.yaml up -d
+sleep 25   # дать первому прогону отказать и уйти в ожидание между прогонами
+cid=$(docker compose -f compose.yaml -f /tmp/compose.offline.yaml ps -q hh-search)
 start=$(date +%s%N); docker stop "$cid" >/dev/null; end=$(date +%s%N)
 echo "stop=$(( (end - start) / 1000000 ))ms exit=$(docker inspect -f '{{.State.ExitCode}}' "$cid")"
 docker logs "$cid" | tail -2
 ```
 
-Expected: `stop=` доли секунды (замер: **263 мс**), `exit=0`, и в логах — строка
-обработчика о завершении после текущего прогона. Проверено, что без обработчика тот же
-контейнер стоит весь grace period и уходит кодом 137; см. таблицу в преамбуле задачи.
+Expected: `stop=` доли секунды, `exit=0`, и в логах — строка обработчика о завершении
+после текущего прогона. Замеры 2026-07-28 на этом образе:
+
+| Что стоит в PID 1 | `docker stop` | код выхода |
+|---|---|---|
+| `serve` в ожидании между прогонами | **129 мс** | **0**, в логах `получен SIGTERM` |
+| `serve`, SIGTERM пришёл посреди прогона | **625 мс** | **0**, прогон дозакрыт |
+| контроль: `python -c "time.sleep(600)"`, тот же образ, `--stop-timeout 20` | 20 237 мс | 137 (SIGKILL) |
+
+Контроль обязателен: без него «быстрая остановка» неотличима от «процесс и так падал
+сам». Разница в 160 раз между строками 1 и 3 — это и есть обработчик из Task 11.
 
 Если здесь `exit=137` — обработчик из Task 11 не установлен или установлен не в PID 1,
 и дальше идти нельзя: `serve` держит открытое `sqlite3.Connection`.
 
-- [ ] **Step 9: Прогнать полную проверку**
+- [x] **Step 9: Прогнать полную проверку**
 
 Run: `uv run pytest -q && uv run mypy hh_search tests && uv run ruff check . && uv run ruff format --check tests/test_config_example.py`
-Expected: всё зелёное; `tests/test_config_example.py` добавляет 32 теста.
+Expected: всё зелёное; `tests/test_config_example.py` добавляет 33 теста (492 -> 525).
 
 `ruff format --check` здесь, как и в задачах 7–11, запускается **по новому файлу, а не по
 репозиторию**: форматтер по нему не гонялся ни разу, и первый прогон — отдельный шаг
 Task 13 с отдельным коммитом.
 
-- [ ] **Step 10: Коммит**
+- [x] **Step 10: Коммит**
 
 ```bash
-git add Dockerfile compose.yaml .dockerignore config.example tests/test_config_example.py
+git add Dockerfile compose.yaml .dockerignore .env.example config.example \
+        tests/test_config_example.py
 git commit -m "feat: Docker-образ и образцы конфигурации
 
 Многостадийная сборка: зависимости ставятся uv sync --frozen из

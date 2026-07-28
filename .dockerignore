@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+.env
+data
+tests
+docs
+compose.yaml
+config.example
+*.egg-info
+.mypy_cache
+.pytest_cache
+.ruff_cache
+__pycache__

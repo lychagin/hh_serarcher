@@ -1,0 +1,26 @@
+# Slug — это НЕ поисковый запрос: hh.ru отдаёт только курируемые листинги.
+# На несуществующий slug он отвечает 200 и общим индексом (спека §3.3), а
+# сторож canonical превращает это в громкий FetchFailed уже ПОСЛЕ запроса —
+# поэтому каждый свой slug подтверждайте одним GET заранее.
+# Проверено 2026-07-28: перечисленные ниже существуют.
+queries:
+  - slug: programmist
+    cluster: backend
+    weight: 8
+    pages: 3
+  - slug: razrabotchik
+    cluster: backend
+    weight: 8
+    pages: 3
+  - slug: lead-developer
+    cluster: lead
+    weight: 10
+    pages: 1
+  - slug: rukovoditel-komandy-razrabotki
+    cluster: lead
+    weight: 10
+    pages: 1
+  - slug: devops
+    cluster: infra
+    weight: 5
+    pages: 1

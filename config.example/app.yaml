@@ -1,0 +1,22 @@
+# ЗАМЕНИТЕ на свой адрес перед первым запуском: он уезжает в User-Agent и
+# служит hh.ru способом с нами связаться (спека §3.5). Заглушка намеренно
+# латинская: httpx кодирует заголовки в ascii, поэтому кириллица здесь роняет
+# КАЖДЫЙ прогон UnicodeEncodeError'ом из глубины httpx — а в `serve` этот отказ
+# ловится общим `except Exception`, и демон вечно крутит пустой цикл раз в
+# четыре часа. Валидатор конфига такую заглушку пропускает: она валидный адрес.
+contact_email: "your-email@example.com"
+user_agent: "hh-search/0.1 (personal job search; {contact_email})"
+schedule:
+  interval_hours: 4
+http:
+  delay_between_requests_sec: 1.0
+  timeout_sec: 20
+  max_retries: 3
+  respect_robots: true
+enrich:
+  max_attempts: 3
+sinks: [csv, markdown]
+paths:
+  state: /data/state/hh.db
+  reports: /data/reports
+  logs: /data/logs

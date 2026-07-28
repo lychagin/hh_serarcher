@@ -1,0 +1,25 @@
+services:
+  hh-search:
+    build: .
+    image: hh-search:latest
+    restart: unless-stopped
+    # uid контейнера обязан совпадать с владельцем ./data на хосте: bind-mount
+    # подменяет каталог образа хостовым ВМЕСТЕ с владельцем, и chown внутри
+    # Dockerfile до него не доезжает. Значения берутся из .env (см. README).
+    user: "${HH_UID:-1000}:${HH_GID:-1000}"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/data
+    environment:
+      TZ: Europe/Moscow
+    # Больше, чем стоит остановка с обработчиком (0.26 с), но достаточно, чтобы
+    # прогон успел закрыть транзакцию, если SIGTERM пришёл в середине.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-m", "hh_search", "healthcheck"]
+      interval: 15m
+      timeout: 30s
+      retries: 3
+      start_period: 5m
