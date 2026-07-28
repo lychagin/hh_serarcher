@@ -1,5 +1,10 @@
+import fcntl
 import logging
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +16,7 @@ from typer.testing import CliRunner, Result
 
 from hh_search.__main__ import app
 from hh_search.config.loader import load_config
+from hh_search.scheduler import StopSignal
 from hh_search.storage.repository import SqliteRepository
 from tests.test_config import APP_YAML, write_config
 from tests.test_pipeline import TWO_VACANCIES, page_html
@@ -226,15 +232,37 @@ def test_run_exits_nonzero_when_reports_cannot_be_written(tmp_path: Path) -> Non
     Каталог отчётов занят файлом, поэтому оба приёмника падают. Прогон
     обязан не помечать вакансии отправленными, понизить статус и отдать
     ненулевой код: cron про испорченный volume иначе не узнает никогда.
+
+    Статус именно `failed`, а не `partial`: доставлено ноль при непустой
+    очереди — это не частичная потеря, а отсутствие работы целиком, и
+    `partial` считался бы для healthcheck успехом (см. C2 в
+    `reporting._complain`).
     """
     config_dir = prepare(tmp_path)
     (tmp_path / "reports").write_text("не каталог", encoding="utf-8")
     mock_source()
     result = invoke(config_dir, "run")
-    assert result.exit_code == 3
-    assert "partial" in result.output
+    assert result.exit_code == 1
+    assert "failed" in result.output
     with SqliteRepository(state_path(config_dir)) as repo:
         assert [item.discovered.id for item in repo.unreported()] == ["111"]
+
+
+@respx.mock
+def test_healthcheck_goes_red_when_nothing_is_ever_delivered(tmp_path: Path) -> None:
+    """C2 целиком, глазами Docker: сутки прогонов, ни одного отчёта.
+
+    Точка входа контейнера — `serve`, кода возврата которого не видит
+    никто, поэтому healthcheck остаётся единственным индикатором. Шесть
+    прогонов подряд (сутки при `interval_hours: 4`) с недоступным томом
+    отчётов обязаны оставить его красным.
+    """
+    config_dir = prepare(tmp_path)
+    (tmp_path / "reports").write_text("не каталог", encoding="utf-8")
+    mock_source()
+    for _ in range(6):
+        assert invoke(config_dir, "run").exit_code == 1
+    assert invoke(config_dir, "healthcheck").exit_code == 1
 
 
 @respx.mock
@@ -418,3 +446,293 @@ def read_status(db: Path, vacancy_id: str) -> str | None:
     row = raw.execute("SELECT status FROM vacancy WHERE id = ?", (vacancy_id,)).fetchone()
     raw.close()
     return None if row is None else str(row[0])
+
+
+# --- I2: два одновременных прогона не имеют права задваивать отчёт ---------
+
+
+@respx.mock
+def test_run_refuses_to_start_while_another_run_holds_the_lock(tmp_path: Path) -> None:
+    """`docker exec … run` во время работы `serve` — естественное действие.
+
+    Взаимного исключения не было ни в CLI, ни в хранилище, а дедупликация
+    приёмника — read-modify-write по файлу дня, то есть гонка. Результат
+    воспроизводился: 38 строк вместо 19, 18 дублей и второй BOM в
+    СЕРЕДИНЕ файла, хотя приёмник обещает ровно один BOM за файл.
+
+    Замок берётся здесь СЫРЫМ `fcntl`, а не через API проекта: тест
+    обязан описывать поведение (второй прогон отказывается стартовать), а
+    не устройство замка.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    assert invoke(config_dir, "init-db").exit_code == 0
+    lock_path = state_path(config_dir).with_name(state_path(config_dir).name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = invoke(config_dir, "run")
+
+    assert result.exit_code == 1
+    assert "уже идёт" in result.output
+    assert "Traceback" not in result.output
+    assert runs_in_journal(state_path(config_dir)) == []
+
+
+@respx.mock
+def test_report_refuses_to_overwrite_the_file_of_a_running_run(tmp_path: Path) -> None:
+    """`report` пишет в ТОТ ЖЕ файл дня, что и прогон.
+
+    Дедупликация приёмника — чтение-правка-запись, поэтому `report`
+    гонится с прогоном ровно так же, как два прогона между собой.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    assert invoke(config_dir, "run").exit_code == 0
+    lock_path = state_path(config_dir).with_name(state_path(config_dir).name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = invoke(config_dir, "report", "--since", "7d")
+
+    assert result.exit_code == 1
+    assert "уже идёт" in result.output
+
+
+@respx.mock
+def test_the_lock_is_released_when_the_run_ends(tmp_path: Path) -> None:
+    """Замок держится ровно на время прогона: следующий обязан пройти."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    assert invoke(config_dir, "run").exit_code == 0
+    assert invoke(config_dir, "run").exit_code == 0
+    assert len(runs_in_journal(state_path(config_dir))) == 2
+
+
+def test_four_parallel_runs_leave_one_intact_report(tmp_path: Path) -> None:
+    """Тот же сценарий по-настоящему: четыре `run` одновременно.
+
+    Проверяются инварианты отчёта, а не порядок победителей: BOM ровно
+    один на файл, id не задвоены, и ни одна строка журнала не осталась
+    незакрытой. С замком это детерминировано. Без него окно гонки
+    открывается не в каждом залпе (замер на FIX_BASE: испорченный отчёт в
+    1 из 10 залпов — 38 строк вместо 19 и второй BOM в середине файла),
+    поэтому дифференциальным сторожем механизма служит тест выше, а этот
+    сторожит сам инвариант отчёта.
+    """
+    config_dir = prepare(tmp_path)
+    driver = tmp_path / "driver.py"
+    driver.write_text(PARALLEL_DRIVER, encoding="utf-8")
+    subprocess.run(
+        [sys.executable, str(driver), str(config_dir)], check=True, cwd=REPO_ROOT, env=child_env()
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(driver), str(config_dir), "run"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=REPO_ROOT,
+            env=child_env(),
+        )
+        for _ in range(4)
+    ]
+    outputs = [process.communicate()[0].strip() for process in processes]
+
+    csv_report = tmp_path / "reports" / f"{TODAY}-new.csv"
+    body = csv_report.read_bytes()
+    lines = body.decode("utf-8-sig").splitlines()
+    ids = [line.split(";")[0] for line in lines[1:] if line]
+    assert body.count("﻿".encode()) == 1, f"BOM не один: {outputs}"
+    assert len(ids) == len(set(ids)), f"отчёт задвоен: {ids}"
+    assert "111" in ids
+    statuses = {status for status, _ in runs_in_journal(state_path(config_dir))}
+    assert "running" not in statuses
+
+
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+
+# Отдельный процесс, а не поток: замок прогона живёт в файловой системе, и
+# проверять его имеет смысл только настоящей параллельностью процессов.
+PARALLEL_DRIVER = f"""
+import sys
+sys.path.insert(0, {REPO_ROOT!r})
+import httpx, respx
+from pathlib import Path
+from typer.testing import CliRunner
+from hh_search.__main__ import app
+from tests.test_pipeline import TWO_VACANCIES, page_html
+
+FIXTURES = Path({REPO_ROOT!r}) / "tests" / "fixtures"
+config_dir, *rest = sys.argv[1:]
+command = rest[0] if rest else "init-db"
+runner = CliRunner()
+with respx.mock:
+    respx.get("https://hh.ru/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=(FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"),
+            headers={{"Content-Type": "text/plain"}},
+        )
+    )
+    respx.get(url__startswith="https://hh.ru/vacancies/programmist").mock(
+        return_value=httpx.Response(200, text=TWO_VACANCIES)
+    )
+    respx.get(url__regex=r"^https://hh\\.ru/vacancy/\\d+$").mock(
+        return_value=httpx.Response(200, text=page_html())
+    )
+    print(runner.invoke(app, ["--config-dir", config_dir, command]).exit_code)
+"""
+
+
+def child_env() -> dict[str, str]:
+    """Окружение дочернего процесса: без кэша байткода и без ANSI в выводе."""
+    return {**os.environ, "NO_COLOR": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+
+
+def runs_in_journal(db: Path) -> list[tuple[str, object]]:
+    raw = sqlite3.connect(str(db))
+    rows = raw.execute("SELECT status, reported FROM run ORDER BY id").fetchall()
+    raw.close()
+    return [(str(row[0]), row[1]) for row in rows]
+
+
+# --- M1: `report` обязан отказывать так же, как `run` ---------------------
+
+
+@respx.mock
+def test_report_exits_partial_when_sinks_cannot_write(tmp_path: Path) -> None:
+    """Одна и та же беда — один и тот же ответ CLI.
+
+    Недоступный каталог отчётов давал здесь голый traceback, тогда как
+    `run` в этой же ситуации отдаёт `partial`, код 3 и внятный текст. По
+    выводу `report` человек решает, чинить ему конфиг или том, — а
+    стектрейс на этот вопрос не отвечает.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    assert invoke(config_dir, "run").exit_code == 0
+    reports = tmp_path / "reports"
+    for report in reports.iterdir():
+        report.unlink()
+    reports.rmdir()
+    reports.write_text("не каталог", encoding="utf-8")
+
+    result = invoke(config_dir, "report", "--since", "7d")
+
+    assert result.exit_code == 3
+    assert "не приняли отчёт" in result.output
+    # Стектрейс в выводе быть может — его печатает логгер приёмника
+    # (`exc_info=True`), как и в `run`. Чего быть не должно, так это
+    # необработанного исключения: именно оно давало код 1 и ни слова о том,
+    # что случилось.
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+# --- M2: строка `running` от убитого процесса не имеет права висеть вечно --
+
+
+@respx.mock
+def test_a_run_row_left_by_a_killed_process_is_closed(tmp_path: Path) -> None:
+    """После SIGKILL строка остаётся `running` навсегда и никем не показана.
+
+    Успешным такой прогон не считался и раньше, но кладбище росло без
+    единого признака. Закрывается оно под замком прогона: пока замок наш,
+    любая строка `running` заведомо принадлежит мёртвому процессу.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    assert invoke(config_dir, "init-db").exit_code == 0
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.start_run()
+    assert [status for status, _ in runs_in_journal(state_path(config_dir))] == ["running"]
+
+    assert invoke(config_dir, "run").exit_code == 0
+
+    statuses = [status for status, _ in runs_in_journal(state_path(config_dir))]
+    assert statuses == ["interrupted", "ok"]
+    assert invoke(config_dir, "healthcheck").exit_code == 0
+
+
+# --- M7: устойчивый 403 обязан прекращать запросы в описанном развёртывании -
+
+
+def test_persistent_forbidden_leaves_a_marker_that_stops_the_next_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`restart: unless-stopped` перезапускает контейнер на ЛЮБОМ коде.
+
+    Значит «демон остановлен кодом 1» в описанном спекой развёртывании
+    недостижимо: счётчик подряд идущих 403 обнуляется вместе с процессом,
+    и контейнер стучится к hh.ru вечно. Маркер достигает того, ради чего
+    остановка и требуется, — ни одного запроса до вмешательства человека.
+    """
+    config_dir = prepare(tmp_path)
+    assert invoke(config_dir, "init-db").exit_code == 0
+    monkeypatch.setattr("hh_search.__main__.serve", lambda *args, **kwargs: 1, raising=True)
+    assert invoke(config_dir, "serve").exit_code == 1
+    marker = tmp_path / "state" / "access-forbidden.stop"
+    assert marker.exists()
+
+    calls: list[object] = []
+
+    def remember(*args: object, **kwargs: object) -> int:
+        calls.append(args)
+        return 0
+
+    monkeypatch.setattr("hh_search.__main__.serve", remember, raising=True)
+    result = invoke(config_dir, "serve")
+
+    assert result.exit_code == 1
+    assert "маркер" in result.output
+    assert calls == [], "демон обязан не начинать работу, пока стоит маркер"
+
+
+# --- serve: точка входа контейнера, до сих пор не вызванная ни одним тестом -
+
+
+class OneShotStop(StopSignal):
+    """Останавливается сразу: цикл делает ровно один прогон и выходит.
+
+    Подменяет `StopSignal` внутри команды, а не саму `serve`: проверять
+    надо именно проводку `serve_command` — она и есть точка входа Docker.
+    """
+
+    def install(self, numbers: tuple[signal.Signals, ...] = ()) -> None:
+        self.request()
+
+
+@respx.mock
+def test_serve_runs_the_pipeline_and_writes_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сквозной прогон через `serve` — тот же, что делает контейнер."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    monkeypatch.setattr("hh_search.__main__.StopSignal", OneShotStop)
+
+    result = invoke(config_dir, "serve")
+
+    assert result.exit_code == 0
+    assert "111" in (tmp_path / "reports" / f"{TODAY}-new.csv").read_text(encoding="utf-8-sig")
+    assert [status for status, _ in runs_in_journal(state_path(config_dir))] == ["ok"]
+
+
+def test_serve_builds_sinks_before_the_loop_and_not_inside_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Опечатка в `sinks` обязана ронять `serve` на старте.
+
+    Собранный ВНУТРИ прогона неизвестный приёмник дал бы `ValueError`,
+    который планировщик глотает своим `except Exception`, — и демон
+    крутил бы бесполезный цикл каждые четыре часа, отвечая нулевым кодом
+    и ничего не отправляя. Контракт задачи 9 держится только на порядке
+    вызовов, поэтому сторожить надо именно его.
+    """
+    broken = APP_YAML.replace("sinks: [csv, markdown]", "sinks: [csv, telegram]")
+    config_dir = prepare(tmp_path, **{"app.yaml": broken})
+    monkeypatch.setattr("hh_search.__main__.StopSignal", OneShotStop)
+
+    result = invoke(config_dir, "serve")
+
+    assert result.exit_code == 2
+    assert "telegram" in result.output
+    assert not (tmp_path / "state" / "hh.db").exists()

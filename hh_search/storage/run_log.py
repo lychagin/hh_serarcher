@@ -23,6 +23,8 @@ ALLOWED_RUN_COUNTERS = {
     "rescored",
     "stuck",
     "requeued",
+    "stalled",
+    "corrupted",
     "error",
 }
 
@@ -66,6 +68,38 @@ class RunLog:
             (*fields.values(), status, moment, run_id),
         )
         self._connection.commit()
+
+    def close_abandoned_runs(self) -> int:
+        """Закрыть строки `running`, оставшиеся от умерших процессов.
+
+        SIGKILL, OOM-kill и `docker kill` не дают конвейеру закрыть строку
+        журнала, и она остаётся `running` навсегда: воспроизведено во всех
+        18 прогонах матрицы аварий. Само по себе это ничего не ломает
+        (`last_successful_run` смотрит только на `ok`/`partial`), но
+        кладбище растёт вечно и никем не показывается — то есть авария не
+        оставляет следа ровно там, где след и нужен.
+
+        Вызывается под замком прогона (`runlock.single_run`), и это не
+        деталь, а условие корректности: пока замок держит один процесс,
+        любая строка `running` заведомо принадлежит уже мёртвому.
+        `finished_at` не выдумывается — время смерти неизвестно, и
+        подставить сюда «сейчас» значило бы соврать о длительности.
+        """
+        cursor = self._connection.execute(
+            "UPDATE run SET status = 'interrupted', "
+            "error = COALESCE(error, 'процесс умер, не закрыв строку журнала') "
+            "WHERE status = 'running'"
+        )
+        self._connection.commit()
+        abandoned = int(cursor.rowcount)
+        if abandoned:
+            logger.warning(
+                "%d строк журнала остались в статусе running от прошлых процессов "
+                "(SIGKILL, OOM-kill или `docker kill` посреди прогона) и помечены "
+                "interrupted; успешными они не считались и раньше",
+                abandoned,
+            )
+        return abandoned
 
     def last_successful_run(self) -> datetime | None:
         """Время последнего успешного прогона; от него зависит healthcheck.

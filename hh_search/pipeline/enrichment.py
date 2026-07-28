@@ -30,7 +30,8 @@ import logging
 
 from hh_search.config.models import Config
 from hh_search.domain.models import DiscoveredVacancy, VacancyDetails
-from hh_search.errors import FetchFailed, RobotsDisallowed
+from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
+from hh_search.pipeline.forbidden import ForbiddenStreak
 from hh_search.pipeline.stats import PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
 from hh_search.sources.http import PoliteClient
@@ -46,6 +47,7 @@ def enrich(
     repo: SqliteRepository,
     scorer: Scorer,
     stats: RunStats,
+    forbidden: ForbiddenStreak,
 ) -> None:
     """Скачать страницы очереди обогащения, оценить и сохранить."""
     pending = repo.pending_enrichment(config.app.enrich.max_attempts)
@@ -59,12 +61,21 @@ def enrich(
         url = vacancy_url(vacancy.id)
         try:
             response = client.get(url)
+        except AccessForbidden as error:
+            # Тоже источник, а не вакансия: попытку НЕ жжём. Одиночный 403
+            # бывает антиботом на конкретном запросе, и терять из-за него
+            # уже скачанные семнадцать страниц из двадцати незачем;
+            # устойчивый `tolerate` пробросит сам (спека §9).
+            unavailable += 1
+            forbidden.tolerate(error, f"страница {url}", stats)
+            continue
         except (FetchFailed, RobotsDisallowed) as error:
             # Источник, а не вакансия: попытку НЕ жжём.
             unavailable += 1
             stats.degrade(PARTIAL, f"страница {url} не получена: {error}")
             logger.warning("страница %s недоступна, попытка не израсходована: %s", url, error)
             continue
+        forbidden.survived()
         if response.status_code != 200:
             _burn_attempt(config, repo, stats, vacancy.id, f"код {response.status_code}")
             unreadable += 1
@@ -82,6 +93,7 @@ def enrich(
             stats.enriched += 1
     salary_stats.log_summary()
     _canary(len(pending), unavailable, unreadable)
+    _check_not_stalled(config, repo, stats)
 
 
 def _burn_attempt(
@@ -144,6 +156,39 @@ def _save(
         logger.error("оценка вакансии %s не сериализуется: %s", vacancy.id, error, exc_info=True)
         return False
     return True
+
+
+def _check_not_stalled(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
+    """Сторож правки `enrich.max_attempts` вниз — счёт после шага, а не до.
+
+    Считать надо именно здесь: строки, честно исчерпавшие лимит В ЭТОМ
+    прогоне, `bump_enrich_attempt` уже сделал терминальными
+    (`rejected`/`enrich_failed`) тем же оператором, и в счёт они не
+    попадают. Остаться `status='new'` с пустым описанием и счётчиком не
+    меньше лимита строка может ровно по одной причине — лимит понизили
+    после того, как попытки были потрачены.
+
+    Понижение статуса симметрично `stuck`: вакансия, уже стоившая
+    запросов к hh.ru, не попадёт ни в один отчёт и не видна ни одной
+    выборке. Молчать об этом нельзя — прогон после такой правки
+    становился `ok`, то есть статус улучшался оттого, что работа пропала.
+    """
+    stalled = repo.stalled_by_attempts(config.app.enrich.max_attempts)
+    stats.stalled = stalled
+    if not stalled:
+        return
+    stats.degrade(PARTIAL, f"{stalled} вакансий выведены из очереди снижением лимита попыток")
+    logger.error(
+        "%d вакансий без описания имеют enrich_attempts >= %d и потому не видны НИ ОДНОЙ "
+        "из трёх выборок: лимит попыток (enrich.max_attempts) понижен уже после того, как "
+        "попытки были потрачены. Скачивания не было — вернуть их можно, подняв лимит "
+        "обратно либо командой `mark <id> new` (она обнуляет счётчик). Найти: "
+        "SELECT id FROM vacancy WHERE status='new' AND description IS NULL "
+        "AND enrich_attempts >= %d",
+        stalled,
+        config.app.enrich.max_attempts,
+        config.app.enrich.max_attempts,
+    )
 
 
 def _canary(pending: int, unavailable: int, unreadable: int) -> None:

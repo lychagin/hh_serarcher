@@ -49,6 +49,8 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("run", "stuck", "INTEGER DEFAULT 0"),
     ("vacancy", "reject_code", "TEXT"),
     ("run", "requeued", "INTEGER DEFAULT 0"),
+    ("run", "stalled", "INTEGER DEFAULT 0"),
+    ("run", "corrupted", "INTEGER DEFAULT 0"),
 )
 
 # У отказов, накопленных базой прошлого поколения, машинного кода нет:

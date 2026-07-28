@@ -1966,3 +1966,75 @@ def test_corrupt_enrich_attempts_does_not_hide_the_vacancy(tmp_path: Path) -> No
     # возврат в очередь не превращается в вечный цикл.
     assert repository.bump_enrich_attempt("1", max_attempts=3) == 1
     repository.close()
+
+
+# --- C1: ручной статус не имеет права создавать невидимое состояние -------
+
+
+def test_manual_return_to_new_clears_the_exhausted_attempts(tmp_path: Path) -> None:
+    """`mark <id> new` — это «попробовать ещё раз», и оно обязано работать.
+
+    Строка с исчерпанными попытками уже терминальна
+    (`rejected`/`enrich_failed`). Смена ОДНОГО столбца `status` на `new`
+    воссоздавала ровно тот Critical, ради недостижимости которого
+    переписывался `bump_enrich_attempt`: `status='new'`,
+    `description IS NULL`, `enrich_attempts >= max` — состояние, невидимое
+    всем трём выборкам, из которого нет пути назад ничем, кроме сырого
+    SQL. Возврат в `new` поэтому обнуляет счётчик и чистит причину тем же
+    UPDATE — по образцу `requeue_prefiltered`.
+    """
+    db_path = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    for _ in range(3):
+        repository.bump_enrich_attempt("1", max_attempts=3)
+    assert read_column(db_path, "status", "1") == "rejected"
+
+    assert repository.set_status("1", "new") is True
+
+    assert [v.id for v in repository.pending_enrichment(max_attempts=3)] == ["1"]
+    assert read_column(db_path, "enrich_attempts", "1") == 0
+    assert read_column(db_path, "reject_reason", "1") is None
+    assert read_column(db_path, "reject_code", "1") is None
+    repository.close()
+
+
+def test_manual_status_drops_the_machine_reject_code(tmp_path: Path) -> None:
+    """M4: решение человека отменяет машинный код, а не сосуществует с ним.
+
+    Иначе `mark X new` на отказе префильтра оставлял `reject_code`
+    нетронутым, и следующий `mark X rejected` возвращал вакансию в
+    очередь СЛЕДУЮЩИМ же прогоном — вопреки спеке §5.2, где ручной
+    `mark <id> rejected` кода не имеет вовсе и не возвращается.
+    """
+    db_path = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.mark_rejected("1", "совпало стоп-слово: junior", REJECT_CODE_PREFILTER)
+
+    repository.set_status("1", "new")
+    repository.set_status("1", "rejected")
+
+    assert read_column(db_path, "reject_code", "1") is None
+    assert repository.rejected_by_prefilter() == []
+    assert repository.requeue_prefiltered(["1"]) == 0
+    assert read_column(db_path, "status", "1") == "rejected"
+    repository.close()
+
+
+def test_manual_status_other_than_new_keeps_the_attempt_counter(tmp_path: Path) -> None:
+    """Обнуляется счётчик ровно у `new` — у остальных статусов он ничего не значит,
+    а стирать историю попыток без нужды незачем: строка и так терминальна."""
+    db_path = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    for _ in range(2):
+        repository.bump_enrich_attempt("1", max_attempts=3)
+
+    repository.set_status("1", "archived")
+
+    assert read_column(db_path, "enrich_attempts", "1") == 2
+    repository.close()

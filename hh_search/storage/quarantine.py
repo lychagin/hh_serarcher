@@ -70,6 +70,12 @@ class Quarantine:
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
+        # Сколько строк уведено в терминальный статус за жизнь объекта, то
+        # есть за один прогон: репозиторий живёт ровно столько. Считается
+        # только `terminate()` — `drop_score()` лечится локальным
+        # пересчётом и уже виден в счётчиках `rescored`/`stuck`, а здесь
+        # нужна именно потеря навсегда.
+        self.terminated = 0
 
     def drop_score(self, key: bytes, payload: bytes | None) -> None:
         """Обнулить ТОЛЬКО оценку: строка уходит в `pending_scoring`.
@@ -92,6 +98,7 @@ class Quarantine:
 
     def terminate(self, key: bytes) -> None:
         """Терминальный статус без обнуления чего бы то ни было."""
+        self.terminated += 1
         logger.error(
             "вакансия %r: повреждены данные, которых нет на странице вакансии — "
             "перекачка их не восстановит; статус %s, значения оставлены как улики",

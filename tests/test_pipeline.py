@@ -23,7 +23,7 @@ from hh_search.sinks.base import Sink
 from hh_search.sources.http import PoliteClient
 from hh_search.storage.repository import SqliteRepository
 from hh_search.storage.run_log import ALLOWED_RUN_COUNTERS
-from tests.test_config import PROFILE_YAML, write_config
+from tests.test_config import APP_YAML, PROFILE_YAML, write_config
 
 FIXTURES = Path(__file__).parent / "fixtures"
 NOW = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
@@ -612,6 +612,29 @@ def test_score_is_recomputed_and_sent_within_one_run(config: Config, db_path: st
 
 
 @respx.mock
+def test_a_run_that_delivered_nothing_is_failed_not_partial(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C2: `partial` считается успехом для healthcheck — значит «ничего не
+    доставлено» им быть не может.
+
+    Приёмники строятся из конфига, а конфиг указывает на том. Том,
+    смонтированный не туда, роняет ВСЕ приёмники: вакансии остаются в
+    очереди, отчётов нет, и так прогон за прогоном. При `partial`
+    `last_successful_run()` считает такой прогон успешным, и
+    `healthcheck` возвращает 0 вечно — тот самый класс «процесс жив,
+    работа не делается», ради которого healthcheck и заводился.
+    Один живой приёмник из двух остаётся `partial`: часть работы дошла.
+    """
+    mock_source()
+    with caplog.at_level(logging.ERROR):
+        stats = run(config, repo, [RecordingSink("csv", fail=True)])
+    assert (stats.status, stats.reported) == ("failed", 0)
+    assert stats.exit_code() == 1
+    assert [vacancy.discovered.id for vacancy in repo.unreported()] == ["111"]
+
+
+@respx.mock
 def test_partial_sink_failure_keeps_everything_unreported(
     config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -654,20 +677,64 @@ def test_run_without_sinks_marks_nothing_reported(config: Config, repo: SqliteRe
 
 
 @respx.mock
-def test_forbidden_stops_the_run_and_closes_the_journal(config: Config, db_path: str) -> None:
-    """403 останавливает прогон (спека §9), но строку журнала закрывает.
+def test_forbidden_stops_the_run_and_closes_the_journal(tmp_path: Path, db_path: str) -> None:
+    """Устойчивый 403 останавливает прогон (спека §9), но строку журнала закрывает.
 
     Незакрытая строка `running` — это не косметика: healthcheck смотрит в
     журнал, и висящие строки копятся вечно.
+
+    Листингов здесь два, а не один: остановку вызывает второй 403 ПОДРЯД —
+    ровно то различие, которое спека называет словом «устойчивый» (см.
+    `pipeline/forbidden.py`).
     """
+    root = tmp_path / "two"
+    root.mkdir(parents=True, exist_ok=True)
+    two_pages = load_config(
+        write_config(root, **{"queries.yaml": ONE_PAGE.replace("pages: 1", "pages: 2")})
+    )
     disk = SqliteRepository(db_path)
     disk.init_schema()
     mock_robots()
     respx.get(url__startswith=LISTING_URL).mock(return_value=httpx.Response(403))
     with pytest.raises(AccessForbidden):
-        run(config, disk, [RecordingSink()])
+        run(two_pages, disk, [RecordingSink()])
     assert disk.last_successful_run() is None
     assert journal(db_path) == [("failed", 0, 0, 0, 0, 0, 0, 0)]
+    disk.close()
+
+
+@respx.mock
+def test_a_single_forbidden_page_does_not_throw_away_the_rest_of_the_run(
+    config: Config, db_path: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Одиночный 403 на ОДНОЙ странице из двадцати — не закрытый источник.
+
+    `PoliteClient` бросает `AccessForbidden` на первом же 403, и он летел
+    из конвейера наружу мимо всех обработчиков: прогон обрывался, хотя
+    остальные страницы отдавались нормально. `scheduler.py` это различие
+    знает уровнем выше (`MAX_FORBIDDEN_IN_A_ROW`), в конвейере его не
+    было вовсе — а два случайных 403 в двух прогонах подряд
+    останавливали ещё и демон.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    pages = {str(100 + i): httpx.Response(200, text=page_html()) for i in range(4)}
+    pages["102"] = httpx.Response(403)
+    mock_source(listing=listing_html(*((key, "Инженер") for key in sorted(pages))))
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        return pages[request.url.path.rsplit("/", 1)[-1]]
+
+    respx.get(url__regex=PAGE_PATTERN).mock(side_effect=answer)
+    sink = RecordingSink()
+    with caplog.at_level(logging.WARNING):
+        stats = run(config, disk, [sink], now=NOW)
+
+    assert (stats.status, stats.enriched) == ("partial", 3)
+    assert sorted(sink.seen) == ["100", "101", "103"]
+    assert "подряд он пока один" in caplog.text
+    # Попытка не сожжена: 403 — состояние источника, а не вакансии.
+    assert repo_status(db_path, "102") == ("new", None, 0)
     disk.close()
 
 
@@ -944,3 +1011,179 @@ def test_requeued_count_reaches_the_run_journal(tmp_path: Path) -> None:
     requeued = [row[0] for row in raw.execute("SELECT requeued FROM run ORDER BY id")]
     raw.close()
     assert requeued == [0, 1]
+
+
+# --- I1: снижение лимита попыток выводит вакансии из ВСЕХ очередей ---------
+
+
+def config_with_attempts(root: Path, max_attempts: int) -> Config:
+    root.mkdir(parents=True, exist_ok=True)
+    app_yaml = APP_YAML.replace("max_attempts: 3", f"max_attempts: {max_attempts}")
+    return load_config(write_config(root, **{"queries.yaml": ONE_PAGE, "app.yaml": app_yaml}))
+
+
+@respx.mock
+def test_lowered_attempt_limit_is_counted_and_loud(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Правка `enrich.max_attempts` вниз обязана быть видимой.
+
+    `pending_enrichment` отбирает по `enrich_attempts < max_attempts`, и
+    снижение лимита делает уже потраченные попытки чрезмерными задним
+    числом. Строка при этом остаётся `new` с пустым описанием: её не
+    видит НИ ОДНА из трёх выборок и не считает `_warn_about_unscored`
+    (там `description IS NOT NULL`). Прогон после такой правки становился
+    `ok` — статус улучшался оттого, что работа пропала.
+    """
+    db = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db)
+    repository.init_schema()
+    mock_source(page=httpx.Response(404))
+    three = config_with_attempts(tmp_path / "three", 3)
+    for _ in range(2):
+        run(three, repository, [RecordingSink()], KeywordScorer(three.profile))
+    assert repo_status(db, "111") == ("new", None, 2)
+
+    two = config_with_attempts(tmp_path / "two", 2)
+    with caplog.at_level(logging.ERROR):
+        stats = run(two, repository, [RecordingSink()], KeywordScorer(two.profile))
+
+    assert (stats.stalled, stats.status) == (1, "partial")
+    assert "лимит попыток" in caplog.text
+    assert repository.pending_enrichment(2) == []
+    repository.close()
+    raw = sqlite3.connect(db)
+    stalled = [row[0] for row in raw.execute("SELECT stalled FROM run ORDER BY id")]
+    raw.close()
+    assert stalled == [0, 0, 1]
+
+
+@respx.mock
+def test_unchanged_attempt_limit_never_reports_stalled_rows(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Обратная сторона: строка, честно исчерпавшая лимит, застрявшей не считается.
+
+    `bump_enrich_attempt` делает её терминальной тем же UPDATE, то есть
+    `rejected`/`enrich_failed`, а не невидимым `new`. Иначе сторож
+    кричал бы на каждый штатный отказ.
+    """
+    mock_source(page=httpx.Response(404))
+    scorer = KeywordScorer(config.profile)
+    for _ in range(config.app.enrich.max_attempts):
+        stats = run(config, repo, [RecordingSink()], scorer)
+        assert stats.stalled == 0
+    assert run(config, repo, [RecordingSink()], scorer).stalled == 0
+
+
+# --- I3: потеря вакансии в карантин обязана быть видна в журнале ----------
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE vacancy SET title = CAST(x'FFFE' AS TEXT) WHERE id = '111'",
+        "UPDATE vacancy SET description = CAST(x'FFFE' AS TEXT) WHERE id = '111'",
+        "UPDATE vacancy SET published_at = 'не дата' WHERE id = '111'",
+        "UPDATE vacancy SET salary_from = 'много' WHERE id = '111'",
+        "UPDATE vacancy SET primary_query = CAST(x'FFFE' AS TEXT) WHERE id = '111'",
+    ],
+)
+def test_terminal_quarantine_is_counted_and_degrades_the_run(
+    config: Config, db_path: str, sql: str
+) -> None:
+    """Изоляция порчи работает, а вот наблюдаемость потери — нет.
+
+    Одна битая строка не роняет остальные — это и есть смысл `safe_rows`.
+    Но вакансия уходит в `corrupt` НАВСЕГДА, а прогон при этом рапортовал
+    `ok`, `error = NULL` и код 0: ни статусом, ни счётчиком, ни причиной
+    потеря не отражена. Для очереди пересчёта счётчики `rescored`/`stuck`
+    заведены именно ради этого; у карантина симметричного не было.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    mock_source()
+    run(config, disk, [RecordingSink()])
+    corrupt(db_path, "UPDATE vacancy SET status = 'new', reported_at = NULL WHERE id = '111'")
+    corrupt(db_path, sql)
+
+    stats = run(config, disk, [RecordingSink()])
+
+    assert (stats.corrupted, stats.status) == (1, "partial")
+    assert stats.error is not None and "карантин" in stats.error
+    disk.close()
+    raw = sqlite3.connect(db_path)
+    row = raw.execute(
+        "SELECT status, corrupted, error FROM run ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    raw.close()
+    assert row[0] == "partial" and row[1] == 1 and row[2] is not None
+
+
+@respx.mock
+def test_a_clean_run_reports_no_quarantine(config: Config, repo: SqliteRepository) -> None:
+    """Счётчик карантина не имеет права срабатывать на здоровой базе."""
+    mock_source()
+    stats = run(config, repo, [RecordingSink()])
+    assert (stats.corrupted, stats.status) == (0, "ok")
+
+
+# --- RunStats.degrade: правило «статус только ухудшается» ------------------
+
+
+def test_status_never_improves() -> None:
+    """Шагов, способных частично отказать, четыре, и каждый пишет своё.
+
+    Если бы `degrade` умел улучшать статус, последний шаг затирал бы
+    жалобы предыдущих, и `ok` после `failed` означал бы прогон, который
+    потерял работу и об этом не сказал. Проверено неэквивалентностью:
+    пустая выдача плюс бэклог с недоступными страницами дают `failed` и
+    код 1, а с улучшающим `degrade` — `partial` и код 3, то есть успех
+    для healthcheck и C2 заново.
+    """
+    stats = RunStats()
+    stats.degrade("failed", "источник не отдал ни одной страницы")
+    stats.degrade("partial", "страница вакансии не получена")
+    stats.degrade("ok", "всё хорошо")
+    assert (stats.status, stats.exit_code()) == ("failed", 1)
+    assert stats.error == "источник не отдал ни одной страницы"
+
+
+def test_the_reason_stays_with_the_worst_status() -> None:
+    """При равном статусе побеждает ПЕРВАЯ жалоба.
+
+    Она обычно и есть корень, а последующие — следствия. Забирая причину
+    у последней, журнал прогона показывал бы симптом вместо диагноза.
+    """
+    stats = RunStats()
+    stats.degrade("partial", "первая")
+    stats.degrade("partial", "вторая")
+    assert stats.error == "первая"
+    stats.degrade("failed", "корень")
+    stats.degrade("failed", "следствие")
+    assert (stats.status, stats.error) == ("failed", "корень")
+
+
+# --- условный запрос: валидатор обязан ДОЕХАТЬ до источника ---------------
+
+
+@respx.mock
+def test_listing_request_carries_the_stored_validators(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Состояние `http_cache` сторожили, а сам заголовок — нет.
+
+    Валидатор, который никуда не уходит, не экономит ничего: источник
+    каждый раз отдаёт полный ответ, а тесты остаются зелёными, потому что
+    смотрят в базу, а не в запрос. Здесь проверяется именно исходящий
+    запрос.
+    """
+    repo.save_cache_headers(LISTING_URL, '"v1"', "Wed, 01 Jul 2026 00:00:00 GMT")
+    _, listing_route, _ = mock_source()
+
+    run(config, repo, [RecordingSink()])
+
+    headers = listing_route.calls.last.request.headers
+    assert headers["If-None-Match"] == '"v1"'
+    assert headers["If-Modified-Since"] == "Wed, 01 Jul 2026 00:00:00 GMT"

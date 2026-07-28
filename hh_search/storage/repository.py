@@ -196,9 +196,30 @@ class SqliteRepository:
         Результат возвращается, потому что вызывающий — CLI, а id туда
         вводит человек: `mark 999999 applied` на несуществующей вакансии
         без этого печатал бы «готово» и отдавал код 0.
+
+        Меняется не только колонка `status`, и это не удобство. Смена
+        ОДНОГО столбца на `new` воссоздавала на терминальной строке ровно
+        то состояние, ради недостижимости которого переписан
+        `bump_enrich_attempt`: `status='new'`, `description IS NULL`,
+        `enrich_attempts >= max` — невидимое ВСЕМ трём выборкам. А
+        `mark <id> new` — это ровно то, что напишет человек, желающий
+        «попробовать ещё раз»: команда отвечала успехом, следующий прогон
+        рапортовал `ok`, и вакансия исчезала навсегда. Поэтому возврат в
+        `new` обнуляет счётчик попыток тем же UPDATE, что и статус, — по
+        образцу `requeue_prefiltered`.
+
+        Машинная причина отказа стирается при ЛЮБОМ ручном статусе:
+        решение человека отменяет решение машины, а не сосуществует с
+        ним. Иначе `mark X new` на отказе префильтра оставлял
+        `reject_code='prefilter'`, и следующий `mark X rejected`
+        возвращался в очередь ближайшим прогоном — вопреки спеке §5.2,
+        где ручной отказ кода не имеет вовсе и не возвращается.
         """
         cursor = self._connection.execute(
-            "UPDATE vacancy SET status = ? WHERE id = ?", (status, vacancy_id)
+            "UPDATE vacancy SET status = :status, reject_reason = NULL, reject_code = NULL, "
+            "enrich_attempts = CASE WHEN :status = :new THEN 0 ELSE enrich_attempts END "
+            "WHERE id = :id",
+            {"status": status, "new": STATUS_NEW, "id": vacancy_id},
         )
         self._connection.commit()
         return cursor.rowcount > 0
@@ -361,6 +382,45 @@ class SqliteRepository:
         ).fetchone()
         return int(row["enrich_attempts"]) if row else 0
 
+    def stalled_by_attempts(self, max_attempts: int) -> int:
+        """Сколько строк выведено из очереди обогащения снижением лимита попыток.
+
+        Второй сторож рядом с `_warn_about_unscored`, и по той же причине:
+        хранилище не может запретить правку конфига, но не имеет права
+        дать её последствиям пройти незамеченными. `pending_enrichment`
+        отбирает по `enrich_attempts < max_attempts`, поэтому уменьшение
+        `enrich.max_attempts` делает уже потраченные попытки чрезмерными
+        задним числом — строка остаётся `status='new'` с пустым описанием
+        и становится невидимой ВСЕМ трём выборкам. `_warn_about_unscored`
+        её не видит (там `description IS NOT NULL`), и прогон после такой
+        правки становился `ok`: статус улучшался оттого, что работа
+        пропала.
+
+        В штатном режиме результат всегда ноль: `bump_enrich_attempt`
+        делает строку терминальной (`rejected`/`enrich_failed`) тем же
+        оператором, которым доводит счётчик до лимита. Ненулевое значение
+        означает ровно одно событие — лимит понизили.
+
+        COUNT(*) по трём предикатам не декодирует ни одного значения,
+        поэтому сторож не падает даже на полностью испорченной таблице.
+        """
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS stalled FROM vacancy WHERE status = ? AND description IS NULL "
+            "AND CAST(COALESCE(enrich_attempts, 0) AS INTEGER) >= ?",
+            (STATUS_NEW, max_attempts),
+        ).fetchone()
+        return int(row["stalled"]) if row else 0
+
+    def corrupted_count(self) -> int:
+        """Сколько строк ушло в терминальный карантин за жизнь этого объекта.
+
+        Репозиторий живёт ровно один прогон, поэтому счётчик и есть
+        «за прогон». Нужен конвейеру: карантин срабатывает ВНУТРИ выборок,
+        и без этого числа потеря вакансии навсегда не отражалась ни
+        статусом прогона, ни причиной, ни счётчиком.
+        """
+        return self._quarantine.terminated
+
     # --- возврат из отказа префильтра, сеть не задействуется -------------
 
     def rejected_by_prefilter(self) -> list[tuple[str, str]]:
@@ -401,9 +461,15 @@ class SqliteRepository:
         `description IS NULL`, `enrich_attempts >= max` — состояние,
         невидимое ВСЕМ трём выборкам. Плата названа честно: возврат даёт
         странице заново полный бюджет попыток, то есть при живом 404
-        стоит до `max_attempts` запросов. Платится она только за
-        осознанную правку конфига и ровно один раз: строка возвращается,
-        пока совпадает условие, а после возврата условия больше нет.
+        стоит до `max_attempts` запросов.
+
+        Платится она за КАЖДЫЙ возврат, а не единожды за жизнь строки:
+        счётчик обнуляется на каждом. Один возврат на одну правку
+        конфига — вот точная формулировка, и её достаточно, чтобы
+        бесконечного цикла не было. Возврат отбирает ровно те строки,
+        которые текущий конфиг НЕ подтверждает, поэтому повторный вызов
+        при неизменном конфиге не находит ничего; чтобы заплатить второй
+        раз, стоп-слово нужно вернуть в `negative` и убрать оттуда снова.
 
         WHERE-охрана повторяет предикат выборки, поэтому метод
         идемпотентен и не воскрешает ничего чужого: ни `enrich_failed`,
@@ -540,6 +606,9 @@ class SqliteRepository:
         **counters: int | str | None,
     ) -> None:
         self._run_log.finish_run(run_id, status, finished_at=finished_at, **counters)
+
+    def close_abandoned_runs(self) -> int:
+        return self._run_log.close_abandoned_runs()
 
     def last_successful_run(self) -> datetime | None:
         return self._run_log.last_successful_run()

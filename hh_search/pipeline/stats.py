@@ -51,6 +51,8 @@ class RunCounters(TypedDict):
     rescored: int
     stuck: int
     requeued: int
+    stalled: int
+    corrupted: int
     reported: int
     error: str | None
 
@@ -68,6 +70,14 @@ class RunStats(BaseModel):
     # стоп-слов достаёт накопленный бэклог, и это работа прогона, а не
     # тихое событие.
     requeued: int = 0
+    # Сколько вакансий выведено из очереди обогащения снижением
+    # `enrich.max_attempts`: строка остаётся `new` с пустым описанием и
+    # невидима всем трём выборкам. `stuck` её не считает — там
+    # `description IS NOT NULL`.
+    stalled: int = 0
+    # Сколько вакансий ушло в карантин терминально за прогон. Потеря
+    # навсегда, и без счётчика она не видна ни в статусе, ни в причине.
+    corrupted: int = 0
     reported: int = 0
     status: str = OK
     error: str | None = None
@@ -100,6 +110,8 @@ class RunStats(BaseModel):
             "rescored": self.rescored,
             "stuck": self.stuck,
             "requeued": self.requeued,
+            "stalled": self.stalled,
+            "corrupted": self.corrupted,
             "reported": self.reported,
             "error": self.error,
         }

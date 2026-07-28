@@ -204,3 +204,35 @@ def test_waiting_is_interrupted_by_the_signal() -> None:
         signal.signal(signal.SIGTERM, previous)
     assert stop.requested()
     assert elapsed < 5.0
+
+
+def test_sigint_is_left_alone(config: Config) -> None:
+    """Ctrl+C обязан прерывать процесс СРАЗУ, а не «после текущего прогона».
+
+    Исключение SIGINT из `STOP_SIGNALS` объявлено докстрингом сознательным
+    решением, но не сторожилось ничем: добавление сигнала в кортеж
+    проходило весь набор тестов. Разница видна руками — при интерактивной
+    отладке Ctrl+C переставал работать и приходилось ждать конца прогона
+    или слать SIGKILL.
+    """
+    before_int = signal.getsignal(signal.SIGINT)
+    before_term = signal.getsignal(signal.SIGTERM)
+    stop = StopSignal()
+    try:
+        stop.install()
+        assert signal.getsignal(signal.SIGINT) is before_int
+        assert signal.getsignal(signal.SIGTERM) is not before_term
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert stop.requested()
+    finally:
+        signal.signal(signal.SIGINT, before_int)
+        signal.signal(signal.SIGTERM, before_term)
+
+
+def test_keyboard_interrupt_ends_the_daemon_immediately(config: Config) -> None:
+    """Оборотная сторона: KeyboardInterrupt выходит из цикла, а не гасится."""
+
+    def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    assert serve(config, interrupted, iterations=5) == EXIT_OK

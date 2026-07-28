@@ -18,7 +18,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from typer.testing import CliRunner
 
+from hh_search.__main__ import app
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
 from hh_search.filtering.matching import SignalMatcher
@@ -225,3 +227,32 @@ def test_spec_config_samples_load_as_a_real_config(tmp_path: Path) -> None:
         (tmp_path / match.group(1)).write_text(match.group(2), encoding="utf-8")
     config = load_config(tmp_path)
     SignalMatcher(_all_signals(config))
+
+
+def test_spec_cli_block_matches_the_real_cli() -> None:
+    """§8.3 — единственное описание CLI, и его расхождение уже случалось.
+
+    Флаг `run --once` жил в спеке ещё долго после того, как был убран на
+    pre-flight: `python -m hh_search run --once` отвечает
+    `No such option: --once`. Абзац «сверить спеку с кодом» этот класс не
+    ловит — он выполняется один раз, а расходятся они каждый раунд.
+    Здесь сверяется и набор команд, и то, что каждая записанная в спеке
+    строка вызова действительно принимается CLI.
+    """
+    block = re.search(
+        r"```\n(python -m hh_search.*?)\n```", _spec_section("### 8.3", "## 9."), re.S
+    )
+    assert block is not None, "в §8.3 пропал блок с вызовами CLI"
+    invocations = [
+        line.split("#", 1)[0].split()[3:]
+        for line in block.group(1).splitlines()
+        if line.startswith("python -m hh_search")
+    ]
+    documented = {invocation[0] for invocation in invocations}
+    registered = {command.name for command in app.registered_commands}
+    assert documented == registered, "набор команд в §8.3 разошёлся с CLI"
+
+    runner = CliRunner()
+    for invocation in invocations:
+        result = runner.invoke(app, ["--config-dir", "/nonexistent", *invocation, "--help"])
+        assert result.exit_code == 0, f"§8.3 обещает `{' '.join(invocation)}`: {result.output}"

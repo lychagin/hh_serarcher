@@ -16,8 +16,9 @@ import logging
 import httpx
 
 from hh_search.config.models import Config, QuerySpec
-from hh_search.errors import FetchFailed, RobotsDisallowed
+from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
 from hh_search.filtering.prefilter import Prefilter
+from hh_search.pipeline.forbidden import ForbiddenStreak
 from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.sources.http import PoliteClient
 from hh_search.sources.listing import build_listing_url, parse_listing
@@ -28,7 +29,13 @@ logger = logging.getLogger(__name__)
 NOT_MODIFIED = 304
 
 
-def discover(config: Config, client: PoliteClient, repo: SqliteRepository, stats: RunStats) -> None:
+def discover(
+    config: Config,
+    client: PoliteClient,
+    repo: SqliteRepository,
+    stats: RunStats,
+    forbidden: ForbiddenStreak,
+) -> None:
     """Обойти все листинги и все их страницы; каждая страница — один запрос."""
     fetched = 0
     unchanged = 0
@@ -37,12 +44,18 @@ def discover(config: Config, client: PoliteClient, repo: SqliteRepository, stats
             url = build_listing_url(query, page)
             try:
                 response = client.get(url, conditional=repo.cache_headers(url))
+            except AccessForbidden as error:
+                # Одиночный 403 бывает антиботом на конкретном запросе;
+                # устойчивый метод пробросит сам (спека §9).
+                forbidden.tolerate(error, f"листинг {url}", stats)
+                continue
             except (FetchFailed, RobotsDisallowed) as error:
                 # Состояние СЕРВЕРА, а не листинга: следующий прогон
                 # повторит запрос, терять нечего. Спека §9 — WARNING+partial.
                 stats.degrade(PARTIAL, f"листинг {url} не получен: {error}")
                 logger.warning("листинг %s пропущен: %s", url, error)
                 continue
+            forbidden.survived()
             if response.status_code == NOT_MODIFIED:
                 unchanged += 1
                 logger.debug("листинг %s не изменился", url)

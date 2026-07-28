@@ -21,8 +21,10 @@ from hh_search.config.loader import load_config
 from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden
 from hh_search.logging_setup import setup_logging
-from hh_search.pipeline import OK, RunStats, run_once
-from hh_search.scheduler import StopSignal, serve
+from hh_search.pipeline import EXIT_CODES, OK, PARTIAL, RunStats, run_once
+from hh_search.pipeline.reporting import emit_to_sinks
+from hh_search.runlock import RunInProgress, single_run
+from hh_search.scheduler import EXIT_FORBIDDEN, StopSignal, serve
 from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sinks import build_sinks
 from hh_search.sinks.base import Sink
@@ -42,6 +44,11 @@ EXIT_FAILED = 1
 # (`mark 1 aplied`) увела бы вакансию в состояние, невидимое всем выборкам.
 MANUAL_STATUSES = ("interesting", "applied", "archived", "new", "rejected", "reported")
 _SINCE_RE = re.compile(r"^(\d+)\s*d?$")
+# Файл-маркер устойчивого 403. `restart: unless-stopped` перезапускает
+# контейнер на любом коде возврата, поэтому «демон остановлен» одним кодом
+# в описанном спекой развёртывании недостижимо; маркер достигает того,
+# ради чего остановка требуется, — ни одного запроса к hh.ru.
+FORBIDDEN_MARKER = "access-forbidden.stop"
 
 ConfigDir = Annotated[Path | None, typer.Option("--config-dir", help="Каталог с YAML-конфигами")]
 Since = Annotated[str, typer.Option("--since", help="Период в днях: 7 или 7d")]
@@ -97,6 +104,15 @@ def _open(config: Config) -> SqliteRepository:
     return SqliteRepository(config.app.paths.state)
 
 
+def _forbidden_marker(config: Config) -> Path:
+    return config.app.paths.state.parent / FORBIDDEN_MARKER
+
+
+def _lock_path(config: Config) -> Path:
+    state = config.app.paths.state
+    return state.with_name(state.name + ".lock")
+
+
 def _execute(config: Config, sinks: Sequence[Sink]) -> RunStats:
     # Каталог создаётся здесь, а не только в `init-db`: на пустом volume
     # `sqlite3.connect` падает «unable to open database file» ещё до
@@ -104,10 +120,14 @@ def _execute(config: Config, sinks: Sequence[Sink]) -> RunStats:
     # необъявленного порядка команд.
     config.app.paths.state.parent.mkdir(parents=True, exist_ok=True)
     with (
+        single_run(_lock_path(config)),
         SqliteRepository(config.app.paths.state) as repo,
         PoliteClient(config.app.http, config.app.user_agent) as client,
     ):
         repo.init_schema()
+        # Ровно здесь и нигде раньше: замок уже наш, значит любая строка
+        # `running` осталась от умершего процесса, а не от живого соседа.
+        repo.close_abandoned_runs()
         return run_once(config, client, repo, KeywordScorer(config.profile), sinks)
 
 
@@ -128,6 +148,8 @@ def run_command(ctx: typer.Context) -> None:
     sinks = _sinks(config)
     try:
         stats = _execute(config, sinks)
+    except RunInProgress as error:
+        _die(f"{error}. Дождитесь его конца или остановите `serve`", EXIT_FAILED)
     except AccessForbidden as error:
         _die(f"hh.ru закрыл доступ: {error}. Обходные пути не применяются", EXIT_FAILED)
     if stats.status != OK:
@@ -143,10 +165,33 @@ def serve_command(ctx: typer.Context) -> None:
     """Бесконечный цикл прогонов по расписанию (точка входа контейнера)."""
     config = _config(ctx)
     sinks = _sinks(config)
+    marker = _forbidden_marker(config)
+    if marker.exists():
+        _die(
+            f"доступ к hh.ru был закрыт устойчиво, стоит маркер {marker}. "
+            "Демон не запускается и в сеть не идёт. Разберитесь и удалите файл",
+            EXIT_FAILED,
+        )
     stop = StopSignal()
     stop.install()
     logger.info("старт, интервал %d ч", config.app.schedule.interval_hours)
-    raise typer.Exit(serve(config, lambda: _execute(config, sinks), stop=stop))
+    code = serve(config, lambda: _execute(config, sinks), stop=stop)
+    if code == EXIT_FORBIDDEN:
+        # `restart: unless-stopped` перезапускает контейнер на ЛЮБОМ коде
+        # возврата, включая нулевой, — то есть заявленная спекой §9
+        # остановка одним кодом в описанном развёртывании недостижима.
+        # Маркер достигает того, ради чего остановка и требуется:
+        # перезапущенный контейнер увидит файл и не отправит к hh.ru ни
+        # одного запроса. Docker разводит рестарты экспоненциально, а
+        # healthcheck при этом красный.
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            f"{datetime.now(UTC).isoformat()} доступ закрыт устойчиво; "
+            "удалите этот файл, когда разберётесь\n",
+            encoding="utf-8",
+        )
+        logger.error("поставлен маркер %s: до его удаления демон в сеть не пойдёт", marker)
+    raise typer.Exit(code)
 
 
 @app.command("healthcheck")
@@ -198,8 +243,26 @@ def report_command(ctx: typer.Context, since: Since = "7d") -> None:
     if not vacancies:
         typer.echo(f"с {cutoff:%Y-%m-%d} отправленных вакансий не найдено")
         return
-    for sink in sinks:
-        sink.emit(vacancies, datetime.now(UTC))
+    # Тот же замок, что у прогона: `report` пишет в ТОТ ЖЕ файл дня, а
+    # дедупликация приёмника — чтение-правка-запись, и гонится она с
+    # прогоном ровно так же, как два прогона гонятся между собой.
+    try:
+        with single_run(_lock_path(config)):
+            # Через тот же `emit_to_sinks`, что и конвейер: недоступный
+            # каталог отчётов давал здесь голый traceback, тогда как `run`
+            # в этой же ситуации отдаёт внятный текст и ненулевой код. По
+            # выводу `report` человек решает, чинить ему конфиг или том, —
+            # двух разных ответов на один отказ у CLI быть не должно.
+            delivered, failed = emit_to_sinks(sinks, vacancies, datetime.now(UTC))
+    except RunInProgress as error:
+        _die(f"{error}. Отчёт пишется в тот же файл дня, поэтому ждём", EXIT_FAILED)
+    if failed:
+        typer.echo(
+            f"приёмники не приняли отчёт: {', '.join(failed)}; "
+            f"приняли: {', '.join(delivered) or 'ни один'}",
+            err=True,
+        )
+        raise typer.Exit(EXIT_CODES[PARTIAL])
     typer.echo(f"перегенерировано вакансий: {len(vacancies)}")
 
 
