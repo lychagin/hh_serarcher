@@ -49,6 +49,22 @@ _SINCE_RE = re.compile(r"^(\d+)\s*d?$")
 # в описанном спекой развёртывании недостижимо; маркер достигает того,
 # ради чего остановка требуется, — ни одного запроса к hh.ru.
 FORBIDDEN_MARKER = "access-forbidden.stop"
+# Доля интервала, внутри которой повторный прогон считается лишним.
+#
+# Проверки «прошлый прогон был только что» не было нигде, а `docker
+# restart` немедленно запускает полный обход листингов: замер — `up -d`
+# плюс три `restart` за 48 секунд дали 41 запрос к hh.ru. При
+# `restart: unless-stopped` и любой падающей конфигурации это множитель
+# запросов, а при обычной возне владельца («поправил профиль —
+# перезапустил») — десятки лишних обходов за вечер.
+#
+# Половина выбрана из потолка, который она может создать: пропущенный
+# прогон не сдвигает дедлайн следующего, поэтому худший случай — пауза в
+# полтора интервала (пропуск за миг до порога плюс полный интервал
+# ожидания). Это строго меньше двух интервалов, на которых краснеет
+# healthcheck, — то есть предохранитель не способен сам по себе погасить
+# индикатор. Доля крупнее (0.9) такой гарантии уже не даёт.
+MIN_RUN_INTERVAL_FRACTION = 0.5
 
 ConfigDir = Annotated[Path | None, typer.Option("--config-dir", help="Каталог с YAML-конфигами")]
 Since = Annotated[str, typer.Option("--since", help="Период в днях: 7 или 7d")]
@@ -108,27 +124,77 @@ def _forbidden_marker(config: Config) -> Path:
     return config.app.paths.state.parent / FORBIDDEN_MARKER
 
 
+def _refuse_while_forbidden(config: Config) -> None:
+    """Пока стоит маркер, в сеть не идёт НИ ОДНА команда, а не только `serve`.
+
+    Контракт маркера дословно: «перезапущенный контейнер не отправляет к
+    hh.ru ни одного запроса». Проверка жила в `serve_command`, поэтому
+    предохранитель открывался самым естественным действием человека:
+    увидев остановленный демон, он выполняет `run` («а сейчас как?») —
+    и получает полный прогон (замер на FIX_BASE: 11 запросов). Отсюда
+    общая для обеих сетевых команд проверка: `run` и `serve` — это две
+    двери в одну и ту же сеть.
+    """
+    marker = _forbidden_marker(config)
+    if marker.exists():
+        _die(
+            f"доступ к hh.ru был закрыт устойчиво, стоит маркер {marker}. "
+            "В сеть не уходит ни одного запроса. Разберитесь и удалите файл, "
+            "если считаете, что можно продолжать",
+            EXIT_FAILED,
+        )
+
+
+def _too_soon(config: Config, repo: SqliteRepository) -> str | None:
+    """Причина пропустить прогон, если предыдущий успешный был только что.
+
+    Смотрит на `last_successful_run()` — тот же источник правды, что и у
+    healthcheck. Отказавший прогон не считается: повторить его сразу
+    после починки конфига — как раз то, чего человек и хочет.
+    """
+    last = repo.last_successful_run()
+    if last is None:
+        return None
+    cooldown = timedelta(hours=config.app.schedule.interval_hours * MIN_RUN_INTERVAL_FRACTION)
+    age = datetime.now(UTC) - last
+    if age >= cooldown:
+        return None
+    return (
+        f"прошлый успешный прогон закончился {last.isoformat()} "
+        f"({age.total_seconds() / 60:.0f} мин назад), а интервал — "
+        f"{config.app.schedule.interval_hours} ч. Прогон пропущен, "
+        f"следующий возможен через {(cooldown - age).total_seconds() / 60:.0f} мин"
+    )
+
+
 def _lock_path(config: Config) -> Path:
     state = config.app.paths.state
     return state.with_name(state.name + ".lock")
 
 
-def _execute(config: Config, sinks: Sequence[Sink]) -> RunStats:
+def _execute(config: Config, sinks: Sequence[Sink]) -> RunStats | None:
+    """Один прогон. `None` — прогон пропущен, потому что предыдущий был только что.
+
+    Проверка стоит ВНУТРИ замка и до создания клиента: решение принимает
+    тот, кто действительно сейчас работает, и ни одного соединения при
+    отказе не открывается.
+    """
     # Каталог создаётся здесь, а не только в `init-db`: на пустом volume
     # `sqlite3.connect` падает «unable to open database file» ещё до
     # `init_schema()`, и первый прогон давал голый traceback, требуя
     # необъявленного порядка команд.
     config.app.paths.state.parent.mkdir(parents=True, exist_ok=True)
-    with (
-        single_run(_lock_path(config)),
-        SqliteRepository(config.app.paths.state) as repo,
-        PoliteClient(config.app.http, config.app.user_agent) as client,
-    ):
+    with single_run(_lock_path(config)), SqliteRepository(config.app.paths.state) as repo:
         repo.init_schema()
+        skip = _too_soon(config, repo)
+        if skip is not None:
+            logger.info("%s", skip)
+            return None
         # Ровно здесь и нигде раньше: замок уже наш, значит любая строка
         # `running` осталась от умершего процесса, а не от живого соседа.
         repo.close_abandoned_runs()
-        return run_once(config, client, repo, KeywordScorer(config.profile), sinks)
+        with PoliteClient(config.app.http, config.app.user_agent) as client:
+            return run_once(config, client, repo, KeywordScorer(config.profile), sinks)
 
 
 @app.command("init-db")
@@ -146,12 +212,18 @@ def run_command(ctx: typer.Context) -> None:
     """Выполнить один прогон. Код возврата повторяет статус прогона."""
     config = _config(ctx)
     sinks = _sinks(config)
+    _refuse_while_forbidden(config)
     try:
         stats = _execute(config, sinks)
     except RunInProgress as error:
         _die(f"{error}. Дождитесь его конца или остановите `serve`", EXIT_FAILED)
     except AccessForbidden as error:
         _die(f"hh.ru закрыл доступ: {error}. Обходные пути не применяются", EXIT_FAILED)
+    if stats is None:
+        # Не ошибка и не молчаливый ноль: человек, запустивший `run`
+        # руками, обязан узнать, ПОЧЕМУ отчёта не будет и когда будет.
+        typer.echo("прогон пропущен: предыдущий успешный был слишком недавно (см. лог)")
+        raise typer.Exit(EXIT_CODES[OK])
     if stats.status != OK:
         # Молчаливый ноль здесь — это cron, который никогда не узнает, что
         # отчёт не вышел: ровно тот случай, ради которого статус прогона и
@@ -165,13 +237,8 @@ def serve_command(ctx: typer.Context) -> None:
     """Бесконечный цикл прогонов по расписанию (точка входа контейнера)."""
     config = _config(ctx)
     sinks = _sinks(config)
+    _refuse_while_forbidden(config)
     marker = _forbidden_marker(config)
-    if marker.exists():
-        _die(
-            f"доступ к hh.ru был закрыт устойчиво, стоит маркер {marker}. "
-            "Демон не запускается и в сеть не идёт. Разберитесь и удалите файл",
-            EXIT_FAILED,
-        )
     stop = StopSignal()
     stop.install()
     logger.info("старт, интервал %d ч", config.app.schedule.interval_hours)

@@ -9,6 +9,7 @@ from types import FrameType
 
 from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden
+from hh_search.pipeline.stats import FAILED, RunStats
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +87,8 @@ def serve(
     ночным.
 
     Отказ одного прогона не роняет демон (иначе контейнер уходил бы в
-    петлю перезапусков), но `AccessForbidden` подряд — исключение из
-    правила: см. `MAX_FORBIDDEN_IN_A_ROW`.
+    петлю перезапусков), но отказ ИСТОЧНИКА подряд — исключение из
+    правила: см. `MAX_FORBIDDEN_IN_A_ROW` и `_looks_blocked`.
     """
     interval = config.app.schedule.interval_hours * 3600.0
     signal_ = stop if stop is not None else StopSignal()
@@ -97,23 +98,27 @@ def serve(
         while iterations is None or completed < iterations:
             deadline = monotonic() + interval
             try:
-                run()
+                result = run()
             except AccessForbidden as error:
                 forbidden += 1
                 logger.error(
                     "hh.ru закрыл доступ (%d-й раз подряд): %s", forbidden, error, exc_info=True
                 )
                 if forbidden >= MAX_FORBIDDEN_IN_A_ROW:
-                    logger.error(
-                        "доступ закрыт устойчиво (%d прогона подряд), демон остановлен. "
-                        "Обходные пути не применяются — нужен человек",
-                        forbidden,
-                    )
-                    return EXIT_FORBIDDEN
+                    return _give_up(forbidden)
             except Exception:
                 logger.exception("прогон завершился с ошибкой, продолжаем по расписанию")
             else:
-                forbidden = 0
+                if _looks_blocked(result):
+                    forbidden += 1
+                    logger.error(
+                        "прогон не получил от hh.ru ни одной страницы (%d-й раз подряд)",
+                        forbidden,
+                    )
+                    if forbidden >= MAX_FORBIDDEN_IN_A_ROW:
+                        return _give_up(forbidden)
+                else:
+                    forbidden = 0
             completed += 1
             if signal_.requested():
                 break
@@ -129,6 +134,43 @@ def serve(
         return EXIT_OK
     logger.info("демон остановлен, выполнено прогонов: %d", completed)
     return EXIT_OK
+
+
+def _looks_blocked(result: object) -> bool:
+    """Прогон состоялся, а страниц от источника не пришло ни одной.
+
+    Сценариев блокировки больше одного, и исключением наружу выходит
+    только часть из них. Прогон, в котором hh.ru не отдал ничего, уже
+    помечается `failed` самим конвейером (`discovery._check_not_silent`),
+    но демон на это не реагировал никак — считались только
+    `AccessForbidden`. Отсюда дыра: пока 403 на `/robots.txt` приходил
+    как `RobotsDisallowed`, каждый прогон был именно таким `failed`, и
+    цикл крутился вечно.
+
+    Условие намеренно узкое. `failed` бывает и по своей вине — занятый
+    том отчётов, например, — но там страницы получены (`discovered > 0`),
+    и останавливать демон до вмешательства человека было бы наказанием
+    за чужую беду. Здесь же речь ровно о «источник не отдал ничего».
+
+    Пропущенный прогон (`None` от `_execute`) блокировкой не считается и
+    серию обнуляет — и это не упущение: пропуск возможен только вскоре
+    после УСПЕШНОГО прогона, а он серию и так обнулил.
+    """
+    return (
+        isinstance(result, RunStats)
+        and result.status == FAILED
+        and result.discovered == 0
+        and result.enriched == 0
+    )
+
+
+def _give_up(streak: int) -> int:
+    logger.error(
+        "доступ закрыт устойчиво (%d прогона подряд), демон остановлен. "
+        "Обходные пути не применяются — нужен человек",
+        streak,
+    )
+    return EXIT_FORBIDDEN
 
 
 def _wait_until(signal_: StopSignal, remaining: float, interval: float) -> None:

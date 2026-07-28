@@ -499,10 +499,17 @@ def test_report_refuses_to_overwrite_the_file_of_a_running_run(tmp_path: Path) -
 
 @respx.mock
 def test_the_lock_is_released_when_the_run_ends(tmp_path: Path) -> None:
-    """Замок держится ровно на время прогона: следующий обязан пройти."""
+    """Замок держится ровно на время прогона: следующий обязан пройти.
+
+    Прошлый прогон отодвигается в прошлое, иначе второй не дошёл бы до
+    замка вовсе: предохранитель от шторма перезапусков пропускает прогон,
+    если предыдущий успешный был только что (см. `_too_soon`). Здесь
+    предмет — замок, и мешать ему другой предохранитель не должен.
+    """
     config_dir = prepare(tmp_path)
     mock_source()
     assert invoke(config_dir, "run").exit_code == 0
+    backdate_last_run(state_path(config_dir), hours=3)
     assert invoke(config_dir, "run").exit_code == 0
     assert len(runs_in_journal(state_path(config_dir))) == 2
 
@@ -736,3 +743,103 @@ def test_serve_builds_sinks_before_the_loop_and_not_inside_the_run(
     assert result.exit_code == 2
     assert "telegram" in result.output
     assert not (tmp_path / "state" / "hh.db").exists()
+
+
+# --- C2: маркер обязан останавливать и `run`, а не только `serve` ----------
+
+
+@respx.mock
+def test_run_sends_nothing_while_the_forbidden_marker_stands(tmp_path: Path) -> None:
+    """«Перезапущенный контейнер не отправляет ни одного запроса» — контракт
+    маркера из README, и проверялся он только в `serve`.
+
+    Дырка открывалась самым естественным действием человека: увидев
+    остановленный демон, он выполняет `docker compose run --rm hh-search
+    run` («а сейчас как?») — и предохранитель, ради которого маркер и
+    заведён, пропускает прогон целиком. Замер на FIX_BASE: 11 запросов к
+    hh.ru при стоящем маркере.
+    """
+    config_dir = prepare(tmp_path)
+    assert invoke(config_dir, "init-db").exit_code == 0
+    marker = tmp_path / "state" / "access-forbidden.stop"
+    marker.write_text("доступ закрыт устойчиво\n", encoding="utf-8")
+    mock_source()
+
+    result = invoke(config_dir, "run")
+
+    assert result.exit_code == 1
+    assert "маркер" in result.output
+    assert "удалите" in result.output.lower()
+    assert respx.calls.call_count == 0, "при стоящем маркере в сеть не уходит ничего"
+
+
+# --- I2: перезапуск контейнера не имеет права означать немедленный прогон --
+
+
+@respx.mock
+def test_a_run_right_after_a_successful_one_is_skipped(tmp_path: Path) -> None:
+    """`docker restart` — обычное действие владельца, а не команда «обойди hh.ru».
+
+    Замер на FIX_BASE: `up -d` плюс три `restart` за 48 секунд — 41 запрос
+    к hh.ru. Проверки «прошлый прогон был только что» не было нигде.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    assert invoke(config_dir, "run").exit_code == 0
+    after_first = respx.calls.call_count
+
+    result = invoke(config_dir, "run")
+
+    assert result.exit_code == 0
+    assert "пропущен" in result.output
+    assert respx.calls.call_count == after_first, "повторный прогон не имеет права идти в сеть"
+
+
+@respx.mock
+def test_a_run_happens_again_once_the_previous_success_is_old_enough(tmp_path: Path) -> None:
+    """Контроль к предыдущему тесту: предохранитель не имеет права
+    подменять собой расписание и глушить прогоны навсегда."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    assert invoke(config_dir, "run").exit_code == 0
+    after_first = respx.calls.call_count
+    backdate_last_run(state_path(config_dir), hours=3)
+
+    assert invoke(config_dir, "run").exit_code == 0
+
+    assert respx.calls.call_count > after_first
+    assert len(runs_in_journal(state_path(config_dir))) == 2
+
+
+@respx.mock
+def test_a_burst_of_restarts_costs_one_run_and_not_four(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Тот же сценарий глазами Docker: `up -d` и три `restart` подряд.
+
+    `restart: unless-stopped` плюс любая падающая конфигурация — это
+    множитель запросов, а обычная возня владельца («поправил профиль —
+    перезапустил») стоила бы десятков лишних обходов листингов за вечер.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    monkeypatch.setattr("hh_search.__main__.StopSignal", OneShotStop)
+
+    codes = [invoke(config_dir, "serve").exit_code for _ in range(4)]
+    after_first_run = 1 + 2 + 1  # robots.txt + две страницы листинга + одна вакансия
+
+    assert codes == [0, 0, 0, 0]
+    assert respx.calls.call_count == after_first_run
+    assert [status for status, _ in runs_in_journal(state_path(config_dir))] == ["ok"]
+
+
+def backdate_last_run(db: Path, hours: int) -> None:
+    """Отодвинуть последний прогон в прошлое: расписание тестом не ждут."""
+    stale = datetime.now(UTC) - timedelta(hours=hours)
+    raw = sqlite3.connect(str(db))
+    raw.execute(
+        "UPDATE run SET finished_at = ? WHERE id = (SELECT MAX(id) FROM run)",
+        (stale.isoformat(),),
+    )
+    raw.commit()
+    raw.close()

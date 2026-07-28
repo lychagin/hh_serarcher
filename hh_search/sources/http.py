@@ -12,12 +12,18 @@ from urllib.parse import urlsplit
 import httpx
 
 from hh_search.config.models import HttpConfig
-from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
+from hh_search.errors import AccessForbidden, FetchFailed, HhSearchError, RobotsDisallowed
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+# Отказ ДОСТУПА к самому robots.txt. Файл отдаётся анонимно всем, поэтому
+# 401/403 именно на нём — это «закрыли нас», а не «правила такие», и
+# отличать этот случай от 5xx обязан тип исключения, а не только текст:
+# предохранители (`ForbiddenStreak`, счётчик прогонов в `serve`) считают
+# `AccessForbidden` и ничего больше.
+ROBOTS_BLOCKED_STATUSES = frozenset({401, 403})
 # Редиректы обходим вручную, чтобы проверить robots.txt и выдержать паузу на
 # КАЖДОМ хопе; потолок нужен, чтобы кольцо редиректов не крутилось вечно.
 MAX_REDIRECTS = 5
@@ -210,6 +216,14 @@ class PoliteClient:
         )
         self._last_request_at: float | None = None
         self._robots: dict[str, Robots] = {}
+        # Отрицательный вердикт кэшируется наравне с положительным, вместе
+        # с ТИПОМ отказа. Иначе каждая несделанная попытка стоила нового
+        # запроса к `/robots.txt`: замер прогона при 403 — 16 запросов, все
+        # 16 к `/robots.txt`, то есть отказ источника УСИЛИВАЛ давление на
+        # него ровно в тот момент, когда он попросил перестать.
+        # Живёт кэш ровно столько же, сколько клиент, то есть один прогон:
+        # временный сбой не имеет права блокировать нас навсегда.
+        self._robots_denied: dict[str, tuple[type[HhSearchError], str]] = {}
 
     def __enter__(self) -> "PoliteClient":
         return self
@@ -332,15 +346,29 @@ class PoliteClient:
 
         Кэш — по origin (scheme://netloc), а не один объект на клиента: иначе
         правила hh.ru молча применялись бы к hh.kz и rabota.by, куда уводят
-        редиректы региональных вакансий.
+        редиректы региональных вакансий. По тому же ключу кэшируется и
+        ОТКАЗ: запрет hh.ru не имеет права распространяться на hh.kz, а
+        двадцать несделанных попыток к hh.ru — стоить двадцати запросов.
         """
         if not self._config.respect_robots:
             return
         parts = urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
+        denied = self._robots_denied.get(origin)
+        if denied is not None:
+            # Новый экземпляр, а не сохранённый: повторный `raise` одного и
+            # того же исключения наращивал бы его traceback на каждой
+            # попытке. Тип и текст те же — по ним принимают решение и
+            # предохранитель, и человек в логе.
+            kind, reason = denied
+            raise kind(reason)
         robots = self._robots.get(origin)
         if robots is None:
-            robots = self._load_robots(origin)
+            try:
+                robots = self._load_robots(origin)
+            except (AccessForbidden, RobotsDisallowed) as error:
+                self._robots_denied[origin] = (type(error), str(error))
+                raise
             self._robots[origin] = robots
         if not robots.can_fetch(self._user_agent, url):
             winner = robots.matched_rule(self._user_agent, url)
@@ -352,28 +380,32 @@ class PoliteClient:
 
         Недоступность (5xx, сетевая ошибка, непонятное тело) трактуется как полный
         запрет по умолчанию (RFC 9309 §2.3.1), а 404 — как отсутствие ограничений.
+
+        Отказ доступа к самому файлу (401/403) выделен из этого правила:
+        поведение то же — никуда не идём, — но исключение другое. Разница
+        не косметическая: `RobotsDisallowed` не считает ни один
+        предохранитель, поэтому самый вероятный сценарий бана (403 на
+        `/robots.txt`) не ставил маркер `access-forbidden.stop` НИКОГДА и
+        демон стучался каждые четыре часа вечно.
         """
         robots_url = f"{origin}/robots.txt"
         response = self._fetch_robots(robots_url)
         if response.status_code == 404:
             return Robots.parse("")
+        if response.status_code in ROBOTS_BLOCKED_STATUSES:
+            logger.error("robots.txt ответил %s: похоже, источник закрыл нас", response.status_code)
+            raise AccessForbidden(
+                f"robots.txt вернул {response.status_code} для {robots_url}. Это похоже на "
+                "блокировку источника, а не на правило: robots.txt отдаётся анонимно. "
+                "Обходные пути не применяются."
+            )
         if response.status_code != 200:
             logger.warning(
                 "robots.txt ответил %s, доступ запрещён по умолчанию", response.status_code
             )
-            # 403 именно здесь — почти наверняка не правило, а блокировка:
-            # robots.txt отдают анонимно все. Отказ остаётся RobotsDisallowed
-            # (мы действительно не знаем правил и поэтому не идём никуда), но
-            # читающий лог обязан понимать, что чинить надо не конфиг.
-            blocked = (
-                " Это похоже на блокировку источника, а не на правило: robots.txt "
-                "отдаётся анонимно. Обходные пути не применяются."
-                if response.status_code == 403
-                else ""
-            )
             raise RobotsDisallowed(
                 f"robots.txt вернул {response.status_code} для {robots_url}, "
-                f"доступ запрещён по умолчанию.{blocked}"
+                "доступ запрещён по умолчанию."
             )
         if not _looks_like_robots(response):
             logger.warning(

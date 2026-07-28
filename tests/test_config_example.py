@@ -13,23 +13,35 @@
    этот класс не ловят — только прогон через фактический `SignalMatcher`.
 """
 
+import gzip
 import re
 from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from hh_search.__main__ import app
 from hh_search.config.loader import load_config
-from hh_search.config.models import Config
+from hh_search.config.models import Config, Signals
+from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown
 from hh_search.filtering.matching import SignalMatcher
+from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sources.http import PoliteClient
+from hh_search.sources.vacancy_page import SalaryBlockStats, parse_vacancy_page
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_EXAMPLE = ROOT / "config.example"
+FIXTURES = Path(__file__).parent / "fixtures"
 SPEC = ROOT / "docs/superpowers/specs/2026-07-27-hh-autosearch-design.md"
 SCHEMA = ROOT / "hh_search/storage/schema.sql"
+
+# Заглушка из образца и адрес, который вписывает человек. Образец
+# намеренно НЕ загружается как есть: незаполненный контакт отвергается
+# валидатором (см. `test_example_config_demands_a_real_contact_email`).
+PLACEHOLDER_EMAIL = "your-email@example.com"
+FILLED_EMAIL = "serg.lychagin.usa@gmail.com"
 
 # Слева — заголовок в живой по форме записи, справа — сигнал, который обязан
 # сработать. Каждая пара взята из находки: прежняя редакция образца молчала
@@ -68,9 +80,22 @@ MUST_NOT_BE_REJECTED = [
 ]
 
 
+def load_example(target: Path) -> Config:
+    """Образец, у которого заполнено единственное поле, требующее человека.
+
+    Ровно то, что делает пользователь после `cp config.example/*.yaml
+    data/config/`: вписывает свой адрес. Остальное берётся из образца
+    дословно, поэтому проверки ниже сторожат именно его.
+    """
+    for name in ("app.yaml", "profile.yaml", "queries.yaml"):
+        body = (CONFIG_EXAMPLE / name).read_text(encoding="utf-8")
+        (target / name).write_text(body.replace(PLACEHOLDER_EMAIL, FILLED_EMAIL), encoding="utf-8")
+    return load_config(target)
+
+
 @pytest.fixture(scope="module")
-def example_config() -> Config:
-    return load_config(CONFIG_EXAMPLE)
+def example_config(tmp_path_factory: pytest.TempPathFactory) -> Config:
+    return load_example(tmp_path_factory.mktemp("config-example"))
 
 
 def _signal_groups(config: Config) -> dict[str, list[list[str]]]:
@@ -110,9 +135,22 @@ def _negative_matcher(config: Config) -> SignalMatcher:
 
 
 def test_example_config_loads(example_config: Config) -> None:
-    """`cp config.example/*.yaml data/config/` обязан давать рабочий конфиг."""
+    """`cp config.example/*.yaml data/config/` плюс свой адрес — рабочий конфиг."""
     assert example_config.queries.queries
     assert example_config.app.sinks == ["csv", "markdown"]
+
+
+def test_example_config_demands_a_real_contact_email() -> None:
+    """Незаполненный образец обязан ронять процесс на старте, а не уезжать к hh.ru.
+
+    Заглушка — валидный по форме адрес, поэтому она проходила проверку и
+    первый запуск завершался `ok`, отправив к hh.ru десяток запросов с
+    несуществующим контактом в User-Agent. §3.5 называет честный контакт
+    жёстким требованием: это единственный способ hh.ru связаться с нами
+    вместо того, чтобы забанить.
+    """
+    with pytest.raises(ValidationError, match="Заполните contact_email в app.yaml"):
+        load_config(CONFIG_EXAMPLE)
 
 
 def test_example_user_agent_builds_a_client(example_config: Config) -> None:
@@ -138,7 +176,7 @@ def test_every_example_signal_compiles(example_config: Config) -> None:
     SignalMatcher(_all_signals(example_config))
 
 
-@pytest.mark.parametrize("field", sorted(_signal_groups(load_config(CONFIG_EXAMPLE))))
+@pytest.mark.parametrize("field", sorted([*Signals.model_fields, "negative"]))
 def test_example_field_has_no_duplicate_signals(example_config: Config, field: str) -> None:
     """Повтор ВНУТРИ поля удваивает вклад и штраф. Повтор МЕЖДУ полями
     (`python` в title_tech и в stack) — наоборот, замысел: это разные
@@ -158,6 +196,67 @@ def test_example_signal_actually_fires(example_config: Config, title: str, signa
 def test_example_stop_words_do_not_reject_the_target(example_config: Config, title: str) -> None:
     """«крупный оператор связи» — это целевой телеком, а не колл-центр."""
     assert _negative_matcher(example_config).find(title) == []
+
+
+# --- четвёртый тихий класс: сигнал есть, компонент оценки — ноль -----------
+#
+# `responsibilities` перечисляла МЕНЕДЖЕРСКИЕ сигналы (архитектура,
+# менторинг, код-ревью), а живая senior-embedded вакансия описана
+# ИНЖЕНЕРНЫМИ глаголами: стабилизация, интеграция, адаптация, реализация и
+# сопровождение BSP, низкоуровневая отладка, bring-up платы. Ни одной
+# профильной основы в тексте нет, поэтому компонент был ровно нулевым, а
+# целевая вакансия теряла двадцать очков из ста — и вставала на самую
+# границу порога отчёта. Проверяется исполнением на живых фикстурах,
+# потому что ни ревью, ни чтение конфига этот класс не ловят.
+
+# Заголовки — те же, что у живых страниц: в проде он приходит из листинга,
+# а не со страницы вакансии, поэтому в скорер подаётся отдельно.
+TARGET_TITLE = "Старший инженер-разработчик Embedded Linux (BSP, ARM64, i.MX 8M Plus)"
+OFF_TARGET_TITLE = "Младший программист/разработчик 1С"
+LIVE_SCORES = [
+    ("vacancy.html.gz", TARGET_TITLE, 100.0),
+    ("vacancy_salary.html.gz", OFF_TARGET_TITLE, 0.0),
+]
+
+
+def _score(config: Config, fixture: str, title: str) -> ScoreBreakdown:
+    with gzip.open(FIXTURES / fixture, "rt", encoding="utf-8") as handle:
+        details = parse_vacancy_page(handle.read(), SalaryBlockStats())
+    discovered = DiscoveredVacancy(
+        id="1", url="https://hh.ru/vacancy/1", title=title, found_by_query="programmist"
+    )
+    return KeywordScorer(config.profile).score(discovered, details)
+
+
+@pytest.mark.parametrize(("fixture", "title", "expected"), LIVE_SCORES)
+def test_example_profile_scores_the_live_pages(
+    example_config: Config, fixture: str, title: str, expected: float
+) -> None:
+    """Целевая вакансия — сотня, вакансия 1С — ноль, и обе на живых страницах."""
+    assert _score(example_config, fixture, title).total == expected
+
+
+def test_responsibilities_fire_on_an_engineering_vacancy(example_config: Config) -> None:
+    """Именно компонент `responsibilities`, а не итог: он и был нулевым.
+
+    Итог сторожит тест выше, но он сойдётся и если двадцать очков придут
+    откуда-то ещё. Здесь проверяется ровно то, что чинилось.
+    """
+    breakdown = _score(example_config, "vacancy.html.gz", TARGET_TITLE)
+    assert breakdown.responsibilities == 1.0, breakdown.matched
+
+
+def test_the_new_responsibilities_do_not_reach_the_off_target_vacancy(
+    example_config: Config,
+) -> None:
+    """Контроль: `разработ` и `поддержк` отвергнуты как шумные не зря.
+
+    Оба ловят и вакансию 1С тоже (проверено исполнением на этой же
+    фикстуре), а компонент, срабатывающий на всём подряд, — это не сигнал,
+    а смещение всех оценок вверх.
+    """
+    breakdown = _score(example_config, "vacancy_salary.html.gz", OFF_TARGET_TITLE)
+    assert breakdown.matched["responsibilities"] == []
 
 
 # --- спека против кода: расхождение обязано ловиться автоматически ---------

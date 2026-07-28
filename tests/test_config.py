@@ -7,7 +7,7 @@ from hh_search.config.loader import load_config
 from hh_search.config.models import QuerySpec
 
 APP_YAML = """
-contact_email: "me@example.com"
+contact_email: "me@lychagin-hh.ru"
 user_agent: "hh-search/0.1 (personal job search; {contact_email})"
 schedule:
   interval_hours: 4
@@ -65,7 +65,7 @@ def test_loads_all_three_files(tmp_path: Path) -> None:
 
 def test_user_agent_gets_contact_email_substituted(tmp_path: Path) -> None:
     cfg = load_config(write_config(tmp_path))
-    assert cfg.app.user_agent == "hh-search/0.1 (personal job search; me@example.com)"
+    assert cfg.app.user_agent == "hh-search/0.1 (personal job search; me@lychagin-hh.ru)"
 
 
 @pytest.mark.parametrize("template", ['"hh-search/{version}"', '"hh-search/{0}"'])
@@ -134,7 +134,7 @@ WEIGHTS_LINE = "weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, doma
             'user_agent: "hh-search/0.1 (personal job search; {contact_email})"',
             'user_agent: ""',
         ),
-        ("app.yaml", 'contact_email: "me@example.com"', 'contact_email: "не почта вовсе"'),
+        ("app.yaml", 'contact_email: "me@lychagin-hh.ru"', 'contact_email: "не почта вовсе"'),
         # saturation: 0 -> ZeroDivisionError в скоринге, уже ПОСЛЕ похода в сеть.
         (
             "profile.yaml",
@@ -195,7 +195,7 @@ def test_empty_queries_list_is_rejected(tmp_path: Path) -> None:
 
 
 def test_duplicate_top_level_key_is_rejected(tmp_path: Path) -> None:
-    broken = APP_YAML + '\ncontact_email: "other@example.com"\n'
+    broken = APP_YAML + '\ncontact_email: "other@lychagin-hh.ru"\n'
     with pytest.raises(ValueError, match="contact_email") as excinfo:
         load_config(write_config(tmp_path, **{"app.yaml": broken}))
     assert "app.yaml" in str(excinfo.value)
@@ -416,3 +416,83 @@ def test_slug_of_a_real_hh_listing_is_accepted(tmp_path: Path, slug: str) -> Non
     body = QUERIES_YAML.replace("slug: programmist", f'slug: "{slug}"')
     cfg = load_config(write_config(tmp_path, **{"queries.yaml": body}))
     assert cfg.queries.queries[0].slug == slug
+
+
+# --- Раунд исправлений 8: заглушка `contact_email` не имеет права уезжать ---
+#
+# Валидатор проверял только форму адреса, поэтому `your-email@example.com`
+# из образца проходил насквозь: первый запуск с неотредактированным
+# app.yaml завершался `ok`, отправив к hh.ru десяток запросов с
+# несуществующим адресом в User-Agent и без единого предупреждения. §3.5
+# требует честного контакта — это единственный способ hh.ru связаться с
+# нами вместо того, чтобы забанить.
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        # Ровно то, что лежит в config.example/app.yaml.
+        "your-email@example.com",
+        # RFC 2606 §3: домены второго уровня, зарезервированные под примеры.
+        "me@example.com",
+        "me@example.net",
+        "me@example.org",
+        "me@example.edu",
+        "me@mail.example.com",
+        # RFC 2606 §2 и RFC 6761: TLD, которые не будут делегированы никогда.
+        "me@hh-search.example",
+        "me@hh-search.test",
+        "me@hh-search.invalid",
+        "me@hh-search.localhost",
+        # Регистр значения не имеет: домен регистронезависим.
+        "me@Example.COM",
+    ],
+)
+def test_undeliverable_documentation_address_is_rejected(tmp_path: Path, address: str) -> None:
+    """Адрес в зарезервированном домене доставить нельзя ПО ОПРЕДЕЛЕНИЮ.
+
+    Критерий выбран не «похоже на заглушку», а «домен зарезервирован
+    стандартом»: RFC 2606 и RFC 6761 гарантируют, что эти имена не
+    делегируются никому, то есть письмо туда не дойдёт ни при каких
+    обстоятельствах. Значит контакт декоративен, а вежливость к источнику
+    держится ровно на нём.
+    """
+    broken = APP_YAML.replace('contact_email: "me@lychagin-hh.ru"', f'contact_email: "{address}"')
+    with pytest.raises(ValidationError, match="contact_email"):
+        load_config(write_config(tmp_path, **{"app.yaml": broken}))
+
+
+def test_the_message_says_what_to_do(tmp_path: Path) -> None:
+    """Человеку нужен не диагноз, а действие: какой файл открыть и что вписать."""
+    broken = APP_YAML.replace(
+        'contact_email: "me@lychagin-hh.ru"', 'contact_email: "your-email@example.com"'
+    )
+    with pytest.raises(ValidationError, match="Заполните contact_email в app.yaml"):
+        load_config(write_config(tmp_path, **{"app.yaml": broken}))
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        # Настоящий адрес владельца из спеки §7.
+        "serg.lychagin.usa@gmail.com",
+        # Собственный домен — самый вероятный случай после публичной почты,
+        # и он не имеет права спотыкаться о критерий заглушки.
+        "hh@lychagin.dev",
+        "example@lychagin.dev",
+        "job-search@my-example.com",
+        "me@examples.com",
+        "me@test.ru",
+        "me@sub.domain.example-company.io",
+    ],
+)
+def test_a_real_address_still_passes(tmp_path: Path, address: str) -> None:
+    """Контроль: критерий обязан ловить образец и не мешать живым адресам.
+
+    `example@lychagin.dev` и `my-example.com` здесь не для красоты — на них
+    ломается любая проверка «содержит example», которая напрашивается
+    первой.
+    """
+    good = APP_YAML.replace('contact_email: "me@lychagin-hh.ru"', f'contact_email: "{address}"')
+    config = load_config(write_config(tmp_path, **{"app.yaml": good}))
+    assert config.app.user_agent.endswith(f"{address})")

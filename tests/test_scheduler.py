@@ -9,6 +9,7 @@ import pytest
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden
+from hh_search.pipeline.stats import FAILED, RunStats
 from hh_search.scheduler import EXIT_FORBIDDEN, EXIT_OK, StopSignal, serve
 from tests.test_config import write_config
 
@@ -236,3 +237,89 @@ def test_keyboard_interrupt_ends_the_daemon_immediately(config: Config) -> None:
         raise KeyboardInterrupt
 
     assert serve(config, interrupted, iterations=5) == EXIT_OK
+
+
+# --- сценариев блокировки больше одного ------------------------------------
+#
+# `AccessForbidden` — не единственная форма отказа источника. Прогон, в
+# котором hh.ru не отдал НИ ОДНОЙ страницы, уже помечается `failed`
+# (`discovery._check_not_silent`), но демон на него не реагировал никак:
+# счётчик считал только исключения, и, например, устойчивый 403 на
+# `/robots.txt` (до этого раунда — `RobotsDisallowed`) крутил цикл вечно.
+
+
+def blocked_stats() -> RunStats:
+    """Прогон, в котором источник не отдал ни одной страницы."""
+    stats = RunStats()
+    stats.degrade(FAILED, "источник не отдал ни одной из 9 запрошенных страниц листингов")
+    return stats
+
+
+def test_two_runs_without_a_single_page_stop_the_daemon(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Два прогона подряд с нулём отданных страниц — тот же отказ доступа.
+
+    Разница с `AccessForbidden` только в форме, в которой источник
+    отказал; цена ошибки одна и та же — сервис стучится вечно и никто об
+    этом не узнаёт.
+    """
+    clock = FakeClock()
+    calls = {"n": 0}
+
+    def blocked() -> RunStats:
+        calls["n"] += 1
+        return blocked_stats()
+
+    code = serve(config, blocked, stop=clock, monotonic=clock.monotonic, iterations=10)
+    assert (code, calls["n"]) == (EXIT_FORBIDDEN, 2)
+    assert "устойчиво" in caplog.text
+
+
+def test_a_failed_run_that_still_got_pages_does_not_stop_the_daemon(config: Config) -> None:
+    """`failed` бывает и по своей вине: том отчётов занят файлом.
+
+    Останавливать демон навсегда из-за испорченного тома нельзя — это не
+    отказ источника, и маркер потребовал бы человека там, где помогает
+    следующий прогон.
+    """
+    clock = FakeClock()
+    calls = {"n": 0}
+
+    def failed_locally() -> RunStats:
+        calls["n"] += 1
+        stats = RunStats(discovered=18, enriched=1)
+        stats.degrade(FAILED, "приёмники не приняли отчёт")
+        return stats
+
+    code = serve(config, failed_locally, stop=clock, monotonic=clock.monotonic, iterations=4)
+    assert (code, calls["n"]) == (EXIT_OK, 4)
+
+
+def test_a_single_empty_run_between_successes_does_not_stop_the_daemon(config: Config) -> None:
+    """Считаются ПОДРЯД идущие, как и для 403: одна пустая выдача бывает."""
+    clock = FakeClock()
+    calls = {"n": 0}
+
+    def flaky() -> RunStats:
+        calls["n"] += 1
+        return blocked_stats() if calls["n"] in (1, 3) else RunStats(discovered=18)
+
+    code = serve(config, flaky, stop=clock, monotonic=clock.monotonic, iterations=4)
+    assert (code, calls["n"]) == (EXIT_OK, 4)
+
+
+def test_an_empty_run_after_a_forbidden_one_stops_the_daemon(config: Config) -> None:
+    """Счётчик один на обе формы отказа: 403, затем пустой прогон — это два
+    подряд идущих отказа источника, а не по одному в двух независимых."""
+    clock = FakeClock()
+    calls = {"n": 0}
+
+    def blocked() -> RunStats:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise AccessForbidden("hh.ru ответил 403")
+        return blocked_stats()
+
+    code = serve(config, blocked, stop=clock, monotonic=clock.monotonic, iterations=10)
+    assert (code, calls["n"]) == (EXIT_FORBIDDEN, 2)

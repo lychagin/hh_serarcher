@@ -98,6 +98,54 @@ def _reject_duplicate_signals(groups: list[list[str]]) -> list[list[str]]:
 SignalGroups = Annotated[list[SignalGroup], AfterValidator(_reject_duplicate_signals)]
 
 
+# Домены, зарезервированные стандартом под примеры и документацию:
+# RFC 2606 §3 (второй уровень) и RFC 2606 §2 + RFC 6761 (домены верхнего
+# уровня). Они не делегированы никому и делегированы не будут, то есть
+# письмо по такому адресу не дойдёт ни при каких обстоятельствах.
+_RESERVED_DOMAINS = frozenset({"example.com", "example.net", "example.org", "example.edu"})
+_RESERVED_TLDS = frozenset({"example", "invalid", "localhost", "test"})
+
+
+def _reject_undeliverable_contact(value: str) -> str:
+    """Заглушка `your-email@example.com` из образца не имеет права уехать к hh.ru.
+
+    §3.5 называет честный контакт жёстким требованием: `contact_email`
+    попадает в `User-Agent` и служит источнику единственным способом
+    связаться с нами вместо того, чтобы забанить. Проверка формы адреса
+    этого не обеспечивала — заглушка ей соответствует, поэтому первый
+    запуск с неотредактированным `app.yaml` завершался `ok`, отправив
+    десяток запросов с несуществующим адресом и без единого
+    предупреждения.
+
+    Критерий — не «похоже на заглушку», а «домен зарезервирован
+    стандартом». Он ловит образец и любую его вариацию, но не спотыкается
+    ни об один настоящий адрес, включая адреса на собственных доменах:
+    `example@lychagin.dev` и `job@my-example.com` законны, а
+    `me@mail.example.com` — нет, потому что поддомен зарезервированного
+    домена зарезервирован вместе с ним.
+    """
+    domain = value.rsplit("@", 1)[-1].strip().rstrip(".").lower()
+    labels = domain.split(".")
+    registrable = ".".join(labels[-2:])
+    if labels[-1] in _RESERVED_TLDS or registrable in _RESERVED_DOMAINS:
+        raise ValueError(
+            f"адрес {value!r} лежит в домене {domain!r}, зарезервированном под примеры "
+            "(RFC 2606, RFC 6761): письмо туда не дойдёт, и hh.ru не сможет с вами "
+            "связаться. Заполните contact_email в app.yaml своим настоящим адресом"
+        )
+    return value
+
+
+# Адрес попадает в User-Agent и служит источнику способом с нами связаться;
+# «не почта вовсе» делает вежливость декоративной, а недоставляемый адрес —
+# декоративной так же, просто менее заметно.
+ContactEmail = Annotated[
+    str,
+    Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+    AfterValidator(_reject_undeliverable_contact),
+]
+
+
 class ScheduleConfig(Base):
     interval_hours: int = Field(default=4, ge=1)
 
@@ -124,9 +172,7 @@ class PathsConfig(Base):
 
 
 class AppConfig(Base):
-    # Адрес попадает в User-Agent и служит источнику способом с нами связаться;
-    # «не почта вовсе» делает вежливость декоративной.
-    contact_email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    contact_email: ContactEmail
     user_agent: NonEmptyStr
     schedule: ScheduleConfig = ScheduleConfig()
     http: HttpConfig = HttpConfig()

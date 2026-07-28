@@ -144,18 +144,23 @@ def test_robots_5xx_means_disallowed_by_default() -> None:
 
 
 @respx.mock
-def test_robots_403_says_it_looks_like_a_block_not_a_rule() -> None:
-    """403 на сам `robots.txt` — почти наверняка блокировка, а не правило.
+@pytest.mark.parametrize("status", [401, 403])
+def test_robots_401_and_403_are_a_block_and_not_a_rule(status: int) -> None:
+    """Отказ ДОСТУПА к самому `robots.txt` — это блокировка, а не правило.
 
-    Отказ остаётся `RobotsDisallowed` (правил мы действительно не знаем и
-    поэтому не идём никуда), но сообщение обязано отличать эти два случая:
-    иначе оператор читает «доступ запрещён по умолчанию» и идёт править
-    конфиг вместо того, чтобы понять, что источник закрылся. Ровно тот
-    отложенный minor Task 4, где «поведение верное, вопрос в формулировке».
+    Файл отдаётся анонимно всем, поэтому 403 (и 401) именно на нём означает
+    «закрыли нас». Сообщение это говорило и раньше, а тип исключения — нет,
+    и предохранители проходили мимо: `ForbiddenStreak` считает только
+    `AccessForbidden`, поэтому маркер `access-forbidden.stop` не ставился
+    НИКОГДА, а демон стучался каждые четыре часа вечно.
+
+    5xx остаётся `RobotsDisallowed` (см. тест выше) сознательно: там
+    источник сломан, а не закрыт для нас, и останавливать демон навсегда
+    из-за чужой аварии нельзя.
     """
-    respx.get(ROBOTS).mock(return_value=httpx.Response(403))
+    respx.get(ROBOTS).mock(return_value=httpx.Response(status))
     client, _ = make_client(respect_robots=True)
-    with client, pytest.raises(RobotsDisallowed, match="блокировку источника"):
+    with client, pytest.raises(AccessForbidden, match="блокировку источника"):
         client.get(URL)
 
 
@@ -585,3 +590,110 @@ def test_normalization_does_not_start_forbidding_the_allowed_urls() -> None:
         "https://hh.ru/vacancies/programmist",
         "https://hh.ru/vacancies/programmist?page=1",
     ]
+
+
+# --- Раунд исправлений 8: отказ источника не имеет права УСИЛИВАТЬ нагрузку --
+#
+# Отрицательный вердикт `robots.txt` не кэшировался вовсе: `self._robots`
+# заполнялся только при успехе, поэтому каждая несделанная попытка стоила
+# нового запроса к `/robots.txt`. Замер прогона при 403: 16 запросов, все
+# 16 — к `/robots.txt`, при девяти страницах листингов и семи вакансиях в
+# очереди. На первом дне с очередью в 98 это 107 запросов за прогон и 642
+# в сутки — к источнику, который нам только что отказал.
+
+
+def counting_robots_transport(statuses: list[int], seen: list[str]) -> httpx.MockTransport:
+    """Транспорт, отвечающий на `/robots.txt` заданными кодами по очереди."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path == "/robots.txt":
+            return httpx.Response(statuses.pop(0) if statuses else 200)
+        return httpx.Response(200, text="ok")
+
+    return httpx.MockTransport(handler)
+
+
+def denied_client(statuses: list[int], seen: list[str]) -> PoliteClient:
+    config = HttpConfig(
+        delay_between_requests_sec=0.1, timeout_sec=5, max_retries=3, respect_robots=True
+    )
+    return PoliteClient(
+        config,
+        "hh-search/test",
+        sleep=lambda _: None,
+        transport=counting_robots_transport(statuses, seen),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(403, AccessForbidden), (500, RobotsDisallowed)],
+)
+def test_a_denied_robots_is_asked_once_per_origin_and_not_once_per_attempt(
+    status: int, error: type[Exception]
+) -> None:
+    """Один запрос на origin за прогон, а не один на каждую попытку.
+
+    Считается фактическое число запросов, а не число отказов: смысл
+    исправления именно в том, чтобы источник, который нам отказал, не
+    получил ещё двадцать запросов подряд.
+    """
+    seen: list[str] = []
+    client = denied_client([status] * 20, seen)
+    with client:
+        for number in range(20):
+            with pytest.raises(error):
+                client.get(f"https://hh.ru/vacancy/{number}")
+    assert seen == ["https://hh.ru/robots.txt"]
+
+
+def test_the_cached_denial_keeps_its_type_on_every_attempt() -> None:
+    """Тип отказа обязан пережить кэш: иначе предохранитель считает первый
+    403 и не считает остальные, а срабатывает он на ВТОРОЙ подряд."""
+    seen: list[str] = []
+    client = denied_client([403], seen)
+    with client:
+        for number in range(3):
+            with pytest.raises(AccessForbidden, match="блокировку источника"):
+                client.get(f"https://hh.ru/vacancy/{number}")
+    assert len(seen) == 1
+
+
+def test_the_denial_is_cached_per_origin_and_not_for_the_whole_client() -> None:
+    """Запрет hh.ru не имеет права молча распространяться на hh.kz.
+
+    Кэш положительных правил уже по origin (спека §3.5); отрицательный
+    обязан быть таким же, иначе редирект на региональный домен получал бы
+    вердикт чужого хоста.
+    """
+    seen: list[str] = []
+    client = denied_client([403, 200], seen)
+    with client:
+        with pytest.raises(AccessForbidden):
+            client.get("https://hh.ru/vacancy/1")
+        assert client.get("https://hh.kz/vacancy/1").status_code == 200
+    assert seen == [
+        "https://hh.ru/robots.txt",
+        "https://hh.kz/robots.txt",
+        "https://hh.kz/vacancy/1",
+    ]
+
+
+def test_the_denial_does_not_outlive_the_client() -> None:
+    """Кэш живёт ровно прогон: временный сбой не блокирует нас навсегда.
+
+    Осознанное решение прошлых раундов — `PoliteClient` создаётся на
+    каждый прогон, поэтому следующий прогон обязан спросить `robots.txt`
+    заново, даже если предыдущему отказали.
+    """
+    seen: list[str] = []
+    statuses = [500, 200]
+    first = denied_client(statuses, seen)
+    with first, pytest.raises(RobotsDisallowed):
+        first.get("https://hh.ru/vacancy/1")
+
+    second = denied_client(statuses, seen)
+    with second:
+        assert second.get("https://hh.ru/vacancy/1").status_code == 200
+    assert seen.count("https://hh.ru/robots.txt") == 2

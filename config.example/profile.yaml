@@ -18,7 +18,8 @@ signals:
                 c++, python, node.js, typescript, docker, kubernetes, kafka,
                 postgresql, clickhouse, [llm, llms], rag, mcp]
   responsibilities: [архитектур, менторинг, [код-ревью, code review],
-                     проектирован, техдолг]
+                     проектирован, техдолг,
+                     [отладк, bring-up, bringup], интеграц, сопровожден]
   domain:      [телеком, встраиваем, embedded, [iot, iiot], микросервис]
 negative: [[junior, стажёр, intern], 1c, продаж, рекрутер, ручн тестиров,
            [оператор пк, оператор call, оператор колл, оператор станка], курьер]
