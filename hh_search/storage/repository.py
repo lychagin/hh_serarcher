@@ -12,10 +12,10 @@ from hh_search.domain.models import (
     VacancyDetails,
 )
 from hh_search.storage.mappers import to_discovered, to_scored, to_scoring_task
-from hh_search.storage.migrations import migrate
+from hh_search.storage.migrations import apply_schema
 from hh_search.storage.quarantine import Quarantine, safe_rows
 from hh_search.storage.run_log import RunLog
-from hh_search.storage.time_utils import now_iso, to_utc_iso
+from hh_search.storage.time_utils import now_iso, to_utc_iso_optional
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
@@ -96,9 +96,7 @@ class SqliteRepository:
         Второе обязательно: база персистентна, а `CREATE TABLE IF NOT
         EXISTS` на уже существующей таблице не добавляет новых колонок.
         """
-        self._connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        migrate(self._connection)
-        self._connection.commit()
+        apply_schema(self._connection, SCHEMA_PATH.read_text(encoding="utf-8"))
 
     # --- discovery -----------------------------------------------------
 
@@ -131,7 +129,7 @@ class SqliteRepository:
                 vacancy.salary.amount_from,
                 vacancy.salary.amount_to,
                 vacancy.salary.currency,
-                to_utc_iso(vacancy.published_at),
+                to_utc_iso_optional(vacancy.published_at),
                 STATUS_NEW,
                 cluster,
                 weight,
@@ -175,37 +173,84 @@ class SqliteRepository:
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL} FROM vacancy "
             "WHERE status = ? AND description IS NULL AND enrich_attempts < ? "
-            "ORDER BY published_at DESC",
+            "ORDER BY COALESCE(published_at, first_seen_at) DESC",
             (STATUS_NEW, max_attempts),
         ).fetchall()
         return safe_rows(rows, to_discovered, self._quarantine)
 
+    # Поля, которые приносит ОДНА скачанная страница вакансии. После
+    # переезда discovery на листинг это единственный их источник, поэтому
+    # они пишутся тем же оператором, что описание и оценка: разъехаться
+    # описанию и компании, за которые заплачено одним запросом, нечем.
+    #
+    # COALESCE(:поле, поле) — «заполнить, но не стереть». Страница может
+    # честно не содержать зарплаты («не указана» — самый обычный случай),
+    # и присвоение NULL затирало бы значение, добытое РАНЬШЕ: у баз,
+    # мигрировавших с RSS, company/area/salary/published_at уже заполнены
+    # с шага discovery. Обесценить их отсутствием блока на странице —
+    # чистая потеря. Обратной опасности нет: описание скачивается ровно
+    # один раз за жизнь вакансии, поэтому «залипнуть» устаревшему
+    # значению обогащения неоткуда.
+    _ENRICHED_COLUMNS_SQL = (
+        "description = :description, fetched_at = :fetched_at, "
+        "published_at = COALESCE(:published_at, published_at), "
+        "valid_through = COALESCE(:valid_through, valid_through), "
+        "company = COALESCE(:company, company), "
+        "area = COALESCE(:area, area), "
+        "salary_raw = COALESCE(:salary_raw, salary_raw), "
+        "salary_from = COALESCE(:salary_from, salary_from), "
+        "salary_to = COALESCE(:salary_to, salary_to), "
+        "salary_currency = COALESCE(:salary_currency, salary_currency)"
+    )
+
+    @staticmethod
+    def _enriched_params(vacancy_id: str, details: VacancyDetails) -> dict[str, object]:
+        return {
+            "id": vacancy_id,
+            "description": details.description,
+            "fetched_at": now_iso(),
+            "published_at": to_utc_iso_optional(details.published_at),
+            "valid_through": to_utc_iso_optional(details.valid_through),
+            "company": details.company,
+            "area": details.area,
+            "salary_raw": details.salary.raw,
+            "salary_from": details.salary.amount_from,
+            "salary_to": details.salary.amount_to,
+            "salary_currency": details.salary.currency,
+        }
+
     def save_description(self, vacancy_id: str, details: VacancyDetails) -> None:
-        """Сохранить ТОЛЬКО описание: страница скачана, оценки ещё нет.
+        """Сохранить страницу без оценки: она скачана, оценки ещё нет.
 
         Отдельный примитив нужен конвейеру для случая «скоринг бросил
-        исключение»: описание уже стоило одного запроса к hh.ru, и терять
-        его из-за ошибки чисто локального вычисления нельзя — иначе
+        исключение»: страница уже стоила одного запроса к hh.ru, и терять
+        её из-за ошибки чисто локального вычисления нельзя — иначе
         следующий прогон снова пойдёт в сеть за той же страницей.
         Вакансия остаётся в `pending_scoring` и досчитывается локально.
+        Компания, регион, зарплата и даты сохраняются здесь наравне с
+        описанием ровно по той же причине.
         """
         self._connection.execute(
-            "UPDATE vacancy SET description = ?, fetched_at = ? WHERE id = ?",
-            (details.description, now_iso(), vacancy_id),
+            f"UPDATE vacancy SET {self._ENRICHED_COLUMNS_SQL} WHERE id = :id",
+            self._enriched_params(vacancy_id, details),
         )
         self._connection.commit()
 
     def save_enriched(
         self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
     ) -> None:
-        """Описание и оценка одним UPDATE — обычный путь после скачивания.
+        """Вся страница и оценка одним UPDATE — обычный путь после скачивания.
 
-        Сериализация вынесена ИЗ кортежа параметров сознательно: внутри
-        кортежа она вычисляется до `UPDATE`, поэтому её отказ (например
+        Одним оператором пишется ВСЁ, что принёс единственный запрос к
+        hh.ru: описание, компания, регион, зарплата, даты — и оценка,
+        посчитанная по ним же. Разъехаться им нечем по построению.
+
+        Сериализация вынесена ИЗ параметров сознательно: рядом с ними она
+        вычисляется до `UPDATE`, поэтому её отказ (например
         `PydanticSerializationError`, подкласс `ValueError`) выбрасывал
-        вместе с оценкой уже скачанное описание — и следующий прогон шёл
-        за той же страницей в сеть. Теперь неудача сериализации сохраняет
-        описание без оценки и пробрасывает ошибку: вакансия попадает в
+        вместе с оценкой уже скачанную страницу — и следующий прогон шёл
+        за ней в сеть повторно. Теперь неудача сериализации сохраняет
+        страницу без оценки и пробрасывает ошибку: вакансия попадает в
         `pending_scoring`, страница не перекачивается.
         """
         try:
@@ -213,10 +258,13 @@ class SqliteRepository:
         except ValueError:
             self.save_description(vacancy_id, details)
             raise
+        params = self._enriched_params(vacancy_id, details)
+        params["score"] = score.total
+        params["score_detail"] = score_detail
         self._connection.execute(
-            "UPDATE vacancy SET description = ?, fetched_at = ?, score = ?, score_detail = ? "
-            "WHERE id = ?",
-            (details.description, now_iso(), score.total, score_detail, vacancy_id),
+            f"UPDATE vacancy SET {self._ENRICHED_COLUMNS_SQL}, "
+            "score = :score, score_detail = :score_detail WHERE id = :id",
+            params,
         )
         self._connection.commit()
 
@@ -269,9 +317,10 @@ class SqliteRepository:
         не повод идти за уже скачанной страницей второй раз.
         """
         rows = self._connection.execute(
-            f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description "
+            f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
+            "CAST(valid_through AS BLOB) AS valid_through "
             "FROM vacancy WHERE status = ? AND description IS NOT NULL "
-            "AND score_detail IS NULL ORDER BY published_at DESC",
+            "AND score_detail IS NULL ORDER BY COALESCE(published_at, first_seen_at) DESC",
             (STATUS_NEW,),
         ).fetchall()
         return safe_rows(rows, to_scoring_task, self._quarantine)
@@ -290,6 +339,7 @@ class SqliteRepository:
         self._warn_about_unscored()
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
+            "CAST(valid_through AS BLOB) AS valid_through, "
             "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
             "FROM vacancy WHERE status = ? AND description IS NOT NULL "
             "AND score_detail IS NOT NULL ORDER BY score DESC",

@@ -14,6 +14,7 @@ BLOB)`, см. repository.py) — decode здесь, а не в SQLite, чтоб�
 
 import json
 import sqlite3
+from datetime import datetime
 
 from hh_search.domain.models import (
     DiscoveredVacancy,
@@ -46,6 +47,19 @@ def decode_optional_int(value: bytes | str | None) -> int | None:
     return None if value is None else int(decode_text(value))
 
 
+def decode_optional_utc(value: bytes | str | None) -> datetime | None:
+    """NULL в колонке даты — «ещё не обогащено», а не порча.
+
+    До переезда discovery на листинг `published_at` заполнялся уже при
+    вставке строки, из RSS. Теперь листинг даты не отдаёт, и NULL —
+    штатное состояние вакансии между discovery и обогащением. Битую же
+    строку по-прежнему разбирает `parse_utc`: её `ValueError` доезжает до
+    `safe_rows` и отправляет запись в карантин.
+    """
+    text = decode_optional_text(value)
+    return None if text is None else parse_utc(text)
+
+
 def to_discovered(row: sqlite3.Row) -> DiscoveredVacancy:
     return DiscoveredVacancy(
         id=decode_text(row["id"]),
@@ -59,19 +73,32 @@ def to_discovered(row: sqlite3.Row) -> DiscoveredVacancy:
             amount_to=decode_optional_int(row["salary_to"]),
             currency=decode_optional_text(row["salary_currency"]),
         ),
-        published_at=parse_utc(decode_text(row["published_at"])),
+        published_at=decode_optional_utc(row["published_at"]),
         found_by_query=decode_text(row["primary_query"]),
+    )
+
+
+def to_details(row: sqlite3.Row) -> VacancyDetails:
+    """Поля страницы вакансии, прочитанные обратно.
+
+    Компания, регион и зарплата живут в колонках `vacancy` и приезжают
+    через `to_discovered`, поэтому здесь повторно не читаются: иначе одна
+    и та же величина имела бы два представления в одной строке.
+    """
+    return VacancyDetails(
+        description=decode_text(row["description"]),
+        valid_through=decode_optional_utc(row["valid_through"]),
     )
 
 
 def to_scoring_task(row: sqlite3.Row) -> tuple[DiscoveredVacancy, VacancyDetails]:
     """Описание уже скачано, оценки нет — всё для локального пересчёта."""
-    return to_discovered(row), VacancyDetails(description=decode_text(row["description"]))
+    return to_discovered(row), to_details(row)
 
 
 def to_scored(row: sqlite3.Row) -> ScoredVacancy:
     discovered = to_discovered(row)
-    details = VacancyDetails(description=decode_text(row["description"]))
+    details = to_details(row)
     cluster = decode_optional_text(row["cluster"]) or ""
     raw_score_detail = row["score_detail"]
     try:

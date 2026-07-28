@@ -7,9 +7,11 @@ import httpx
 import pytest
 import respx
 
-from hh_search.config.models import HttpConfig
+from hh_search.config.models import HttpConfig, QuerySpec
 from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
 from hh_search.sources.http import PoliteClient
+from hh_search.sources.listing import build_listing_url
+from hh_search.sources.rss import RssQuery, build_rss_url
 
 URL = "https://hh.ru/search/vacancy/rss?text=Yocto"
 ROBOTS = "https://hh.ru/robots.txt"
@@ -463,3 +465,33 @@ def test_get_after_close_fails_as_fetch_failed() -> None:
         client.get(URL)
     with pytest.raises(FetchFailed):
         client.get(URL)
+
+
+# --- Раунд переезда discovery на листинг ---------------------------------
+
+
+@respx.mock
+def test_polite_client_passes_urls_built_for_discovery_and_still_blocks_rss() -> None:
+    """Сквозная проверка переезда: не «какой-то листинговый URL проходит»,
+    а именно тот, что строит `build_listing_url`, — обе его формы. Тест
+    сторожит связку целиком, поэтому попытка вернуть фильтрацию через
+    query-параметры (`?area=66&page=1`) покраснеет здесь, а не на проде.
+    Контроль в том же тесте: старый RSS-URL по-прежнему не проходит."""
+    respx.get(ROBOTS).mock(return_value=live_robots_response())
+    query = QuerySpec(slug="programmist", cluster="embedded")
+    first_page = build_listing_url(query)
+    second_page = build_listing_url(query, page=1)
+    assert first_page == "https://hh.ru/vacancies/programmist"
+    assert second_page == "https://hh.ru/vacancies/programmist?page=1"
+
+    client, _ = make_client(respect_robots=True)
+    with client:
+        for url in (first_page, second_page):
+            respx.get(url).mock(return_value=httpx.Response(200, text="ok"))
+            assert client.get(url).status_code == 200, f"discovery обязан проходить: {url}"
+
+        rss = build_rss_url(RssQuery(text="Yocto"))
+        route = respx.get(rss).mock(return_value=httpx.Response(200, text="ok"))
+        with pytest.raises(RobotsDisallowed):
+            client.get(rss)
+        assert route.call_count == 0, "RSS запрещён `Disallow: *?*` и в сеть не уходит"

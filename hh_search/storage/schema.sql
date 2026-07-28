@@ -8,7 +8,13 @@ CREATE TABLE IF NOT EXISTS vacancy (
     salary_from     INTEGER,
     salary_to       INTEGER,
     salary_currency TEXT,
-    published_at    TEXT NOT NULL,
+    -- NULL до обогащения: discovery идёт по листингу /vacancies/{slug},
+    -- который отдаёт только id, url и заголовок. Дата публикации, как и
+    -- company/area/salary, приходит со страницы вакансии. Всё, что
+    -- сортировалось по этой колонке, обязано падать на first_seen_at.
+    published_at    TEXT,
+    -- Дата, после которой вакансия неактуальна (validThrough из JSON-LD).
+    valid_through   TEXT,
     description     TEXT,
     fetched_at      TEXT,
     enrich_attempts INTEGER NOT NULL DEFAULT 0,

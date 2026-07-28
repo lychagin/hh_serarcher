@@ -11,20 +11,40 @@ class Salary(BaseModel):
 
 
 class DiscoveredVacancy(BaseModel):
+    """То, что известно о вакансии сразу после discovery.
+
+    Листинг hh.ru отдаёт только id, url и заголовок, поэтому company,
+    area, salary и published_at здесь необязательны: они заполняются на
+    шаге обогащения, со страницы вакансии. `published_at` необязателен
+    именно поэтому, а не потому, что дата бывает неизвестна источнику —
+    сортировки, опирающиеся на него, обязаны падать на `first_seen_at`.
+    """
+
     id: str
     url: str
     title: str
     company: str | None = None
     area: str | None = None
     salary: Salary = Salary()
-    published_at: datetime
+    published_at: datetime | None = None
     found_by_query: str
 
 
 class VacancyDetails(BaseModel):
+    """Всё, что даёт страница вакансии: один запрос — один набор полей.
+
+    После переезда discovery на листинг это единственный источник
+    компании, региона, зарплаты и даты публикации, поэтому они лежат
+    здесь, а не приходят россыпью: их обязана сохранять одна транзакция
+    вместе с описанием и оценкой.
+    """
+
     description: str
     valid_through: datetime | None = None
-    location: str | None = None
+    published_at: datetime | None = None
+    company: str | None = None
+    area: str | None = None
+    salary: Salary = Salary()
 
 
 class ScoreBreakdown(BaseModel):

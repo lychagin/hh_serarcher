@@ -24,6 +24,17 @@ def to_utc_iso(moment: datetime) -> str:
     return moment.isoformat()
 
 
+def to_utc_iso_optional(moment: datetime | None) -> str | None:
+    """`None` — это «дата ещё неизвестна», а не «дата нулевая».
+
+    После переезда discovery на листинг вакансия вставляется в базу
+    раньше, чем становится известна дата публикации. Подставить сюда
+    что-нибудь правдоподобное (например момент вставки) значило бы
+    записать выдумку, неотличимую от факта, — поэтому NULL.
+    """
+    return None if moment is None else to_utc_iso(moment)
+
+
 def parse_utc(value: str) -> datetime:
     """Обратная операция к `to_utc_iso`: всегда возвращает aware UTC."""
     parsed = datetime.fromisoformat(value)

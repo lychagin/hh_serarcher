@@ -114,39 +114,51 @@ class ProfileConfig(Base):
     report_threshold: float = Field(default=60.0, ge=0, le=100)
 
 
-class QueryDefaults(Base):
-    experience: list[str] | None = None
-    employment: str | None = None
-    schedule: str | None = None
-    # period — глубина выдачи в днях; hh.ru принимает 0..30.
-    period: int | None = Field(default=None, ge=0, le=30)
+def _reject_url_syntax(value: str) -> str:
+    """Slug обязан быть ОДНИМ сегментом пути и ничем больше.
+
+    Он подставляется в `/vacancies/{slug}`, а живой robots.txt hh.ru
+    запрещает правилом `Disallow: *?*` любой URL с query-строкой. Slug
+    вида `programmist?area=66` или `programmist/../search/vacancy`
+    протащил бы запрещённый запрос мимо всех проверок кода — не в обход
+    матчера robots (он такой URL поймает), а в обход договорённости, на
+    которой держится право сервиса ходить в источник. Отказ на старте,
+    до первого сетевого запроса.
+    """
+    if value.strip() != value:
+        raise ValueError("slug не может начинаться или заканчиваться пробелом")
+    forbidden = set(value) & set("?&#/ \t\n%")
+    if forbidden:
+        raise ValueError(
+            f"slug {value!r} содержит недопустимые символы {sorted(forbidden)}: "
+            "разрешён ровно один сегмент пути вида /vacancies/{slug}"
+        )
+    return value
+
+
+Slug = Annotated[str, Field(min_length=1), AfterValidator(_reject_url_syntax)]
 
 
 class QuerySpec(Base):
-    text: NonEmptyStr
+    """Один курируемый листинг hh.ru.
+
+    Параметров RSS (text/area/experience/employment/schedule/period)
+    здесь больше нет: они были query-строкой, а query-строка запрещена
+    robots.txt. Их удаление намеренно ломает старые конфиги через
+    `extra="forbid"` — молча игнорируемое поле хуже отсутствующего,
+    потому что создаёт иллюзию работающей фильтрации.
+    """
+
+    slug: Slug
     cluster: NonEmptyStr
     weight: int = Field(default=5, ge=0)
-    area: list[int] | None = None
-    experience: list[str] | None = None
-    employment: str | None = None
-    schedule: str | None = None
-    period: int | None = Field(default=None, ge=0, le=30)
+    # Верхняя граница — вежливость, а не вкус: одна страница это один
+    # запрос к hh.ru, и опечатка `pages: 500` превращает прогон в обстрел.
+    pages: int = Field(default=1, ge=1, le=20)
 
 
 class QueriesConfig(Base):
-    defaults: QueryDefaults = QueryDefaults()
     queries: list[QuerySpec] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def apply_defaults(self) -> "QueriesConfig":
-        for query in self.queries:
-            for field in ("experience", "employment", "schedule", "period"):
-                if getattr(query, field) is None:
-                    value = getattr(self.defaults, field)
-                    # Копия, а не общий объект: иначе правка списка у одного
-                    # запроса меняла бы его у всех остальных и у самих defaults.
-                    setattr(query, field, list(value) if isinstance(value, list) else value)
-        return self
 
 
 class Config(Base):

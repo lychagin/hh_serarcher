@@ -67,6 +67,24 @@ def ids_with_status(db_path: str, status: str) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
+def _indexes_of_vacancy(db_path: str) -> set[str]:
+    """Явно созданные индексы, принадлежащие именно таблице `vacancy`.
+
+    Имя индекса в SQLite глобально, а `tbl_name` показывает владельца,
+    поэтому индекс, уехавший вместе с отодвинутой при миграции таблицей,
+    здесь не появится, даже если он ещё существует в базе. Автоиндексы
+    первичного ключа отфильтрованы по `sql IS NULL`: они не создавались
+    схемой и не могут быть потеряны.
+    """
+    raw = sqlite3.connect(db_path)
+    rows = raw.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'index' AND tbl_name = 'vacancy' AND sql IS NOT NULL"
+    ).fetchall()
+    raw.close()
+    return {str(row[0]) for row in rows}
+
+
 def test_add_discovered_reports_new_only_once(repo: SqliteRepository) -> None:
     assert repo.add_discovered(make_vacancy(), "embedded", 9) is True
     assert repo.add_discovered(make_vacancy(), "embedded", 9) is False
@@ -1190,6 +1208,198 @@ def test_migration_backfills_primary_query_and_run_counters(tmp_path: object) ->
     row = raw.execute("SELECT rescored, stuck FROM run WHERE id = ?", (run_id,)).fetchone()
     raw.close()
     assert (row[0], row[1]) == (1, 2)
+
+
+# --- Раунд переезда discovery на листинг ---------------------------------
+
+
+def make_listed(vacancy_id: str = "1", query: str = "programmist") -> DiscoveredVacancy:
+    """Ровно то, что даёт листинг /vacancies/{slug}: id, url, заголовок.
+
+    Ни компании, ни региона, ни зарплаты, ни даты публикации — всё это
+    приходит только со страницы вакансии, на шаге обогащения.
+    """
+    return DiscoveredVacancy(
+        id=vacancy_id,
+        url=f"https://hh.ru/vacancy/{vacancy_id}",
+        title=f"Вакансия {vacancy_id}",
+        found_by_query=query,
+    )
+
+
+def enriched_details() -> VacancyDetails:
+    """То, что реально приносит живая страница вакансии (см. test_vacancy_page)."""
+    return VacancyDetails(
+        description="Требуется Yocto",
+        published_at=datetime(2026, 7, 27, 19, 27, 20, tzinfo=UTC),
+        valid_through=datetime(2026, 8, 5, 19, 27, 20, tzinfo=UTC),
+        company="Альтео Софт",
+        area="Москва",
+        salary=Salary(
+            raw="от 100 000 до 150 000 ₽ за месяц на руки",
+            amount_from=100000,
+            amount_to=150000,
+            currency="₽",
+        ),
+    )
+
+
+def test_vacancy_without_published_at_is_stored_and_ordered_by_first_seen(
+    tmp_path: object,
+) -> None:
+    """Листинг не отдаёт даты публикации, поэтому между discovery и
+    обогащением published_at — NULL. Сортировка `ORDER BY published_at`
+    ставила такие строки в непредсказуемое место (в SQLite NULL меньше
+    любого значения, и при DESC они уезжали в хвост очереди), а с NOT NULL
+    в схеме вставка вообще не проходила. Падаем на first_seen_at."""
+    db_path = str(tmp_path) + "/listing.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    for vacancy_id in ("1", "2", "3"):
+        assert repository.add_discovered(make_listed(vacancy_id), "dev", 5) is True
+    # first_seen_at ставится репозиторием «сейчас»; задаём его явно, чтобы
+    # порядок проверялся детерминированно, а не гонкой микросекунд
+    for vacancy_id, seen in (("1", "01"), ("2", "03"), ("3", "02")):
+        corrupt(
+            db_path,
+            "UPDATE vacancy SET first_seen_at = ? WHERE id = ?",
+            f"2026-07-{seen}T00:00:00+00:00",
+            vacancy_id,
+        )
+
+    pending = repository.pending_enrichment(max_attempts=3)
+    assert [v.id for v in pending] == ["2", "3", "1"], "свежайшая по first_seen_at — первой"
+    assert all(v.published_at is None for v in pending)
+    assert read_column(db_path, "published_at", "1") is None
+    repository.close()
+
+
+def test_save_enriched_stores_every_field_the_page_brought(repo: SqliteRepository) -> None:
+    """Компания, регион, зарплата и обе даты приходят ОДНОЙ страницей и
+    обязаны сохраняться тем же оператором, что описание и оценка: они
+    оплачены одним запросом к hh.ru, разъехаться им нечем."""
+    repo.add_discovered(make_listed("1"), "embedded", 9)
+    repo.save_enriched("1", enriched_details(), make_score())
+
+    scored = repo.unreported()
+    assert len(scored) == 1
+    discovered = scored[0].discovered
+    assert discovered.company == "Альтео Софт"
+    assert discovered.area == "Москва"
+    assert (discovered.salary.amount_from, discovered.salary.amount_to) == (100000, 150000)
+    assert discovered.salary.currency == "₽"
+    assert discovered.published_at == datetime(2026, 7, 27, 19, 27, 20, tzinfo=UTC)
+    assert scored[0].details.valid_through == datetime(2026, 8, 5, 19, 27, 20, tzinfo=UTC)
+
+
+def test_page_fields_survive_a_score_that_cannot_be_serialized(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Продолжение A-I2 для полей, приехавших с переездом: отказ чисто
+    локальной сериализации оценки не имеет права выбрасывать компанию и
+    зарплату — за них заплачено тем же единственным запросом, что и за
+    описание."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_listed("1"), "embedded", 9)
+
+    def broken_dump(*_args: object, **_kwargs: object) -> str:
+        raise ValueError("оценка не сериализуется")
+
+    monkeypatch.setattr(ScoreBreakdown, "model_dump_json", broken_dump)
+    with pytest.raises(ValueError, match="не сериализуется"):
+        repository.save_enriched("1", enriched_details(), make_score())
+    monkeypatch.undo()
+
+    assert read_column(db_path, "company", "1") == "Альтео Софт"
+    assert read_column(db_path, "salary_from", "1") == 100000
+    assert read_column(db_path, "score_detail", "1") is None
+    assert repository.pending_enrichment(max_attempts=3) == [], "в сеть за страницей не идём"
+    repository.close()
+
+
+def test_enrichment_fills_but_never_erases_what_discovery_already_knew(
+    repo: SqliteRepository,
+) -> None:
+    """«Зарплата не указана» — самый обычный ответ страницы, и присвоение
+    NULL затирало бы значение, добытое раньше. У баз, мигрировавших с RSS,
+    company/area/salary/published_at заполнены ещё на discovery: обесценить
+    их отсутствием блока на странице значит потерять данные без всякой
+    ошибки. Перекачки не бывает, поэтому «залипнуть» тут нечему."""
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)  # RSS-эпоха: всё заполнено
+    repo.save_enriched("1", VacancyDetails(description="Требуется Yocto"), make_score())
+
+    discovered = repo.unreported()[0].discovered
+    assert discovered.salary.amount_from == 200000
+    assert discovered.company == "ООО Ромашка"
+    assert discovered.area == "Нижний Новгород"
+    assert discovered.published_at == datetime(2026, 7, 27, 9, 0, tzinfo=UTC)
+
+
+def test_migration_makes_published_at_nullable_without_losing_rows(tmp_path: object) -> None:
+    """Схема первого поколения объявляла published_at NOT NULL: RSS отдавал
+    дату сразу. Листинг её не отдаёт, поэтому вставка новой вакансии в
+    непереехавшую базу падала бы с IntegrityError на каждом прогоне.
+    SQLite не умеет ослаблять ограничение через ALTER TABLE, значит
+    таблица перестраивается — и обязана донести все строки, значения,
+    внешние ключи и индексы."""
+    db_path = str(tmp_path) + "/old.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(FIRST_GENERATION_SCHEMA)
+    raw.executescript(
+        "CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);"
+    )
+    raw.execute(
+        "INSERT INTO vacancy (id, url, title, company, area, salary_raw, salary_from, "
+        "published_at, status, first_seen_at, cluster, cluster_weight) "
+        "VALUES ('1', 'https://hh.ru/vacancy/1', 'Старая вакансия', 'ООО Ромашка', "
+        "'Нижний Новгород', 'от 200 000 руб.', 200000, '2026-07-27T09:00:00+00:00', "
+        "'new', '2026-07-20T09:00:00+00:00', 'embedded', 9)"
+    )
+    raw.execute("INSERT INTO vacancy_query (vacancy_id, query) VALUES ('1', 'Yocto')")
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+
+    # 0. ПЕРВЫЙ же старт обязан оставить базу полностью исправной. Проверка
+    #    идёт до повторных вызовов сознательно: индекс, уехавший с
+    #    отодвинутой таблицей, восстанавливался бы вторым init_schema, и
+    #    потеря была бы не видна — при том что весь первый прогон сервиса
+    #    шёл бы по vacancy без индекса.
+    assert _indexes_of_vacancy(db_path) >= {"idx_vacancy_status"}
+
+    # 1. старая строка цела во всех своих значениях
+    old = repository.pending_enrichment(max_attempts=3)[0]
+    assert old.id == "1"
+    assert old.company == "ООО Ромашка"
+    assert old.area == "Нижний Новгород"
+    assert old.salary.amount_from == 200000
+    assert old.published_at == datetime(2026, 7, 27, 9, 0, tzinfo=UTC)
+    assert old.found_by_query == "Yocto", "бэкфилл primary_query пережил перестроение"
+
+    # 2. а новая, найденная листингом и БЕЗ даты публикации, теперь ложится
+    assert repository.add_discovered(make_listed("2"), "dev", 5) is True
+    assert {v.id for v in repository.pending_enrichment(max_attempts=3)} == {"1", "2"}
+    repository.close()
+
+    # 3. ограничение снято, внешний ключ цел, индекс не потерян вместе с
+    #    отодвинутой таблицей, временной таблицы не осталось
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    notnull = {r["name"]: r["notnull"] for r in raw.execute("PRAGMA table_info(vacancy)")}
+    assert notnull["published_at"] == 0
+    assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+    indexes = {r[0] for r in raw.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='vacancy'"
+    )}
+    assert "idx_vacancy_status" in indexes, "индекс уехал с отодвинутой таблицей"
+    tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert not any(name.startswith("vacancy_before") for name in tables)
+    assert raw.execute("SELECT query FROM vacancy_query").fetchall()[0][0] == "Yocto"
+    raw.close()
 
 
 def test_added_columns_cover_every_column_of_the_current_schema() -> None:

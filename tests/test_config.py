@@ -39,14 +39,11 @@ report_threshold: 60
 """
 
 QUERIES_YAML = """
-defaults:
-  experience: [between3And6, moreThan6]
-  employment: full
 queries:
-  - text: "Yocto"
+  - slug: programmist
     cluster: embedded
     weight: 9
-    area: [66]
+    pages: 2
 """
 
 
@@ -62,8 +59,7 @@ def test_loads_all_three_files(tmp_path: Path) -> None:
     cfg = load_config(write_config(tmp_path))
     assert cfg.app.schedule.interval_hours == 4
     assert cfg.profile.weights.stack == 0.30
-    assert cfg.queries.queries[0].text == "Yocto"
-    assert cfg.queries.queries[0].area == [66]
+    assert cfg.queries.queries[0].slug == "programmist"
 
 
 def test_user_agent_gets_contact_email_substituted(tmp_path: Path) -> None:
@@ -83,11 +79,14 @@ def test_weights_must_sum_to_one(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, **{"profile.yaml": broken}))
 
 
-def test_query_inherits_defaults(tmp_path: Path) -> None:
-    cfg = load_config(write_config(tmp_path))
-    query = cfg.queries.queries[0]
-    assert query.experience == ["between3And6", "moreThan6"]
-    assert query.employment == "full"
+def test_query_describes_a_listing_slug(tmp_path: Path) -> None:
+    query = load_config(write_config(tmp_path)).queries.queries[0]
+    assert (query.slug, query.cluster, query.weight, query.pages) == (
+        "programmist",
+        "embedded",
+        9,
+        2,
+    )
 
 
 # --- Раунд исправлений 3: опечатка в ЗНАЧЕНИИ так же опасна, как в имени ----
@@ -133,12 +132,13 @@ WEIGHTS_LINE = "weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, doma
         ("profile.yaml", "stack: [yocto]", 'stack: ["   "]'),
         ("profile.yaml", "negative: [junior]", 'negative: [junior, ""]'),
         ("profile.yaml", "title_roles: [team lead]", 'title_roles: [""]'),
-        # Пустой текст запроса — запрос «обо всём».
-        ("queries.yaml", 'text: "Yocto"', 'text: ""'),
+        # Пустой slug превращает URL листинга в общий индекс /vacancies.
+        ("queries.yaml", "slug: programmist", 'slug: ""'),
         ("queries.yaml", "weight: 9", "weight: -1"),
-        ("queries.yaml", "weight: 9", "weight: 9\n    period: 31"),
-        ("queries.yaml", "weight: 9", "weight: 9\n    period: -1"),
-        ("queries.yaml", "employment: full", "employment: full\n  period: 60"),
+        # pages: 0 — запрос, не скачивающий ни одной страницы; верхняя
+        # граница ограничивает обстрел hh.ru опечаткой в одну цифру.
+        ("queries.yaml", "pages: 2", "pages: 0"),
+        ("queries.yaml", "pages: 2", "pages: 21"),
     ],
 )
 def test_out_of_range_value_is_rejected(
@@ -178,22 +178,57 @@ def test_duplicate_key_in_signals_is_rejected(tmp_path: Path) -> None:
 
 
 TWO_QUERIES_YAML = """
-defaults:
-  experience: [between3And6, moreThan6]
-  employment: full
 queries:
-  - text: "Yocto"
+  - slug: programmist
     cluster: embedded
     weight: 9
-  - text: "Buildroot"
-    cluster: embedded
+  - slug: devops
+    cluster: infra
     weight: 8
 """
 
 
-def test_defaults_are_copied_not_shared_between_queries(tmp_path: Path) -> None:
+def test_pages_defaults_to_one(tmp_path: Path) -> None:
     cfg = load_config(write_config(tmp_path, **{"queries.yaml": TWO_QUERIES_YAML}))
-    first, second = cfg.queries.queries
-    assert first.experience == second.experience == ["between3And6", "moreThan6"]
-    assert first.experience is not second.experience
-    assert first.experience is not cfg.queries.defaults.experience
+    assert [q.slug for q in cfg.queries.queries] == ["programmist", "devops"]
+    assert all(q.pages == 1 for q in cfg.queries.queries)
+
+
+# --- Раунд переезда discovery на листинг ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("slug", "case"),
+    [
+        ("programmist?area=66", "query-строка"),
+        ("programmist&page=1", "склейка параметров"),
+        ("programmist/../search/vacancy", "выход из сегмента пути"),
+        ("programmist#anchor", "фрагмент"),
+        ("%3Fprogrammist", "процентное кодирование"),
+        ("prog rammist", "пробел внутри"),
+        (" programmist", "пробел в начале"),
+    ],
+)
+def test_slug_that_is_not_a_single_path_segment_is_rejected(
+    tmp_path: Path, slug: str, case: str
+) -> None:
+    """Slug подставляется в `/vacancies/{slug}`, а живой robots.txt hh.ru
+    запрещает правилом `Disallow: *?*` любой URL с query-строкой. Slug,
+    протаскивающий в путь `?`, `&`, `/` или `#`, обходил бы не матчер
+    robots (он-то такой URL поймает), а саму договорённость, ради которой
+    discovery и переехал с RSS на листинг."""
+    body = QUERIES_YAML.replace("slug: programmist", f'slug: "{slug}"')
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, **{"queries.yaml": body}))
+
+
+def test_parameters_of_the_forbidden_rss_search_are_no_longer_accepted(
+    tmp_path: Path,
+) -> None:
+    """Поля RSS (text/area/experience/employment/schedule/period) листинг не
+    поддерживает: любое из них стало бы query-строкой. Молча игнорировать
+    их нельзя — пользователь остался бы с конфигом, который описывает
+    фильтрацию, которой на самом деле нет."""
+    body = QUERIES_YAML.replace("pages: 2", "pages: 2\n    area: [66]")
+    with pytest.raises(ValidationError):
+        load_config(write_config(tmp_path, **{"queries.yaml": body}))

@@ -4,9 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from hh_search.config.models import QuerySpec
 from hh_search.errors import FetchFailed
-from hh_search.sources.rss import build_rss_url, parse_feed, parse_salary
+from hh_search.sources.rss import RssQuery, build_rss_url, parse_feed, parse_salary
 
 FIXTURE = Path(__file__).parent / "fixtures" / "rss_yocto.xml"
 
@@ -257,9 +256,8 @@ def test_parse_feed_accepts_genuinely_empty_feed() -> None:
 
 def test_build_rss_url_includes_filters_and_date_ordering() -> None:
     url = build_rss_url(
-        QuerySpec(
+        RssQuery(
             text="Backend Team Lead",
-            cluster="backend",
             area=[66],
             experience=["between3And6", "moreThan6"],
             employment="full",
@@ -275,6 +273,6 @@ def test_build_rss_url_includes_filters_and_date_ordering() -> None:
 
 
 def test_build_rss_url_omits_unset_filters() -> None:
-    url = build_rss_url(QuerySpec(text="Yocto", cluster="embedded"))
+    url = build_rss_url(RssQuery(text="Yocto"))
     assert "area=" not in url
     assert "schedule=" not in url

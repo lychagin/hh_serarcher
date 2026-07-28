@@ -1,10 +1,10 @@
-"""Накатывание недостающих колонок на уже существующую базу.
+"""Догоняющая миграция уже существующей базы до актуальной схемы.
 
-`init_schema()` — это `CREATE TABLE IF NOT EXISTS`: на базе, созданной
-предыдущей версией сервиса, он не делает ровно ничего, новые колонки не
-появляются, и первая же выборка падает с `no such column`. Путь к базе
-персистентный (том Docker на VPS), `init_schema()` вызывается при старте,
-то есть без миграции обновление сервиса означает мёртвый сервис.
+`CREATE TABLE IF NOT EXISTS` на базе, созданной предыдущей версией
+сервиса, не делает ровно ничего: новые колонки не появляются, и первая же
+выборка падает с `no such column`. Путь к базе персистентный (том Docker
+на VPS), схема применяется при старте — то есть без миграции обновление
+сервиса означает мёртвый сервис.
 
 Механизм выбран самый скучный из возможных: спросить у SQLite, какие
 колонки есть (`PRAGMA table_info`), и добавить недостающие
@@ -12,6 +12,14 @@
 состояния и одинаково работает с базой любого прошлого поколения — в
 отличие от `PRAGMA user_version`, который во всех уже выпущенных базах
 равен нулю независимо от их реального возраста.
+
+Одно изменение через ADD COLUMN невыразимо: снятие NOT NULL с колонки
+`published_at`. SQLite не умеет ослаблять ограничение существующей
+колонки, а после переезда discovery на листинг дата публикации на момент
+вставки строки неизвестна. Для этого случая ниже есть перестроение
+таблицы — тоже без собственного знания о схеме: старая таблица
+отодвигается в сторону, актуальную создаёт сам `schema.sql`, строки
+переливаются по пересечению колонок.
 """
 
 import sqlite3
@@ -24,6 +32,7 @@ import sqlite3
 ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("vacancy", "primary_query", "TEXT NOT NULL DEFAULT ''"),
     ("vacancy", "corrupt_payload", "BLOB"),
+    ("vacancy", "valid_through", "TEXT"),
     ("vacancy_query", "weight", "INTEGER NOT NULL DEFAULT 0"),
     ("run", "rescored", "INTEGER DEFAULT 0"),
     ("run", "stuck", "INTEGER DEFAULT 0"),
@@ -45,8 +54,23 @@ WHERE primary_query = ''
   AND EXISTS (SELECT 1 FROM vacancy_query vq WHERE vq.vacancy_id = vacancy.id)
 """
 
+# Временное имя отодвинутой таблицы. Живёт ровно внутри одного вызова
+# `apply_schema`, но названо так, чтобы упавший посреди миграции процесс
+# оставлял после себя очевидную улику, а не загадку.
+_LEGACY_VACANCY = "vacancy_before_nullable_published_at"
 
-def migrate(connection: sqlite3.Connection) -> None:
+
+def apply_schema(connection: sqlite3.Connection, schema_sql: str) -> None:
+    """Создать схему и догнать до неё уже существующую базу.
+
+    Порядок значим: устаревшую таблицу надо отодвинуть ДО того, как
+    `schema.sql` создаст актуальную, иначе `CREATE TABLE IF NOT EXISTS`
+    увидит старую и не сделает ничего.
+    """
+    detached = _detach_vacancy_with_not_null_published_at(connection)
+    connection.executescript(schema_sql)
+    if detached:
+        _refill_from_legacy(connection)
     for table, column, definition in ADDED_COLUMNS:
         if column not in _columns(connection, table):
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -54,8 +78,80 @@ def migrate(connection: sqlite3.Connection) -> None:
     # находит их и не делает ничего. Выполняется после ALTER — на этот
     # момент обе участвующие колонки заведомо существуют.
     connection.execute(_BACKFILL_PRIMARY_QUERY)
+    connection.commit()
+
+
+def _detach_vacancy_with_not_null_published_at(connection: sqlite3.Connection) -> bool:
+    """Отодвинуть таблицу `vacancy`, если у неё published_at ещё NOT NULL.
+
+    `legacy_alter_table=ON` обязателен: без него SQLite переписал бы
+    `REFERENCES vacancy(id)` в таблице vacancy_query на новое имя, и
+    внешний ключ после миграции указывал бы на временную таблицу,
+    которой через три оператора не станет.
+
+    Индексы переезжают вместе с таблицей и потому сносятся явно: имя
+    индекса в SQLite глобально, поэтому `CREATE INDEX IF NOT EXISTS` из
+    schema.sql увидел бы уцелевший старый индекс, не создал бы новый — и
+    после удаления отодвинутой таблицы актуальная осталась бы без индекса.
+    """
+    if "vacancy" not in _tables(connection):
+        return False
+    if not _is_not_null(connection, "vacancy", "published_at"):
+        return False
+    connection.commit()  # PRAGMA ниже игнорируется внутри транзакции
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("PRAGMA legacy_alter_table=ON")
+    for index in _indexes_of(connection, "vacancy"):
+        connection.execute(f"DROP INDEX {index}")
+    connection.execute(f"ALTER TABLE vacancy RENAME TO {_LEGACY_VACANCY}")
+    connection.execute("PRAGMA legacy_alter_table=OFF")
+    return True
+
+
+def _refill_from_legacy(connection: sqlite3.Connection) -> None:
+    """Перелить строки в свежесозданную `vacancy` и убрать отодвинутую.
+
+    Колонки берутся по пересечению: собственного знания о схеме здесь
+    нет, поэтому список нечему разойтись с `schema.sql`. Колонки, которых
+    в старой базе не было, останутся при своих DEFAULT — их дозаполняет
+    обычный проход ADD COLUMN и бэкфилл.
+    """
+    shared = sorted(_columns(connection, _LEGACY_VACANCY) & _columns(connection, "vacancy"))
+    columns = ", ".join(shared)  # имена пришли из PRAGMA, не из внешних данных
+    connection.execute(
+        f"INSERT INTO vacancy ({columns}) SELECT {columns} FROM {_LEGACY_VACANCY}"
+    )
+    connection.execute(f"DROP TABLE {_LEGACY_VACANCY}")
+    broken = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if broken:  # pragma: no cover - перелив идёт по первичному ключу один в один
+        raise RuntimeError(f"миграция vacancy порвала внешние ключи: {broken!r}")
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=ON")
+
+
+def _tables(connection: sqlite3.Connection) -> set[str]:
+    rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def _indexes_of(connection: sqlite3.Connection, table: str) -> list[str]:
+    """Только явно созданные индексы: у автоиндексов первичного ключа
+    `sql IS NULL`, и удалить их нельзя (да и не нужно — они уедут с таблицей)."""
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? "
+        "AND sql IS NOT NULL",
+        (table,),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def _is_not_null(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    for row in connection.execute(f"PRAGMA table_info({table})").fetchall():
+        if str(row[1]) == column:
+            return bool(row[3])
+    return False
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-    return {str(row["name"]) for row in rows}
+    return {str(row[1]) for row in rows}

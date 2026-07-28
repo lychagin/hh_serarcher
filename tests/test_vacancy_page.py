@@ -1,21 +1,34 @@
 import gzip
+import logging
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from hh_search.errors import FetchFailed
 from hh_search.sources.vacancy_page import (
+    SalaryBlockStats,
     extract_job_posting,
+    extract_salary,
     html_to_text,
     parse_vacancy_page,
     vacancy_url,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "vacancy.html.gz"
+# Живая страница вакансии С УКАЗАННОЙ зарплатой. Нужна отдельно: у
+# основной фикстуры зарплата не указана, и на ней невозможно отличить
+# «блока нет» от «блок не разбирается».
+SALARY_FIXTURE = Path(__file__).parent / "fixtures" / "vacancy_salary.html.gz"
 
 
 def load_fixture() -> str:
     with gzip.open(FIXTURE, "rt", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def load_salary_fixture() -> str:
+    with gzip.open(SALARY_FIXTURE, "rt", encoding="utf-8") as handle:
         return handle.read()
 
 
@@ -99,3 +112,75 @@ def test_parse_vacancy_page_raises_when_description_key_is_absent() -> None:
     html = '<script type="application/ld+json">{"@type": "JobPosting"}</script>'
     with pytest.raises(FetchFailed, match="description"):
         parse_vacancy_page(html)
+
+
+# --- Раунд переезда discovery на листинг ---------------------------------
+#
+# Листинг /vacancies/{slug} отдаёт только id, url и заголовок, поэтому
+# страница вакансии стала ЕДИНСТВЕННЫМ источником компании, региона,
+# зарплаты и даты публикации. Раньше всё это приходило из RSS.
+
+
+def test_parse_vacancy_page_extracts_company_area_and_dates() -> None:
+    """Живая страница: всё, что раньше давал RSS, кроме зарплаты, лежит в JSON-LD."""
+    details = parse_vacancy_page(load_fixture())
+    assert details.company == "Кадровый центр «ПРЕЗИДЕНТ»"
+    assert details.area == "Москва"
+    assert isinstance(details.published_at, datetime)
+    assert isinstance(details.valid_through, datetime)
+    assert details.published_at < details.valid_through
+
+
+def test_parse_vacancy_page_extracts_salary_from_markup() -> None:
+    """Зарплаты в JSON-LD нет: `baseSalary` у hh.ru всегда null, даже когда
+    зарплата указана. Единственный источник — разметка, и формат строки там
+    тот же, что приходил из RSS, поэтому её разбирает тот же parse_salary."""
+    posting = extract_job_posting(load_salary_fixture())
+    assert posting is not None and not posting.get("baseSalary")
+    details = parse_vacancy_page(load_salary_fixture())
+    assert details.salary.amount_from == 100000
+    assert details.salary.amount_to == 150000
+    assert details.salary.currency == "₽"
+    assert details.salary.raw is not None and details.salary.raw.startswith("от 100 000")
+
+
+def test_page_without_salary_block_is_not_a_failure() -> None:
+    """«Зарплата не указана» — законный ответ источника, а не поломка."""
+    assert extract_salary(load_fixture()) is None
+    details = parse_vacancy_page(load_fixture())
+    assert details.salary.amount_from is None
+    assert details.description, "остальной разбор при этом обязан работать"
+
+
+def test_salary_stats_warn_when_the_attribute_seems_to_have_drifted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """По одной странице дрейф `data-qa` неотличим от «зарплата не указана».
+    Виден он только в агрегате: прогон, где блок не нашёлся НИ РАЗУ, почти
+    наверняка означает переименованный атрибут, а не рынок без зарплат."""
+    stats = SalaryBlockStats()
+    for _ in range(3):
+        parse_vacancy_page(load_fixture(), stats)
+    assert (stats.pages, stats.without_salary) == (3, 3)
+    with caplog.at_level(logging.WARNING):
+        stats.log_summary()
+    assert "vacancy-salary" in caplog.text
+
+
+def test_salary_stats_stay_quiet_when_some_pages_do_have_salary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stats = SalaryBlockStats()
+    parse_vacancy_page(load_fixture(), stats)
+    parse_vacancy_page(load_salary_fixture(), stats)
+    assert (stats.pages, stats.without_salary) == (2, 1)
+    with caplog.at_level(logging.WARNING):
+        stats.log_summary()
+    assert caplog.text == "", "атрибут на месте — тревожить не о чем"
+
+
+def test_extract_salary_ignores_a_renamed_attribute() -> None:
+    """Сторож самой регулярки: она обязана держаться за конкретный data-qa,
+    а не хватать первую попавшуюся сумму со страницы."""
+    html = '<div data-qa="vacancy-compensation">от 250 000 ₽</div>'
+    assert extract_salary(html) is None
