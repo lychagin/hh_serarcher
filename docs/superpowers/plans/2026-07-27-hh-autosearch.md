@@ -32,19 +32,31 @@
 | `hh_search/config/loader.py` | Чтение и валидация конфига | 1 |
 | `hh_search/filtering/matching.py` | Нормализация текста, сопоставление сигналов | 2 |
 | `hh_search/domain/models.py` | Доменные модели | 3 |
-| `hh_search/sources/rss.py` | Сборка URL и разбор RSS | 3 |
+| `hh_search/sources/rss.py` | Разбор RSS; ВЫКЛЮЧЕН запретом robots.txt | 3 |
+| `hh_search/sources/salary.py` | Разбор строки зарплаты | 3 |
 | `hh_search/errors.py` | Типы исключений | 4 |
-| `hh_search/sources/http.py` | Вежливый HTTP-клиент | 4 |
-| `hh_search/sources/vacancy_page.py` | Извлечение JSON-LD | 5 |
+| `hh_search/sources/http.py` | Вежливый HTTP-клиент, матчер robots.txt | 4 |
+| `hh_search/sources/vacancy_page.py` | Извлечение JSON-LD и зарплаты | 5 |
+| `hh_search/sources/listing.py` | Шаг 1: URL листинга и разбор `ItemList` | 5 |
 | `hh_search/storage/schema.sql` | DDL | 6 |
-| `hh_search/storage/repository.py` | Весь SQL | 6 |
+| `hh_search/storage/repository.py` | Весь SQL по `vacancy`, три очереди | 6 |
+| `hh_search/storage/run_log.py` | Журнал прогонов и HTTP-кэш | 6 |
+| `hh_search/storage/mappers.py` | `sqlite3.Row` → доменные модели | 6 |
+| `hh_search/storage/quarantine.py` | Два вида порчи данных и их лечение | 6 |
+| `hh_search/storage/migrations.py` | Догоняющая миграция базы | 6 |
+| `hh_search/storage/time_utils.py` | Нормализация дат к aware UTC | 6 |
 | `hh_search/filtering/prefilter.py` | Дешёвый отсев по заголовку | 7 |
 | `hh_search/scoring/base.py` | Протокол `Scorer` | 8 |
 | `hh_search/scoring/keyword.py` | Keyword-скоринг | 8 |
 | `hh_search/sinks/base.py` | Протокол `Sink` | 9 |
 | `hh_search/sinks/csv_sink.py` | CSV-отчёт | 9 |
 | `hh_search/sinks/markdown_sink.py` | Markdown-отчёт | 9 |
-| `hh_search/pipeline.py` | Оркестрация семи шагов | 10 |
+| `hh_search/sinks/__init__.py` | Фабрика `build_sinks` | 9 |
+| `hh_search/pipeline/__init__.py` | `run_once`: порядок семи шагов и журнал | 10 |
+| `hh_search/pipeline/stats.py` | Счётчики прогона, статус, коды возврата | 10 |
+| `hh_search/pipeline/discovery.py` | Шаги 1–3: листинги, дедуп, префильтр | 10 |
+| `hh_search/pipeline/enrichment.py` | Шаги 4–6: страница, оценка, пересчёт | 10 |
+| `hh_search/pipeline/reporting.py` | Шаг 7: отправка в приёмники | 10 |
 | `hh_search/logging_setup.py` | Логи в stdout + файл с ротацией | 11 |
 | `hh_search/scheduler.py` | Цикл режима `serve` | 11 |
 | `hh_search/__main__.py` | CLI | 11 |
@@ -3176,30 +3188,155 @@ git commit -m "feat: отчёты в CSV и Markdown
 ### Task 10: Конвейер
 
 **Files:**
-- Create: `hh_search/pipeline.py`
+- Create: `hh_search/pipeline/__init__.py`, `hh_search/pipeline/stats.py`,
+  `hh_search/pipeline/discovery.py`, `hh_search/pipeline/enrichment.py`,
+  `hh_search/pipeline/reporting.py`
+- Edit: `hh_search/storage/repository.py`, `hh_search/storage/run_log.py` (одна правка подписи,
+  см. шаг 1)
 - Test: `tests/test_pipeline.py`
 
 **Interfaces:**
 - Consumes: всё из задач 1–9
-- Produces: `class RunStats` (pydantic: `discovered: int`, `new_count: int`, `rejected: int`, `enriched: int`, `reported: int`, `status: str`, `error: str | None`); `run_once(config: Config, client: PoliteClient, repo: SqliteRepository, scorer: Scorer, sinks: Sequence[Sink], now: datetime | None = None) -> RunStats`
+- Produces: `class RunStats` (pydantic: `discovered`, `new_count`, `rejected`, `enriched`,
+  `rescored`, `stuck`, `reported`, `status`, `error`; методы `degrade`, `counters`, `exit_code`);
+  `RunCounters` (TypedDict полей таблицы `run`); константы `OK`/`PARTIAL`/`FAILED`, `EXIT_CODES`;
+  `run_once(config, client, repo, scorer, sinks, now=None) -> RunStats`
 
-Порядок и правила:
-1. `start_run()`; далее любой `AccessForbidden` → `status="failed"`, конвейер прерывается.
-2. По каждому запросу: `build_rss_url` → `client.get` с условными заголовками из `repo.cache_headers` → при `304` пропуск → `parse_feed`. Сетевая ошибка одного запроса (`FetchFailed`, `RobotsDisallowed`) → `WARNING` и `status="partial"`, остальные запросы продолжаются.
-3. `repo.add_discovered(...)` для каждой вакансии; новыми считаются те, для которых он вернул `True`.
-4. Для каждой новой — `Prefilter.reason_to_reject`; при отказе `repo.mark_rejected`.
-5. `repo.pending_enrichment(max_attempts)` → `client.get(vacancy_url(id))` → `parse_vacancy_page` → `repo.save_details`. Ошибка → `repo.bump_enrich_attempt`; если счётчик достиг предела → `repo.mark_rejected(id, "enrich_failed")`. Если попыток было больше нуля и **более половины** провалились → `logger.error` с текстом про вероятную смену вёрстки.
-6. Скоринг всех, у кого есть описание и нет оценки (берём из `repo.unreported()` — там гарантированно есть описание, оценку проставляем сразу после сохранения деталей).
-7. `repo.unreported()` → каждый sink вызывается в `try/except`; при успехе **всех** sink'ов → `repo.mark_reported`. Если хоть один упал — вакансии остаются `new` и уедут следующим прогоном.
-8. `finish_run(...)` со счётчиками.
+**Эта задача переписана целиком.** Прежняя редакция была собрана ревьюером дословно и прогнана
+end-to-end: она вызывала три несуществующих метода хранилища и содержала три независимых пути
+безвозвратной потери данных, все молчаливые. Ниже — что именно изменилось и почему; без этих
+причин код выглядит переусложнённым.
 
-- [ ] **Step 1: Написать падающий интеграционный тест**
+**1. Источник данных другой.** Discovery переехало с RSS на разрешённый листинг
+`/vacancies/{slug}` + `?page=N` (RSS запрещён живым `robots.txt`, правило `Disallow: *?*`).
+Значит: перебор идёт по листингам И страницам (`for page in range(query.pages)`, каждая
+страница — один запрос); `build_rss_url`/`parse_feed` заменяются на
+`build_listing_url`/`parse_listing`; листинг отдаёт только `id`, `url`, `title`, а `company`,
+`area`, `salary`, `published_at`, `valid_through` приходят на шаге обогащения и пишутся тем же
+оператором, что описание и оценка.
+
+**2. Интерфейс хранилища ушёл вперёд на четыре раунда правок Task 6.** Каждая строка ниже
+подтверждена исполнением прежней редакции:
+
+| Что вызывала прежняя редакция | Что в хранилище на самом деле | Чем кончалось |
+|---|---|---|
+| `repo.save_details(id, details)` | метода нет; есть транзакционный `save_enriched(id, details, score)` | `AttributeError` в цикле обогащения ПОСЛЕ скачивания страницы: прогресса нет никогда, нагрузка на hh.ru есть всегда |
+| `repo.save_score(id, score)` вторым вызовом | есть, но для пересчёта БЕЗ описания | пара вызовов теряла транзакционность, между ними жило состояние, невидимое всем выборкам |
+| — (не вызывался) | `pending_scoring()` | вакансии с обнулённой карантином оценкой копились вечно, в отчёт не попадали, статус прогона `ok` |
+| «берём из `unreported()`, там гарантированно есть описание» | `unreported()` требует `description IS NOT NULL AND score_detail IS NOT NULL` | вакансия без оценки не видна ни одной вызываемой выборке |
+| `repo.reported_since(cutoff)` | метода не было (добавляется задачей 11) | команда `report` не компилировалась |
+| `self._to_discovered(row)` | `mappers.to_discovered(row)` + колонки `CAST(... AS BLOB)` | обход карантина и падение всей выборки на одной битой строке |
+| `SELECT v.*` + подзапрос `found_by_query` | `_DISCOVERED_COLUMNS_SQL` + `safe_rows` + колонка `primary_query` | возврат дефекта, на который Task 6 потратил четыре раунда |
+| `bump_enrich_attempt(id)` + `mark_rejected(...)` | `bump_enrich_attempt(id, max_attempts)` — лимит и терминальный статус ОДНИМ UPDATE | плановая последовательность воспроизводила Critical, из-за которого вакансия исчезала из всех очередей |
+| `finish_run(id, st, error=..., **counters)` | `finished_at` третьим позиционным | 3 ошибки mypy плюс латентная коллизия имени счётчика |
+| нет обработки `ParseError` | `parse_listing`/`parse_vacancy_page` бросают `FetchFailed` | тихий ноль вместо громкого отказа |
+| `datetime.now()` наивный | `time_utils` требует aware UTC во всех точках обмена | дата в имени файла отчёта расходится с `reported_at` на сутки |
+
+Появившиеся методы, которых прежняя редакция не знала и которые конвейер обязан использовать:
+`save_description(id, details)` (страница без оценки), `pending_scoring()`, `reset_cache(url)`,
+счётчики прогона `rescored`/`stuck`.
+
+**3. Четыре пути потери данных, закрытые здесь.**
+
+- **Валидатор условного запроса писался ДО разбора выдачи.** Одна обрезанная выдача ослепляла
+  сервис навсегда: `ETag` снимка, который никогда не был прочитан, дальше давал вечный 304.
+  Воспроизводится без всякой аварии — достаточно, чтобы hh.ru один раз ответил обрезанной
+  страницей: прогон 1 `failed`, прогоны 2–4 `{'discovered': 0, 'reported': 0, 'status': 'ok'}`,
+  вакансий в базе ноль, healthcheck зелёный, `docker logs` чист. Лечение: валидатор пишется
+  ПОСЛЕ того, как все вакансии страницы оказались в базе, а при отказе разбора прежний
+  валидатор сбрасывается (`reset_cache`). Это два независимых механизма, и у каждого свой тест.
+- **Временная авария hh.ru навсегда выбрасывала всю очередь.** `FetchFailed` от 503/таймаута и
+  `RobotsDisallowed` от недоступного robots.txt — состояния СЕРВЕРА, а не вакансии, но они жгли
+  `enrich_attempts`. При `interval_hours = 4` и `max_attempts = 3` двенадцати часов
+  недоступности хватало, чтобы очередь ушла в `rejected`/`enrich_failed` терминально
+  (`{'rejected': 20}`), а после подъёма источника `pending_enrichment` оставался пуст. Спека §9
+  для этой строки требует лишь `WARNING` + `partial`. Лечение: транспортный отказ попытку не
+  жжёт, отказ самой страницы (404, нет `JobPosting`, пустое `description`) — жжёт.
+- **Исключение из скоринга роняло прогон и заставляло перекачивать страницу.**
+  `scorer.score(...)` стоял аргументом записи и ничем не был обёрнут: `ZeroDivisionError`
+  (достижимая опечаткой `saturation: 0`) улетала наружу, страниц скачано 1, описаний сохранено
+  0, при перезапуске страница качалась заново. Лечение: исключение ловится, страница пишется
+  через `save_description`, вакансия ждёт в `pending_scoring`.
+- **Прогон отчитывался `ok`, не сделав ничего.** Пустой `ItemList` законен для одной страницы,
+  но не для всего прогона (требование R-I3, оставленное этой задаче); частичный отказ
+  приёмников не понижал статус; статус не влиял на код возврата. Лечение: `RunStats.degrade`,
+  агрегатный сторож тишины со статусом `failed` и код возврата из статуса.
+
+**Порядок и правила (спека §4.1, §5.2, §9).**
+
+1. `build_sinks` вызывается ДО `run_once` и до первого сетевого запроса — контракт задачи 9.
+   `start_run()` открывает журнал; он закрывается при ЛЮБОМ исходе, включая исключение.
+2. Шаг 1: по каждому листингу и каждой его странице `build_listing_url` → `client.get` с
+   условными заголовками из `repo.cache_headers` → `304` пропуск → `parse_listing` →
+   `add_discovered` → **и только теперь** `save_cache_headers`. Транспортный отказ одной
+   страницы: `WARNING`, `partial`, остальные продолжаются.
+3. Шаг 2 (дедупликация) — внутри `add_discovered`: новыми считаются те, для которых он вернул
+   `True`.
+4. Шаг 3: `Prefilter.reason_to_reject` по всей очереди `pending_enrichment`, а не только по
+   найденному сейчас — отсев локальный, и правка `negative` обязана достать бэклог.
+5. Шаг 4–5: `pending_enrichment(max_attempts)` → `client.get(vacancy_url(id))` →
+   `parse_vacancy_page(text, salary_stats)` → `scorer.score` → `save_enriched`. Транспортный
+   отказ и отказ страницы разведены (см. выше). Отказ оценки → `save_description`. Больше
+   половины провалов → громкая тревога, отдельная для вёрстки и отдельная для недоступности.
+6. Шаг 6–7: `rescore` → `unreported()` **дважды** (карантин срабатывает внутри чтения, поэтому
+   лечение должно занимать один прогон, а не два), потом остаток очереди пересчёта
+   перепроверяется и при непустом — `logger.error` со списком id, `stuck` в журнал, статус
+   `partial`. Затем каждый приёмник в `try/except`; `mark_reported` только при успехе ВСЕХ.
+7. `finish_run(...)` со статусом и счётчиками.
+
+**Почему `pipeline.py` стал пакетом.** Замер: пять модулей, 646 строк всего, 386 строк кода —
+одним файлом это вдвое больше ориентира. Разбито по шагам, а не по строкам: `discovery.py`
+(шаги 1–3), `enrichment.py` (4–6), `reporting.py` (7), `stats.py` (счётчики и статус),
+`__init__.py` (только `run_once`: порядок шагов и журнал, 58 строк кода). Инвариант «порядок
+шагов значим» от разбиения не размазывается — он целиком живёт в `run_once`, который стал
+короче и читается за один экран.
+
+- [ ] **Step 1: Правка Task 6 — `finished_at` только по имени**
+
+`finish_run` принимает счётчики через `**counters`, а `finished_at` стоял третьим позиционным
+параметром: значение счётчика, переданное позиционно, молча уезжало в дату завершения, а имя
+счётчика при этом отбрасывалось белым списком — ошибка тихая с двух сторон. В
+`hh_search/storage/run_log.py` и `hh_search/storage/repository.py` добавить `*` перед
+`finished_at` (все существующие вызовы уже передают его по имени, тесты не меняются):
+
+```python
+    def finish_run(
+        self,
+        run_id: int,
+        status: str,
+        *,
+        finished_at: datetime | None = None,
+        **counters: int | str | None,
+    ) -> None:
+```
+
+В `repository.py` делегат вызывает `run_log` тоже по имени:
+`self._run_log.finish_run(run_id, status, finished_at=finished_at, **counters)`.
+
+**Одного `*` мало, и это проверено исполнением.** `mypy --strict` на
+`repo.finish_run(run_id, status, **stats.counters())` продолжает давать три ошибки
+`Argument 3 ... has incompatible type "**dict[str, int | str | None]"; expected
+"datetime | None"`: распаковку словаря с размытым типом значений mypy сверяет с КАЖДЫМ
+именованным параметром, включая `finished_at`, и ключевое-только положение этого не меняет.
+Поэтому `RunStats.counters()` возвращает `TypedDict` (см. `stats.py`): у него набор ключей
+известен, проверка идёт по именам, а имя счётчика перестаёт быть строкой, которую можно
+опечатать.
+
+Run: `uv run mypy --strict hh_search && uv run pytest tests/test_repository.py -q`
+Expected: `Success: no issues found`, `56 passed` (тесты хранилища не менялись: все
+существующие вызовы уже передают `finished_at` по имени)
+
+- [ ] **Step 2: Написать падающий тест**
 
 Создать `tests/test_pipeline.py`:
 
 ```python
+import gzip
+import json
+import logging
+import sqlite3
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -3208,55 +3345,112 @@ import respx
 
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
-from hh_search.domain.models import ScoredVacancy
+from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, ScoredVacancy, VacancyDetails
 from hh_search.errors import AccessForbidden
-from hh_search.pipeline import run_once
+from hh_search.pipeline import RunStats, run_once
+from hh_search.pipeline.stats import RunCounters
+from hh_search.scoring.base import Scorer
 from hh_search.scoring.keyword import KeywordScorer
+from hh_search.sinks.base import Sink
 from hh_search.sources.http import PoliteClient
 from hh_search.storage.repository import SqliteRepository
+from hh_search.storage.run_log import ALLOWED_RUN_COUNTERS
 from tests.test_config import write_config
 
-NOW = datetime(2026, 7, 27, 10, 0, 0)
+FIXTURES = Path(__file__).parent / "fixtures"
+NOW = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
 
-FEED = """<?xml version='1.0' encoding='utf-8'?>
-<rss version="2.0"><channel>
-<item><pubDate>2026-07-27T09:21:20.933+03:00</pubDate>
-<title>Senior Embedded Engineer</title>
-<link>https://hh.ru/vacancy/111</link>
-<description><![CDATA[<p>Вакансия компании: ООО Ромашка</p> <p>Регион: Нижний Новгород</p> <p>Предполагаемый уровень месячного дохода: от 200 000 руб.</p>]]></description>
-</item>
-<item><pubDate>2026-07-27T09:22:20.933+03:00</pubDate>
-<title>Junior Python Developer</title>
-<link>https://hh.ru/vacancy/222</link>
-<description><![CDATA[<p>Вакансия компании: ООО Лютик</p> <p>Регион: Москва</p> <p>Предполагаемый уровень месячного дохода: не указан</p>]]></description>
-</item>
-</channel></rss>
+# Один листинг, одна страница: `pages: 2` из образца конфига удвоило бы
+# каждое число в ожиданиях, ничего не добавив. Пагинация проверяется
+# отдельным тестом, где она и есть предмет.
+ONE_PAGE = """
+queries:
+  - slug: programmist
+    cluster: embedded
+    weight: 9
+    pages: 1
 """
 
-PAGE = (
-    '<html><script type="application/ld+json">'
-    '{"@type": "JobPosting", "title": "Senior Embedded Engineer", '
-    '"description": "<p>Yocto, Buildroot, C++. Архитектура и менторинг.</p>"}'
-    "</script></html>"
+LISTING_URL = "https://hh.ru/vacancies/programmist"
+PAGE_PATTERN = r"^https://hh\.ru/vacancy/\d+$"
+
+
+def load(name: str) -> str:
+    with gzip.open(FIXTURES / name, "rt", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def listing_html(*vacancies: tuple[str, str], slug: str = "programmist") -> str:
+    """Страница листинга ровно того устройства, что живая: canonical + ItemList."""
+    items = [
+        {"@type": "ListItem", "url": f"https://hh.ru/vacancy/{vacancy_id}", "name": title}
+        for vacancy_id, title in vacancies
+    ]
+    block = json.dumps({"@type": "ItemList", "itemListElement": items}, ensure_ascii=False)
+    return (
+        f'<html><head><link rel="canonical" href="https://hh.ru/vacancies/{slug}">'
+        f'<script type="application/ld+json">{block}</script></head><body></body></html>'
+    )
+
+
+def page_html(description: str = "Опыт Yocto и Buildroot.") -> str:
+    block = json.dumps(
+        {
+            "@type": "JobPosting",
+            "description": f"<p>{description}</p>",
+            "hiringOrganization": {"name": "ООО Ромашка"},
+        },
+        ensure_ascii=False,
+    )
+    return f'<html><script type="application/ld+json">{block}</script></html>'
+
+
+TWO_VACANCIES = listing_html(
+    ("111", "Senior Embedded Engineer"), ("222", "Junior Python Developer")
 )
 
 
 class RecordingSink:
-    name = "recording"
+    """Приёмник, который помнит, что и сколько раз ему отдали."""
 
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, name: str = "recording", fail: bool = False) -> None:
+        self.name = name
         self.batches: list[list[str]] = []
         self._fail = fail
 
     def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> None:
         if self._fail:
-            raise RuntimeError("sink недоступен")
+            raise RuntimeError(f"приёмник {self.name} недоступен")
         self.batches.append([item.discovered.id for item in vacancies])
+
+    @property
+    def seen(self) -> list[str]:
+        return [vacancy_id for batch in self.batches for vacancy_id in batch]
+
+
+class BrokenScorer:
+    """Скорер, падающий на первых `failures` вызовах.
+
+    `ZeroDivisionError` — не выдумка: `saturation: 0` в profile.yaml даёт
+    ровно её, причём уже ПОСЛЕ того, как страница скачана.
+    """
+
+    def __init__(self, profile: Config, failures: int = 1_000_000) -> None:
+        self._real = KeywordScorer(profile.profile)
+        self._left = failures
+        self.calls = 0
+
+    def score(self, discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown:
+        self.calls += 1
+        if self._left > 0:
+            self._left -= 1
+            raise ZeroDivisionError("division by zero")
+        return self._real.score(discovered, details)
 
 
 @pytest.fixture()
 def config(tmp_path: Path) -> Config:
-    return load_config(write_config(tmp_path))
+    return load_config(write_config(tmp_path, **{"queries.yaml": ONE_PAGE}))
 
 
 @pytest.fixture()
@@ -3266,121 +3460,1219 @@ def repo() -> SqliteRepository:
     return repository
 
 
+@pytest.fixture()
+def db_path(tmp_path: Path) -> str:
+    """Путь к файловой базе: нужен там, где база портится сырым SQL."""
+    return str(tmp_path / "hh.db")
+
+
 def make_client(config: Config) -> PoliteClient:
     return PoliteClient(config.app.http, config.app.user_agent, sleep=lambda _: None)
 
 
-def mock_hh(feed: str = FEED, page_status: int = 200) -> None:
-    respx.get(url__startswith="https://hh.ru/search/vacancy/rss").mock(
-        return_value=httpx.Response(200, text=feed)
+def mock_source(
+    listing: str = TWO_VACANCIES,
+    page: str | httpx.Response | None = None,
+    listing_headers: dict[str, str] | None = None,
+) -> tuple[respx.Route, respx.Route, respx.Route]:
+    """robots.txt, листинг и страницы вакансий — все три обязательны.
+
+    robots ОБЯЗАТЕЛЕН в каждом тесте: незамоканный запрос даёт
+    `AllMockedAssertionError`, а это подкласс `AssertionError`, который
+    `_load_robots` не ловит (он ловит `httpx.HTTPError`). Такой прогон
+    рвётся насквозь ещё до первого шага, и любой ассерт про конвейер
+    проверяет пустоту. Правила берутся живые, из фикстуры: заодно каждый
+    прогон конвейера перепроверяет, что выбранные URL источником разрешены.
+    """
+    robots = respx.get("https://hh.ru/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=(FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
     )
-    respx.get(url__startswith="https://hh.ru/vacancy/").mock(
-        return_value=httpx.Response(page_status, text=PAGE)
+    listing_route = respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(200, text=listing, headers=listing_headers or {})
     )
+    body = page if page is not None else page_html()
+    page_response = body if isinstance(body, httpx.Response) else httpx.Response(200, text=body)
+    page_route = respx.get(url__regex=PAGE_PATTERN).mock(return_value=page_response)
+    return robots, listing_route, page_route
+
+
+def run(
+    config: Config,
+    repo: SqliteRepository,
+    sinks: Sequence[Sink],
+    scorer: Scorer | None = None,
+    now: datetime = NOW,
+) -> RunStats:
+    with make_client(config) as client:
+        return run_once(config, client, repo, scorer or KeywordScorer(config.profile), sinks, now)
+
+
+def journal(db: str) -> list[tuple[object, ...]]:
+    raw = sqlite3.connect(db)
+    rows = raw.execute(
+        "SELECT status, discovered, new_count, rejected, enriched, rescored, stuck, reported "
+        "FROM run ORDER BY id"
+    ).fetchall()
+    raw.close()
+    return [tuple(row) for row in rows]
+
+
+def corrupt(db: str, sql: str, *params: object) -> None:
+    raw = sqlite3.connect(db)
+    raw.execute(sql, params)
+    raw.commit()
+    raw.close()
+
+
+# --- прогон целиком, на живых фикстурах -----------------------------------
 
 
 @respx.mock
-def test_full_run_reports_only_surviving_vacancy(config: Config, repo: SqliteRepository) -> None:
-    mock_hh()
+def test_live_listing_run_ends_with_measured_counters(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Живая страница `/vacancies/programmist` и живая страница вакансии.
+
+    Числа зафиксированы по факту: 20 элементов в ItemList, два заголовка с
+    «junior» отсеяны префильтром (в профиле образца одно стоп-слово), 18
+    страниц скачано, 18 вакансий отправлено. Сверяется ВЕСЬ набор
+    счётчиков, потому что именно они уезжают в журнал прогона и в
+    healthcheck.
+    """
+    mock_source(listing=load("listing_programmist.html.gz"), page=load("vacancy_salary.html.gz"))
     sink = RecordingSink()
-    stats = run_once(config, make_client(config), repo, KeywordScorer(config.profile), [sink], NOW)
-    assert stats.status == "ok"
-    assert stats.discovered == 2
-    assert stats.new_count == 2
-    assert stats.rejected == 1          # Junior отсеян префильтром
-    assert stats.enriched == 1
-    assert sink.batches == [["111"]]
+    stats = run(config, repo, [sink])
+    assert (stats.status, stats.error) == ("ok", None)
+    assert (stats.discovered, stats.new_count, stats.rejected) == (20, 20, 2)
+    assert (stats.enriched, stats.rescored, stats.stuck, stats.reported) == (18, 0, 0, 18)
+    assert len(sink.seen) == 18
+    assert "135469420" not in sink.seen  # «Программист 1С (стажер/junior)»
 
 
 @respx.mock
-def test_second_run_reports_nothing_new(config: Config, repo: SqliteRepository) -> None:
-    mock_hh()
-    scorer = KeywordScorer(config.profile)
-    run_once(config, make_client(config), repo, scorer, [RecordingSink()], NOW)
-    sink = RecordingSink()
-    stats = run_once(config, make_client(config), repo, scorer, [sink], NOW)
-    assert stats.new_count == 0
-    assert sink.batches == []
+def test_report_carries_the_fields_bought_by_the_page_request(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Компания, регион, зарплата и дата публикации доезжают до приёмника.
+
+    Листинг их не отдаёт вовсе — за них заплачено запросом к странице
+    вакансии, и они обязаны пройти весь путь: разбор → `save_enriched` →
+    `unreported()` → приёмник. Тест читает их из того, что получил
+    приёмник, то есть уже ПОСЛЕ обратного чтения из базы.
+    """
+    mock_source(
+        listing=listing_html(("111", "Senior Embedded Engineer")),
+        page=load("vacancy_salary.html.gz"),
+    )
+    run(config, repo, [RecordingSink()])
+    stored = repo.reported_since(datetime(2026, 7, 1, tzinfo=UTC))
+    assert [vacancy.discovered.id for vacancy in stored] == ["111"]
+    discovered = stored[0].discovered
+    assert (discovered.company, discovered.area) == ("Альтео Софт", "Москва")
+    assert (discovered.salary.amount_from, discovered.salary.amount_to) == (100000, 150000)
+    assert discovered.published_at == datetime(2026, 7, 27, 16, 27, 20, 492000, tzinfo=UTC)
 
 
 @respx.mock
 def test_rejected_vacancy_is_never_fetched(config: Config, repo: SqliteRepository) -> None:
-    mock_hh()
-    page_route = respx.get(url__startswith="https://hh.ru/vacancy/")
-    run_once(config, make_client(config), repo, KeywordScorer(config.profile), [], NOW)
-    requested = {call.request.url.path for call in page_route.calls}
-    assert "/vacancy/222" not in requested
+    """Скачиваются РОВНО выжившие — ни больше, ни меньше.
+
+    Прежняя редакция проверяла только отсутствие одного URL и потому
+    проходила даже тогда, когда обогащение не скачивало вообще ничего.
+    """
+    _, _, page_route = mock_source()
+    sink = RecordingSink()
+    run(config, repo, [sink])
+    requested = sorted(call.request.url.path for call in page_route.calls)
+    assert requested == ["/vacancy/111"]
+    assert sink.seen == ["111"]
+
+
+# --- страница качается один раз за жизнь вакансии --------------------------
 
 
 @respx.mock
-def test_failing_sink_leaves_vacancy_unreported(config: Config, repo: SqliteRepository) -> None:
-    mock_hh()
+def test_second_run_costs_one_request_and_reports_nothing(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Считаются ФАКТИЧЕСКИЕ запросы, а не результат.
+
+    Второй прогон обязан стоить одного запроса к листингу и ни одного к
+    страницам вакансий: описание уже записано, а `pending_enrichment`
+    выбирает только `description IS NULL`. Проверка «во втором прогоне
+    ничего не отправлено» этого не ловит — она зелена и когда конвейер
+    качает всё заново.
+    """
+    _, listing_route, page_route = mock_source()
     scorer = KeywordScorer(config.profile)
-    run_once(config, make_client(config), repo, scorer, [RecordingSink(fail=True)], NOW)
-    assert [item.discovered.id for item in repo.unreported()] == ["111"]
+    first = run(config, repo, [RecordingSink()], scorer)
+    assert (listing_route.call_count, page_route.call_count) == (1, 1)
 
     sink = RecordingSink()
-    run_once(config, make_client(config), repo, scorer, [sink], NOW)
-    assert sink.batches == [["111"]]
+    second = run(config, repo, [sink], scorer)
+    assert (listing_route.call_count, page_route.call_count) == (2, 1)
+    assert (second.new_count, second.reported, second.status) == (0, 0, "ok")
+    assert sink.batches == []
+    assert first.reported == 1
 
 
 @respx.mock
-def test_forbidden_aborts_the_run(config: Config, repo: SqliteRepository) -> None:
-    respx.get(url__startswith="https://hh.ru/search/vacancy/rss").mock(
-        return_value=httpx.Response(403)
+def test_pages_of_one_listing_are_requested_one_by_one(
+    tmp_path: Path, repo: SqliteRepository
+) -> None:
+    """`pages: 2` — это два запроса, второй с `?page=1` (нумерация с нуля).
+
+    Без этого теста конвейер, читающий только первую страницу, выглядел бы
+    полностью работоспособным: вакансии есть, отчёт есть, статус `ok`.
+    """
+    config = load_config(write_config(tmp_path))
+    _, listing_route, _ = mock_source(listing=TWO_VACANCIES)
+    run(config, repo, [RecordingSink()])
+    assert [str(call.request.url) for call in listing_route.calls] == [
+        LISTING_URL,
+        f"{LISTING_URL}?page=1",
+    ]
+
+
+# --- C3: валидатор условного запроса пишется ПОСЛЕ записи вакансий ---------
+
+
+@respx.mock
+def test_unparsable_listing_leaves_no_cache_validator(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Валидатор снимка, который не был прочитан, — вечный 304.
+
+    Проверяется и то, что новый не записан, и то, что прежний СБРОШЕН:
+    иначе одна обрезанная выдача ослепляет сервис навсегда, причём при
+    зелёном healthcheck и чистом `docker logs`.
+    """
+    repo.save_cache_headers(LISTING_URL, '"stale-v0"', None)
+    mock_source(
+        listing='<html><head><link rel="canonical" href="/vacancies/programmist">'
+        "</head><body>без ItemList</body></html>"
     )
-    with pytest.raises(AccessForbidden):
-        run_once(config, make_client(config), repo, KeywordScorer(config.profile), [], NOW)
-    assert repo.last_successful_run() is None
+    stats = run(config, repo, [RecordingSink()])
+    assert repo.cache_headers(LISTING_URL) == {}
+    assert stats.status == "failed"
 
 
 @respx.mock
-def test_enrichment_failure_is_retried_next_run(config: Config, repo: SqliteRepository) -> None:
-    mock_hh(page_status=404)
+def test_truncated_listing_does_not_blind_the_next_run(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Сквозная форма того же дефекта: авария не нужна, хватит одной обрезки.
+
+    Мок отвечает 304 на условный запрос — ровно как hh.ru. Если первый
+    прогон сохранит валидатор до разбора, второй получит 304, вакансий не
+    увидит никогда и отчитается `ok`.
+    """
+    broken = '<html><head><link rel="canonical" href="/vacancies/programmist"></head></html>'
+    state = {"listing": broken}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("If-None-Match"):
+            return httpx.Response(304)
+        return httpx.Response(200, text=state["listing"], headers={"ETag": '"v1"'})
+
+    respx.get("https://hh.ru/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=(FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+    )
+    respx.get(url__startswith=LISTING_URL).mock(side_effect=answer)
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+
+    first = run(config, repo, [RecordingSink()])
+    assert (first.status, first.discovered) == ("failed", 0)
+
+    state["listing"] = TWO_VACANCIES
+    sink = RecordingSink()
+    second = run(config, repo, [sink])
+    assert (second.status, second.discovered, second.reported) == ("ok", 2, 1)
+    assert sink.seen == ["111"]
+
+
+@respx.mock
+def test_validator_is_not_stored_when_writing_vacancies_fails(
+    config: Config, repo: SqliteRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сторож самого ПОРЯДКА, а не только сброса кэша.
+
+    Сброс `reset_cache` спасает лишь тот отказ, который мы предвидели —
+    отказ разбора. Между разбором и записью в базу может случиться что
+    угодно: заблокированная база, кончившееся место, убитый контейнер. Если
+    валидатор к этому моменту уже записан, следующий прогон получит 304 и
+    не увидит эти вакансии НИКОГДА.
+    """
+    mock_source(listing_headers={"ETag": '"v1"'})
+
+    def locked(*args: object, **kwargs: object) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(repo, "add_discovered", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        run(config, repo, [RecordingSink()])
+    assert repo.cache_headers(LISTING_URL) == {}
+
+
+@respx.mock
+def test_validator_is_saved_after_a_good_page(config: Config, repo: SqliteRepository) -> None:
+    """Обратная сторона: на успешном разборе валидатор обязан сохраниться,
+    иначе условные запросы не работают вовсе и каждый прогон тянет тело."""
+    mock_source(listing_headers={"ETag": '"v1"'})
+    run(config, repo, [RecordingSink()])
+    assert repo.cache_headers(LISTING_URL) == {"If-None-Match": '"v1"'}
+
+
+# --- R-I3: агрегатный сторож тишины ---------------------------------------
+
+
+@respx.mock
+def test_run_where_no_listing_yielded_anything_is_a_failure(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Пустая страница законна, пустой ПРОГОН — нет.
+
+    `itemListElement: []` разбирается без ошибки (честно пустая выдача), и
+    без агрегатного сторожа прогон отчитался бы `ok` при нулевой работе —
+    класс «месяцы молчания при зелёном healthcheck».
+    """
+    mock_source(listing=listing_html())
+    with caplog.at_level(logging.ERROR):
+        stats = run(config, repo, [RecordingSink()])
+    assert (stats.status, stats.discovered) == ("failed", 0)
+    assert stats.exit_code() == 1
+    assert "ни одна не дала ни одной вакансии" in caplog.text
+
+
+@respx.mock
+def test_one_empty_page_among_several_is_not_a_failure(
+    tmp_path: Path, repo: SqliteRepository
+) -> None:
+    """Сторож обязан быть АГРЕГАТНЫМ: пустая вторая страница — норма для
+    листинга, который короче двух страниц."""
+    config = load_config(write_config(tmp_path))
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        body = listing_html() if request.url.query else TWO_VACANCIES
+        return httpx.Response(200, text=body)
+
+    respx.get("https://hh.ru/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=(FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+    )
+    respx.get(url__startswith=LISTING_URL).mock(side_effect=answer)
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+    stats = run(config, repo, [RecordingSink()])
+    assert (stats.status, stats.discovered, stats.reported) == ("ok", 2, 1)
+
+
+# --- C4: авария источника не жжёт попытки ---------------------------------
+
+
+@respx.mock
+def test_source_outage_does_not_burn_enrich_attempts(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Три прогона при лежащем hh.ru — очередь обязана остаться целой.
+
+    `max_attempts = 3`, то есть прежняя редакция плана к третьему прогону
+    отправляла всю очередь в `rejected`/`enrich_failed` терминально, и
+    вернуть её было нечем: `add_discovered` даёт False, а
+    `pending_enrichment` требует `description IS NULL`. 12 часов
+    недоступности источника стоили всего бэклога.
+    """
+    mock_source(page=httpx.Response(503))
     scorer = KeywordScorer(config.profile)
-    stats = run_once(config, make_client(config), repo, scorer, [], NOW)
-    assert stats.enriched == 0
+    for _ in range(config.app.enrich.max_attempts):
+        stats = run(config, repo, [RecordingSink()], scorer)
+        assert (stats.enriched, stats.status) == (0, "partial")
+    assert [vacancy.id for vacancy in repo.pending_enrichment(3)] == ["111"]
+
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+    sink = RecordingSink()
+    recovered = run(config, repo, [sink], scorer)
+    assert (recovered.enriched, recovered.reported) == (1, 1)
+    assert sink.seen == ["111"]
+
+
+@respx.mock
+def test_broken_page_burns_attempts_and_ends_in_enrich_failed(config: Config, db_path: str) -> None:
+    """Обратная сторона того же разделения: 404 — состояние ВАКАНСИИ.
+
+    Счётчик обязан работать, иначе несуществующая вакансия перепрашивается
+    вечно. Терминальный статус ставит тем же UPDATE `bump_enrich_attempt`.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    mock_source(page=httpx.Response(404))
+    scorer = KeywordScorer(config.profile)
+    for _ in range(config.app.enrich.max_attempts):
+        run(config, disk, [RecordingSink()], scorer)
+    assert repo_status(db_path, "111") == ("rejected", "enrich_failed", 3)
+    assert disk.pending_enrichment(3) == []
+    disk.close()
+
+
+def repo_status(db: str, vacancy_id: str) -> tuple[object, object, object]:
+    raw = sqlite3.connect(db)
+    row = raw.execute(
+        "SELECT status, reject_reason, enrich_attempts FROM vacancy WHERE id = ?", (vacancy_id,)
+    ).fetchone()
+    raw.close()
+    return tuple(row)
+
+
+# --- I3: отказ оценки не выбрасывает скачанную страницу -------------------
+
+
+@respx.mock
+def test_scoring_failure_keeps_the_page_and_is_loud(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Скоринг — локальное вычисление; страница за ним уже стоила запроса.
+
+    Проверяется всё, что здесь дорого: прогон не упал, страница скачана
+    РОВНО один раз за оба прогона, вакансия ждёт в `pending_scoring`,
+    остаток очереди назван в логе поимённо, статус понижен, — и второй
+    прогон досчитывает оценку, НЕ обращаясь к hh.ru.
+
+    Прежняя редакция вызывала `scorer.score(...)` прямо аргументом записи,
+    поэтому `ZeroDivisionError` (достижимая опечаткой `saturation: 0`)
+    роняла прогон целиком и выбрасывала уже скачанную страницу.
+    """
+    _, _, page_route = mock_source()
+    with caplog.at_level(logging.ERROR):
+        first = run(config, repo, [RecordingSink()], BrokenScorer(config))
+    assert (first.status, first.enriched, first.reported, first.stuck) == ("partial", 0, 0, 1)
+    assert page_route.call_count == 1
+    assert [vacancy.id for vacancy, _ in repo.pending_scoring()] == ["111"]
+    assert "111" in caplog.text
+
+    sink = RecordingSink()
+    second = run(config, repo, [sink], KeywordScorer(config.profile))
+    assert page_route.call_count == 1
+    assert (second.rescored, second.stuck, second.reported) == (1, 0, 1)
+    assert sink.seen == ["111"]
+
+
+@respx.mock
+def test_score_is_recomputed_and_sent_within_one_run(
+    config: Config, repo: SqliteRepository, db_path: str
+) -> None:
+    """Порча оценки лечится за ОДИН прогон, а не за два.
+
+    Карантин срабатывает внутри `unreported()`: нечитаемая оценка
+    обнуляется в момент чтения, и вакансия уходит в `pending_scoring`
+    уже после того, как отправлять было бы поздно. Поэтому пересчёт стоит
+    между двумя чтениями — один вызов задерживал бы вылеченную вакансию
+    до следующего прогона.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    mock_source()
+    scorer = KeywordScorer(config.profile)
+    run(config, disk, [RecordingSink()], scorer)
+    corrupt(
+        db_path,
+        "UPDATE vacancy SET status = 'new', reported_at = NULL, score_detail = ? WHERE id = '111'",
+        "{не json",
+    )
+
+    sink = RecordingSink()
+    stats = run(config, disk, [sink], scorer)
+    assert (stats.rescored, stats.stuck, stats.reported) == (1, 0, 1)
+    assert sink.seen == ["111"]
+    disk.close()
+
+
+# --- I1: частичный отказ приёмника -----------------------------------------
+
+
+@respx.mock
+def test_partial_sink_failure_keeps_everything_unreported(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ни одна вакансия не помечается отправленной, и об этом громко.
+
+    Повтор при этом неустраним: живой приёмник получит те же вакансии
+    следующим прогоном. Тест фиксирует и это — иначе «защита от потери»
+    выглядела бы бесплатной.
+    """
+    mock_source()
+    good = RecordingSink("csv")
+    bad = RecordingSink("markdown", fail=True)
+    with caplog.at_level(logging.ERROR):
+        stats = run(config, repo, [good, bad])
+    assert (stats.status, stats.reported) == ("partial", 0)
+    assert "markdown" in caplog.text and "повторно" in caplog.text
+    assert good.seen == ["111"]
+    assert [vacancy.discovered.id for vacancy in repo.unreported()] == ["111"]
+
+    both = RecordingSink("csv")
+    second = run(config, repo, [both])
+    assert (second.status, second.reported) == ("ok", 1)
+    assert both.seen == ["111"]
+
+
+@respx.mock
+def test_run_without_sinks_marks_nothing_reported(config: Config, repo: SqliteRepository) -> None:
+    """Пустой список приёмников — не повод пометить вакансии отправленными.
+
+    Через конфиг недостижимо (`sinks` требует непустого списка), но именно
+    такие пути в этом проекте обязаны кричать, а не молчать.
+    """
+    mock_source()
+    stats = run(config, repo, [])
+    assert (stats.status, stats.reported) == ("failed", 0)
+    assert [vacancy.discovered.id for vacancy in repo.unreported()] == ["111"]
+
+
+# --- журнал прогона --------------------------------------------------------
+
+
+@respx.mock
+def test_forbidden_stops_the_run_and_closes_the_journal(config: Config, db_path: str) -> None:
+    """403 останавливает прогон (спека §9), но строку журнала закрывает.
+
+    Незакрытая строка `running` — это не косметика: healthcheck смотрит в
+    журнал, и висящие строки копятся вечно.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    respx.get("https://hh.ru/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=(FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+    )
+    respx.get(url__startswith=LISTING_URL).mock(return_value=httpx.Response(403))
+    with pytest.raises(AccessForbidden):
+        run(config, disk, [RecordingSink()])
+    assert disk.last_successful_run() is None
+    assert journal(db_path) == [("failed", 0, 0, 0, 0, 0, 0, 0)]
+    disk.close()
+
+
+@respx.mock
+def test_counters_survive_a_crash_in_the_middle(
+    config: Config, db_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Счётчики накапливаются по ходу, а не присваиваются в конце.
+
+    Падение на третьей вакансии из четырёх обязано оставить в журнале
+    двойку: с присваиванием после возврата функции там был бы ноль, и
+    журнал врал бы о том, сколько страниц уже скачано.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    mock_source(
+        listing=listing_html(
+            ("111", "Инженер"), ("222", "Разработчик"), ("333", "Программист"), ("444", "Тимлид")
+        )
+    )
+    real = disk.save_enriched
+    calls = {"n": 0}
+
+    def flaky(vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown) -> None:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise TypeError("база сломалась посреди прогона")
+        real(vacancy_id, details, score)
+
+    monkeypatch.setattr(disk, "save_enriched", flaky)
+    with pytest.raises(TypeError):
+        run(config, disk, [RecordingSink()])
+    assert journal(db_path) == [("failed", 4, 4, 0, 2, 0, 0, 0)]
+    disk.close()
+
+
+def test_counter_names_match_the_run_table_whitelist() -> None:
+    """Имя счётчика — не строка, которую можно опечатать.
+
+    `finish_run` отбрасывает неизвестные имена МОЛЧА, поэтому опечатка в
+    `RunCounters` стоила бы потерянного счётчика без единого признака.
+    """
+    assert set(RunCounters.__annotations__) <= ALLOWED_RUN_COUNTERS
+
+
+def test_naive_moment_is_rejected(config: Config, repo: SqliteRepository) -> None:
+    """Имя файла отчёта берётся из `now`, а `reported_at` пишется в UTC.
+
+    Наивная дата при ночном прогоне разводит их на сутки, и найти отчёт
+    по дате из базы становится невозможно.
+    """
+    with make_client(config) as client, pytest.raises(ValueError, match="aware UTC"):
+        run_once(
+            config, client, repo, KeywordScorer(config.profile), [], datetime(2026, 7, 28, 10, 0)
+        )
+
+
+# --- сторожа дрейфа источника ---------------------------------------------
+
+
+@respx.mock
+def test_salary_drift_guard_is_wired_into_enrichment(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`SalaryBlockStats` обязан получать каждую страницу прогона.
+
+    Не передать его в `parse_vacancy_page` — значит выключить сторож
+    переименованного атрибута `data-qa="vacancy-salary"`, оставив его в
+    коде. Проверяется на страницах без блока зарплаты.
+    """
+    mock_source()
+    with caplog.at_level(logging.WARNING):
+        run(config, repo, [RecordingSink()])
+    assert 'data-qa="vacancy-salary"' in caplog.text
+
+
+@respx.mock
+def test_more_than_half_failed_pages_raise_the_canary(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Канарейка на смену вёрстки (спека §9): страница без JSON-LD.
+
+    Причина отказа здесь — сама страница, поэтому в логе обязана быть
+    вёрстка, а не недоступность источника: лечит их разный человек.
+    """
+    mock_source(page="<html>без всякого JSON-LD</html>")
+    with caplog.at_level(logging.ERROR):
+        stats = run(config, repo, [RecordingSink()])
     assert stats.status == "partial"
-    assert [v.id for v in repo.pending_enrichment(config.app.enrich.max_attempts)] == ["111"]
+    assert "сменил вёрстку" in caplog.text
 ```
 
-> Тест использует `write_config` из `tests/test_config.py`. Убедитесь, что `tests/__init__.py` существует (создан в Task 1), иначе импорт не разрешится.
+- [ ] **Step 3: Запустить тест и убедиться, что он падает**
 
-- [ ] **Step 2: Запустить тест и убедиться, что он падает**
+Run: `uv run pytest tests/test_pipeline.py -q`
+Expected: `ModuleNotFoundError: No module named 'hh_search.pipeline'`, «1 error»
 
-Run: `uv run pytest tests/test_pipeline.py -v`
-Expected: FAIL с `ModuleNotFoundError: No module named 'hh_search.pipeline'`
-
-- [ ] **Step 3: Реализовать `hh_search/pipeline.py`**
+- [ ] **Step 4: Реализовать `hh_search/pipeline/stats.py`**
 
 ```python
-import logging
-from collections.abc import Sequence
-from datetime import datetime
+"""Счётчики прогона и его статус.
+
+Статус умеет только УХУДШАТЬСЯ. Причина практическая: шагов, способных
+частично отказать, четыре, и каждый писал бы своё значение — последний
+затирал бы предыдущие, а `ok` после `partial` означал бы прогон, который
+потерял работу и об этом не сказал. Отсюда `degrade()` вместо присваивания
+и порядок `ok < partial < failed`.
+
+`partial` считается успехом для `last_successful_run()` (значит и для
+healthcheck), поэтому им обозначается только частичная потеря работы. Всё,
+что означает «прогон не состоялся» или «работа не делается вовсе», обязано
+быть `failed` — иначе получается тот самый зелёный healthcheck при
+месяцах молчания.
+"""
+
+from typing import TypedDict
 
 from pydantic import BaseModel
 
-from hh_search.config.models import Config
-from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
+OK = "ok"
+PARTIAL = "partial"
+FAILED = "failed"
+
+_RANK = {OK: 0, PARTIAL: 1, FAILED: 2}
+
+# Коды возврата CLI. `partial` отличается от `failed` не строгостью, а
+# содержанием: прогон состоялся, но часть работы потеряна. Cron и
+# `docker run` видят ненулевой код в обоих случаях, а человек по коду
+# различает два разных разбора. 2 не занят намеренно: его отдаёт click на
+# ошибку в аргументах, и там же CLI отдаёт его на ошибку конфига.
+EXIT_CODES = {OK: 0, FAILED: 1, PARTIAL: 3}
+
+
+class RunCounters(TypedDict):
+    """Поля таблицы `run`, которые заполняет конвейер.
+
+    Именно TypedDict, а не `dict[str, int | str | None]`: `finish_run`
+    принимает счётчики через `**counters`, и словарь с размытым типом
+    значений mypy обязан сверять с КАЖДЫМ именованным параметром, включая
+    `finished_at: datetime | None`, — три ошибки типа на пустом месте. У
+    TypedDict набор ключей известен, поэтому проверка идёт по именам, а
+    имя счётчика перестаёт быть строкой, которую можно опечатать
+    (`ALLOWED_RUN_COUNTERS` неизвестные имена отбрасывает молча — тест
+    сверяет один список с другим).
+    """
+
+    discovered: int
+    new_count: int
+    rejected: int
+    enriched: int
+    rescored: int
+    stuck: int
+    reported: int
+    error: str | None
+
+
+class RunStats(BaseModel):
+    """То, что уезжает в таблицу `run` и в код возврата CLI."""
+
+    discovered: int = 0
+    new_count: int = 0
+    rejected: int = 0
+    enriched: int = 0
+    rescored: int = 0
+    stuck: int = 0
+    reported: int = 0
+    status: str = OK
+    error: str | None = None
+
+    def degrade(self, status: str, reason: str) -> None:
+        """Ухудшить статус прогона и запомнить причину.
+
+        Улучшить статус этим методом нельзя: `ok` после `partial` — это
+        потеря, о которой прогон промолчал. Причина сохраняется от самого
+        плохого статуса; при равном статусе побеждает первая, потому что
+        она обычно и есть корень, а последующие — следствия.
+        """
+        if _RANK[status] > _RANK[self.status]:
+            self.status = status
+            self.error = reason
+        elif self.error is None:
+            self.error = reason
+
+    def counters(self) -> RunCounters:
+        """Счётчики для `finish_run`. `status` и `finished_at` — не здесь.
+
+        `status` уезжает отдельным параметром, а `finished_at` конвейер не
+        передаёт вовсе: время закрытия ставит хранилище.
+        """
+        return {
+            "discovered": self.discovered,
+            "new_count": self.new_count,
+            "rejected": self.rejected,
+            "enriched": self.enriched,
+            "rescored": self.rescored,
+            "stuck": self.stuck,
+            "reported": self.reported,
+            "error": self.error,
+        }
+
+    def exit_code(self) -> int:
+        return EXIT_CODES[self.status]
+```
+
+- [ ] **Step 5: Реализовать `hh_search/pipeline/discovery.py`**
+
+```python
+"""Шаги 1–3: листинги, дедупликация, префильтр (спека §4.1).
+
+Порядок записи внутри шага 1 — не стилистический. Валидатор условного
+запроса (`ETag`/`Last-Modified`) сохраняется ПОСЛЕ того, как все вакансии
+страницы оказались в базе, и никогда раньше. Обратный порядок означал, что
+любой отказ между этими точками оставляет в `http_cache` валидатор
+снимка, который никогда не был прочитан: дальше `If-None-Match` даёт 304,
+страница не разбирается вообще, и прогон честно сообщает `ok` при нулевой
+работе. Для воспроизведения не нужна авария — достаточно, чтобы hh.ru
+один раз отдал обрезанную выдачу. Это класс отказа «месяцы молчания при
+зелёном healthcheck», и стоит он всех вакансий сразу.
+"""
+
+import logging
+
+import httpx
+
+from hh_search.config.models import Config, QuerySpec
+from hh_search.errors import FetchFailed, RobotsDisallowed
 from hh_search.filtering.prefilter import Prefilter
-from hh_search.scoring.base import Scorer
-from hh_search.sinks.base import Sink
+from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.sources.http import PoliteClient
-from hh_search.sources.rss import build_rss_url, parse_feed
-from hh_search.sources.vacancy_page import parse_vacancy_page, vacancy_url
+from hh_search.sources.listing import build_listing_url, parse_listing
+from hh_search.storage.repository import SqliteRepository
+
+logger = logging.getLogger(__name__)
+
+NOT_MODIFIED = 304
+
+
+def discover(config: Config, client: PoliteClient, repo: SqliteRepository, stats: RunStats) -> None:
+    """Обойти все листинги и все их страницы; каждая страница — один запрос."""
+    fetched = 0
+    unchanged = 0
+    for query in config.queries.queries:
+        for page in range(query.pages):
+            url = build_listing_url(query, page)
+            try:
+                response = client.get(url, conditional=repo.cache_headers(url))
+            except (FetchFailed, RobotsDisallowed) as error:
+                # Состояние СЕРВЕРА, а не листинга: следующий прогон
+                # повторит запрос, терять нечего. Спека §9 — WARNING+partial.
+                stats.degrade(PARTIAL, f"листинг {url} не получен: {error}")
+                logger.warning("листинг %s пропущен: %s", url, error)
+                continue
+            if response.status_code == NOT_MODIFIED:
+                unchanged += 1
+                logger.debug("листинг %s не изменился", url)
+                continue
+            if response.status_code != 200:
+                stats.degrade(PARTIAL, f"листинг {url}: код {response.status_code}")
+                logger.warning("листинг %s ответил %s", url, response.status_code)
+                continue
+            # Считается ОТДАННАЯ источником страница, а не успешно
+            # разобранная: дрейф формата, при котором не разбирается ни
+            # одна, — это и есть тишина, которую обязан поймать сторож
+            # ниже. Считай мы разобранные, отказ разбора остался бы
+            # `partial`, то есть успехом для healthcheck.
+            fetched += 1
+            _store_page(repo, query, url, response, stats)
+    _check_not_silent(config, stats, fetched, unchanged)
+
+
+def _store_page(
+    repo: SqliteRepository,
+    query: QuerySpec,
+    url: str,
+    response: httpx.Response,
+    stats: RunStats,
+) -> None:
+    """Разобрать страницу, записать вакансии и только потом — валидатор."""
+    try:
+        vacancies = parse_listing(response.text, query.slug)
+    except FetchFailed as error:
+        # Валидатор не сохраняем и вычищаем прежний: 304 на следующем
+        # прогоне спрятал бы дрейф формата за нулевой работой, а один
+        # лишний полный ответ — дешевле месяца молчания.
+        repo.reset_cache(url)
+        stats.degrade(PARTIAL, f"листинг {url} не разобран: {error}")
+        logger.error("листинг %s не разобран, кэш условного запроса сброшен: %s", url, error)
+        return
+    for vacancy in vacancies:
+        stats.discovered += 1
+        if repo.add_discovered(vacancy, query.cluster, query.weight):
+            stats.new_count += 1
+    repo.save_cache_headers(
+        url, response.headers.get("ETag"), response.headers.get("Last-Modified")
+    )
+
+
+def _check_not_silent(config: Config, stats: RunStats, fetched: int, unchanged: int) -> None:
+    """Агрегатный сторож: пустая страница законна, пустой ПРОГОН — нет.
+
+    Пустой `itemListElement` — законный результат для ОДНОЙ страницы
+    (короткий листинг, конец пагинации), поэтому `parse_listing` на нём
+    молчит. Для всего прогона при непустом списке листингов он означает,
+    что источник перестал отдавать выдачу, — и это ровно тот класс
+    отказа, который стоил проекту раунда: месяцы тишины при зелёном
+    healthcheck.
+
+    `failed`, а не `partial`, потому что `partial` считается успехом для
+    `last_successful_run()`, то есть для healthcheck. Сторож накрывает и
+    дрейф формата: там отказывает разбор каждой страницы, и без этой
+    строки прогон остался бы `partial`, то есть успешным.
+    """
+    if fetched and not stats.discovered:
+        stats.degrade(
+            FAILED, f"источник отдал {fetched} страниц листингов, вакансий не найдено ни одной"
+        )
+        logger.error(
+            "источник отдал %d страниц листингов по %d запросам, и ни одна не дала ни "
+            "одной вакансии. Либо блок ItemList пуст, либо разбор отказал на каждой "
+            "странице (причина выше). Прогон помечен %s",
+            fetched,
+            len(config.queries.queries),
+            FAILED,
+        )
+    elif unchanged and not fetched:
+        logger.warning(
+            "ни одна из %d страниц листингов не изменилась с прошлого прогона (304); "
+            "новых вакансий в этом прогоне не будет",
+            unchanged,
+        )
+
+
+def prefilter(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
+    """Шаг 3: отсев по заголовку — единственный барьер перед сетью.
+
+    Идёт по всей очереди обогащения, а не только по найденному сейчас:
+    отсев локальный и бесплатный, а правка `negative` в конфиге обязана
+    доставать накопленный бэклог, а не только следующую находку.
+    """
+    barrier = Prefilter(config.profile)
+    for vacancy in repo.pending_enrichment(config.app.enrich.max_attempts):
+        reason = barrier.reason_to_reject(vacancy)
+        if reason is not None:
+            repo.mark_rejected(vacancy.id, reason)
+            stats.rejected += 1
+```
+
+- [ ] **Step 6: Реализовать `hh_search/pipeline/enrichment.py`**
+
+```python
+"""Шаги 4–6: страница вакансии, оценка и локальный пересчёт (спека §4.1).
+
+Единственный шаг конвейера, ходящий в сеть за вакансией, и потому
+единственный, где ошибка стоит запроса к hh.ru. Отсюда два разделения,
+без которых шаг теряет данные.
+
+1. **Транспортный отказ ≠ отказ страницы.** `FetchFailed` от 503 или
+   таймаута и `RobotsDisallowed` от временно недоступного robots.txt — это
+   состояния СЕРВЕРА, а не вакансии. Жечь ими `enrich_attempts` значит
+   терять всю очередь за одну аварию источника: при `interval_hours = 4` и
+   `max_attempts = 3` двенадцати часов недоступности достаточно, чтобы вся
+   очередь ушла в `rejected`/`enrich_failed` терминально, откуда её не
+   возвращает ничто (`add_discovered` даёт False, `pending_enrichment`
+   требует `description IS NULL`). Спека §9 для этой строки требует лишь
+   `WARNING` и `partial`. Счётчик уместен там, где отказ про саму вакансию:
+   404, отсутствие `JobPosting`, пустое `description`.
+   Плата за это решение названа честно: при длительной аварии вакансия
+   перепрашивается каждый прогон. Дешевле её сделать `next_attempt_at` с
+   экспоненциальным backoff, но это колонка в схеме, то есть правка
+   задачи 6, и заказывать её надо явно. Терять данные ради экономии
+   запросов — не тот размен, который выбирала спека.
+2. **Отказ оценки ≠ отказ страницы.** Скоринг — чисто локальное
+   вычисление, а страница за спиной уже стоила запроса. Поэтому
+   исключение из `scorer.score` сохраняет страницу через
+   `save_description` и оставляет вакансию в `pending_scoring`: в сеть за
+   ней больше не пойдёт никто (спека §5.2).
+"""
+
+import logging
+
+from hh_search.config.models import Config
+from hh_search.domain.models import DiscoveredVacancy, VacancyDetails
+from hh_search.errors import FetchFailed, RobotsDisallowed
+from hh_search.pipeline.stats import PARTIAL, RunStats
+from hh_search.scoring.base import Scorer
+from hh_search.sources.http import PoliteClient
+from hh_search.sources.vacancy_page import SalaryBlockStats, parse_vacancy_page, vacancy_url
 from hh_search.storage.repository import SqliteRepository
 
 logger = logging.getLogger(__name__)
 
 
-class RunStats(BaseModel):
-    discovered: int = 0
-    new_count: int = 0
-    rejected: int = 0
-    enriched: int = 0
-    reported: int = 0
-    status: str = "ok"
-    error: str | None = None
+def enrich(
+    config: Config,
+    client: PoliteClient,
+    repo: SqliteRepository,
+    scorer: Scorer,
+    stats: RunStats,
+) -> None:
+    """Скачать страницы очереди обогащения, оценить и сохранить."""
+    pending = repo.pending_enrichment(config.app.enrich.max_attempts)
+    salary_stats = SalaryBlockStats()
+    unavailable = 0
+    unreadable = 0
+    for vacancy in pending:
+        # URL собирается заново, а не берётся из базы: канонический
+        # `https://hh.ru/vacancy/{id}` без query-строки — единственная
+        # форма, разрешённая живым robots.txt (см. sources/listing.py).
+        url = vacancy_url(vacancy.id)
+        try:
+            response = client.get(url)
+        except (FetchFailed, RobotsDisallowed) as error:
+            # Источник, а не вакансия: попытку НЕ жжём.
+            unavailable += 1
+            stats.degrade(PARTIAL, f"страница {url} не получена: {error}")
+            logger.warning("страница %s недоступна, попытка не израсходована: %s", url, error)
+            continue
+        if response.status_code != 200:
+            _burn_attempt(config, repo, stats, vacancy.id, f"код {response.status_code}")
+            unreadable += 1
+            continue
+        try:
+            details = parse_vacancy_page(response.text, salary_stats)
+        except FetchFailed as error:
+            _burn_attempt(config, repo, stats, vacancy.id, str(error))
+            unreadable += 1
+            continue
+        if _save(repo, scorer, vacancy, details, stats):
+            # Накапливаем по ходу, а не присваиваем в конце: падение на
+            # шестнадцатой из двадцати обязано оставить в журнале
+            # пятнадцать, а не ноль.
+            stats.enriched += 1
+    salary_stats.log_summary()
+    _canary(len(pending), unavailable, unreadable)
+
+
+def _burn_attempt(
+    config: Config, repo: SqliteRepository, stats: RunStats, vacancy_id: str, reason: str
+) -> None:
+    """Отказ про саму вакансию: инкремент попытки и, при исчерпании, отказ.
+
+    Терминальный статус ставит тем же UPDATE сам `bump_enrich_attempt` —
+    отдельного `mark_rejected` здесь нет сознательно: пара вызовов
+    оставляла между собой состояние, невидимое всем трём выборкам
+    (спека §5.2).
+    """
+    attempts = repo.bump_enrich_attempt(vacancy_id, config.app.enrich.max_attempts)
+    stats.degrade(PARTIAL, f"вакансия {vacancy_id} не обогащена: {reason}")
+    if attempts >= config.app.enrich.max_attempts:
+        logger.warning(
+            "вакансия %s: попытка %d из %d, лимит исчерпан, отказ enrich_failed: %s",
+            vacancy_id,
+            attempts,
+            config.app.enrich.max_attempts,
+            reason,
+        )
+    else:
+        logger.warning(
+            "вакансия %s: попытка %d из %d не удалась: %s",
+            vacancy_id,
+            attempts,
+            config.app.enrich.max_attempts,
+            reason,
+        )
+
+
+def _save(
+    repo: SqliteRepository,
+    scorer: Scorer,
+    vacancy: DiscoveredVacancy,
+    details: VacancyDetails,
+    stats: RunStats,
+) -> bool:
+    """Оценить и записать. Отказ оценки не выбрасывает скачанную страницу."""
+    try:
+        score = scorer.score(vacancy, details)
+    except Exception as error:  # noqa: BLE001 — страница дороже оценки
+        repo.save_description(vacancy.id, details)
+        stats.degrade(PARTIAL, f"оценка вакансии {vacancy.id} не посчиталась: {error}")
+        logger.error(
+            "оценка вакансии %s не посчиталась (%s); страница сохранена без оценки и "
+            "будет досчитана локально, в сеть за ней больше не идём",
+            vacancy.id,
+            error,
+            exc_info=True,
+        )
+        return False
+    try:
+        repo.save_enriched(vacancy.id, details, score)
+    except ValueError as error:
+        # Оценка не сериализуется. Описание `save_enriched` сохранил сам,
+        # поэтому здесь остаётся только не уронить прогон.
+        stats.degrade(PARTIAL, f"оценка вакансии {vacancy.id} не сериализуется: {error}")
+        logger.error("оценка вакансии %s не сериализуется: %s", vacancy.id, error, exc_info=True)
+        return False
+    return True
+
+
+def _canary(pending: int, unavailable: int, unreadable: int) -> None:
+    """Тревога на смену вёрстки и на аварию источника — спека §9.
+
+    Порог «больше половины» ловит проблему в тот же день, а не через месяц
+    по пустым отчётам. Две причины разведены, потому что лечатся они
+    по-разному: вёрстку правит разработчик, аварию — время.
+    """
+    if not pending:
+        return
+    if unreadable * 2 > pending:
+        logger.error(
+            "не разобрано %d страниц вакансий из %d — вероятно, hh.ru сменил вёрстку "
+            "страницы вакансии или разметку JSON-LD",
+            unreadable,
+            pending,
+        )
+    if unavailable * 2 > pending:
+        logger.error(
+            "не получено %d страниц вакансий из %d — похоже, источник недоступен; "
+            "попытки не израсходованы, очередь сохранена до следующего прогона",
+            unavailable,
+            pending,
+        )
+
+
+def rescore(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> int:
+    """Шаг 6: локальный пересчёт оценок. Сеть не задействуется.
+
+    Обслуживает две очереди сразу: вакансии, у которых оценка не
+    посчиталась при обогащении (`save_description` выше), и те, у которых
+    оценку обнулил карантин, прочитав её как испорченную.
+    """
+    rescored = 0
+    for vacancy, details in repo.pending_scoring():
+        try:
+            repo.save_score(vacancy.id, scorer.score(vacancy, details))
+        except Exception as error:  # noqa: BLE001 — одна вакансия не роняет прогон
+            stats.degrade(PARTIAL, f"оценка вакансии {vacancy.id} не пересчиталась: {error}")
+            logger.error(
+                "оценка вакансии %s не пересчиталась: %s", vacancy.id, error, exc_info=True
+            )
+            continue
+        rescored += 1
+    return rescored
+```
+
+- [ ] **Step 7: Реализовать `hh_search/pipeline/reporting.py`**
+
+```python
+"""Шаг 7: отправка готового в приёмники (спека §4.1, §5.2).
+
+Порядок здесь важнее кода. Карантин срабатывает ВНУТРИ `unreported()`:
+нечитаемая оценка обнуляется именно в момент чтения, и вакансия уходит в
+`pending_scoring`. Значит один вызов `unreported()` не может вернуть то,
+что он же только что отправил на пересчёт, — а лечение обязано занимать
+один прогон, не два. Отсюда два прохода `пересчёт → unreported()`:
+
+* первый разгребает очередь, которую мог создать сам шаг обогащения
+  (`save_description` при отказе оценки), и читает готовое;
+* второй досчитывает то, что карантин обнулил во время этого чтения.
+
+Двух проходов ДОСТАТОЧНО и это доказуемо: записать оценку, которая не
+читается обратно, нельзя — `ScoreBreakdown` запрещает `inf`/`nan` на
+входе, поэтому пересчитанная оценка не может снова уйти в карантин.
+"""
+
+import logging
+from collections.abc import Sequence
+from datetime import datetime
+
+from hh_search.domain.models import ScoredVacancy
+from hh_search.pipeline.enrichment import rescore
+from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
+from hh_search.scoring.base import Scorer
+from hh_search.sinks.base import Sink
+from hh_search.storage.repository import SqliteRepository
+
+logger = logging.getLogger(__name__)
+
+_PASSES = 2
+
+
+def report(
+    repo: SqliteRepository,
+    scorer: Scorer,
+    sinks: Sequence[Sink],
+    stats: RunStats,
+    moment: datetime,
+) -> None:
+    ready = _collect(repo, scorer, stats)
+    if not ready:
+        return
+    if not sinks:
+        # Недостижимо через конфиг (`sinks` требует min_length=1), но
+        # пометить вакансии отправленными, не отправив их никуда, — тихая
+        # потеря, а такие пути в этом проекте обязаны кричать.
+        stats.degrade(FAILED, "приёмников нет, отправлять некуда")
+        logger.error("приёмников нет: %d вакансий остаются в очереди отправки", len(ready))
+        return
+    delivered, failed = _emit(sinks, ready, moment)
+    if failed:
+        _complain(ready, delivered, failed, stats)
+        return
+    repo.mark_reported([item.discovered.id for item in ready])
+    stats.reported = len(ready)
+    logger.info("отправлено вакансий: %d, приёмники: %s", len(ready), ", ".join(delivered))
+
+
+def _collect(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> list[ScoredVacancy]:
+    """Готовое к отправке — после того, как очередь пересчёта разобрана."""
+    ready: list[ScoredVacancy] = []
+    for _ in range(_PASSES):
+        stats.rescored += rescore(repo, scorer, stats)
+        ready = repo.unreported()
+    # Хранилище кричит из `unreported()` о застрявших строках, но пропуск
+    # шага не должен быть тихим и здесь: `stuck` уезжает в журнал прогона,
+    # а id — в лог, потому что без них не понять, какие вакансии, уже
+    # стоившие запроса к hh.ru, не попадут ни в один отчёт.
+    stuck = repo.pending_scoring()
+    stats.stuck = len(stuck)
+    if stuck:
+        stats.degrade(PARTIAL, f"оценка не досчитана у {len(stuck)} вакансий")
+        logger.error(
+            "%d вакансий с готовым описанием остались без оценки и не попадут в отчёт: %s. "
+            "Описание у них есть, перекачка не нужна — нужен локальный пересчёт",
+            len(stuck),
+            ", ".join(vacancy.id for vacancy, _ in stuck),
+        )
+    return ready
+
+
+def _emit(
+    sinks: Sequence[Sink], ready: Sequence[ScoredVacancy], moment: datetime
+) -> tuple[list[str], list[str]]:
+    delivered: list[str] = []
+    failed: list[str] = []
+    for sink in sinks:
+        try:
+            sink.emit(ready, moment)
+        except Exception as error:  # noqa: BLE001 — падение приёмника не теряет вакансии
+            failed.append(sink.name)
+            logger.error(
+                "приёмник %s не принял %d вакансий: %s",
+                sink.name,
+                len(ready),
+                error,
+                exc_info=True,
+            )
+        else:
+            delivered.append(sink.name)
+    return delivered, failed
+
+
+def _complain(
+    ready: Sequence[ScoredVacancy], delivered: Sequence[str], failed: Sequence[str], stats: RunStats
+) -> None:
+    """Ни одной вакансии не помечаем отправленной — и говорим, чем платим.
+
+    `mark_reported` только при успехе ВСЕХ приёмников защищает от потери,
+    но не от повтора: следующий прогон отдаст те же вакансии заново, и
+    приёмник, отработавший сейчас, увидит их второй раз. Устранить это
+    внутри конвейера нечем — доставка at-least-once по построению, —
+    поэтому идемпотентность по `id` остаётся обязанностью приёмника, а
+    здесь обязателен громкий лог и понижение статуса: молча задваивать
+    отчёт нельзя.
+    """
+    stats.degrade(PARTIAL, f"приёмники не приняли отчёт: {', '.join(failed)}")
+    logger.error(
+        "приёмники %s не приняли отчёт, поэтому %d вакансий остаются в очереди отправки. "
+        "Следующий прогон отправит их заново, и приёмники, отработавшие сейчас (%s), "
+        "увидят их повторно",
+        ", ".join(failed),
+        len(ready),
+        ", ".join(delivered) or "ни один",
+    )
+```
+
+- [ ] **Step 8: Реализовать `hh_search/pipeline/__init__.py`**
+
+```python
+"""Оркестрация семи шагов конвейера (спека §4.1).
+
+Модуль разбит на файлы по шагам, а `run_once` здесь оставлен один и
+целиком: единственное, что он знает, — ПОРЯДОК шагов и то, что журнал
+прогона закрывается при любом исходе. Порядок здесь — не оформление:
+сохранение идёт до отправки, отправка выбирает из базы, а не из памяти
+(поэтому авария между шагами ничего не теряет), и пересчёт оценки стоит
+между двумя чтениями `unreported()`, потому что карантин срабатывает
+внутри чтения (см. reporting.py).
+
+`build_sinks` вызывается ВНЕ этой функции и до неё — контракт задачи 9:
+опечатка в имени приёмника обязана ронять процесс на старте, а не в
+середине прогона, когда за страницы уже заплачено запросами к hh.ru.
+"""
+
+import logging
+from collections.abc import Sequence
+from datetime import UTC, datetime
+
+from hh_search.config.models import Config
+from hh_search.errors import AccessForbidden
+from hh_search.pipeline.discovery import discover, prefilter
+from hh_search.pipeline.enrichment import enrich
+from hh_search.pipeline.reporting import report
+from hh_search.pipeline.stats import EXIT_CODES, FAILED, OK, PARTIAL, RunStats
+from hh_search.scoring.base import Scorer
+from hh_search.sinks.base import Sink
+from hh_search.sources.http import PoliteClient
+from hh_search.storage.repository import SqliteRepository
+
+__all__ = ["EXIT_CODES", "FAILED", "OK", "PARTIAL", "RunStats", "run_once"]
+
+logger = logging.getLogger(__name__)
 
 
 def run_once(
@@ -3391,157 +4683,430 @@ def run_once(
     sinks: Sequence[Sink],
     now: datetime | None = None,
 ) -> RunStats:
-    moment = now or datetime.now()
+    """Один прогон целиком. Возвращает счётчики и статус, не бросает при частичном отказе.
+
+    Наружу летит только `AccessForbidden` (спека §9: устойчивый 403 —
+    остановка прогона) и ошибки программиста. Журнал прогона закрывается
+    в любом случае, иначе в таблице `run` копятся строки `running`, и
+    healthcheck перестаёт понимать, что происходит.
+    """
+    moment = now or datetime.now(UTC)
+    if moment.tzinfo is None:
+        # Наивная дата разъехалась бы с `reported_at`: имя файла отчёта
+        # берётся отсюда, а `reported_at` пишется в UTC хранилищем — при
+        # ночном прогоне это разные сутки.
+        raise ValueError(f"момент прогона обязан быть aware UTC, получено {moment!r}")
     stats = RunStats()
-    prefilter = Prefilter(config.profile)
     run_id = repo.start_run()
-
     try:
-        stats.new_count, stats.discovered = _discover(config, client, repo, stats)
-        stats.rejected = _prefilter(repo, prefilter, config)
-        stats.enriched = _enrich(config, client, repo, scorer, stats)
-        stats.reported = _emit(repo, sinks, moment)
+        discover(config, client, repo, stats)
+        prefilter(config, repo, stats)
+        enrich(config, client, repo, scorer, stats)
+        report(repo, scorer, sinks, stats, moment)
     except AccessForbidden as error:
-        stats.status = "failed"
-        stats.error = str(error)
-        logger.error("прогон остановлен: %s", error)
-        repo.finish_run(run_id, "failed", error=str(error), **_counters(stats))
+        stats.degrade(FAILED, f"hh.ru закрыл доступ: {error}")
+        logger.error("прогон остановлен: %s. Обходные пути не применяются", error)
+        repo.finish_run(run_id, stats.status, **stats.counters())
         raise
-    except Exception as error:  # noqa: BLE001 — журнал прогона обязан закрыться
-        stats.status = "failed"
-        stats.error = str(error)
-        repo.finish_run(run_id, "failed", error=str(error), **_counters(stats))
+    except Exception as error:
+        stats.degrade(FAILED, f"необработанная ошибка: {error}")
+        logger.exception("прогон прерван необработанной ошибкой")
+        repo.finish_run(run_id, stats.status, **stats.counters())
         raise
-
-    repo.finish_run(run_id, stats.status, error=stats.error, **_counters(stats))
+    repo.finish_run(run_id, stats.status, **stats.counters())
     logger.info(
-        "прогон завершён: %s, найдено %d, новых %d, отсеяно %d, обогащено %d, отправлено %d",
-        stats.status, stats.discovered, stats.new_count, stats.rejected,
-        stats.enriched, stats.reported,
+        "прогон %s: найдено %d, новых %d, отсеяно %d, обогащено %d, пересчитано %d, "
+        "без оценки %d, отправлено %d%s",
+        stats.status,
+        stats.discovered,
+        stats.new_count,
+        stats.rejected,
+        stats.enriched,
+        stats.rescored,
+        stats.stuck,
+        stats.reported,
+        f", причина: {stats.error}" if stats.error else "",
     )
     return stats
-
-
-def _counters(stats: RunStats) -> dict[str, int]:
-    return {
-        "discovered": stats.discovered,
-        "new_count": stats.new_count,
-        "rejected": stats.rejected,
-        "enriched": stats.enriched,
-        "reported": stats.reported,
-    }
-
-
-def _discover(
-    config: Config, client: PoliteClient, repo: SqliteRepository, stats: RunStats
-) -> tuple[int, int]:
-    new_count = 0
-    discovered = 0
-    for query in config.queries.queries:
-        url = build_rss_url(query)
-        try:
-            response = client.get(url, conditional=repo.cache_headers(url))
-        except (FetchFailed, RobotsDisallowed) as error:
-            logger.warning("запрос %r пропущен: %s", query.text, error)
-            stats.status = "partial"
-            continue
-
-        if response.status_code == 304:
-            logger.debug("лента %r не изменилась", query.text)
-            continue
-
-        repo.save_cache_headers(
-            url, response.headers.get("ETag"), response.headers.get("Last-Modified")
-        )
-        for vacancy in parse_feed(response.text, query.text):
-            discovered += 1
-            if repo.add_discovered(vacancy, query.cluster, query.weight):
-                new_count += 1
-    return new_count, discovered
-
-
-def _prefilter(repo: SqliteRepository, prefilter: Prefilter, config: Config) -> int:
-    rejected = 0
-    for vacancy in repo.pending_enrichment(config.app.enrich.max_attempts):
-        reason = prefilter.reason_to_reject(vacancy)
-        if reason:
-            repo.mark_rejected(vacancy.id, reason)
-            rejected += 1
-    return rejected
-
-
-def _enrich(
-    config: Config, client: PoliteClient, repo: SqliteRepository, scorer: Scorer, stats: RunStats
-) -> int:
-    pending = repo.pending_enrichment(config.app.enrich.max_attempts)
-    enriched = 0
-    failed = 0
-    for vacancy in pending:
-        try:
-            response = client.get(vacancy_url(vacancy.id))
-            if response.status_code != 200:
-                raise FetchFailed(f"{response.status_code} на {vacancy.url}")
-            details = parse_vacancy_page(response.text)
-        except (FetchFailed, RobotsDisallowed) as error:
-            failed += 1
-            stats.status = "partial"
-            attempts = repo.bump_enrich_attempt(vacancy.id)
-            logger.warning("не удалось обогатить %s (попытка %d): %s", vacancy.id, attempts, error)
-            if attempts >= config.app.enrich.max_attempts:
-                repo.mark_rejected(vacancy.id, "enrich_failed")
-            continue
-
-        repo.save_details(vacancy.id, details)
-        repo.save_score(vacancy.id, scorer.score(vacancy, details))
-        enriched += 1
-
-    if pending and failed * 2 > len(pending):
-        logger.error(
-            "провалено %d обогащений из %d — вероятно, hh.ru сменил вёрстку страницы вакансии",
-            failed, len(pending),
-        )
-    return enriched
-
-
-def _emit(repo: SqliteRepository, sinks: Sequence[Sink], moment: datetime) -> int:
-    pending = repo.unreported()
-    if not pending:
-        return 0
-
-    all_succeeded = True
-    for sink in sinks:
-        try:
-            sink.emit(pending, moment)
-        except Exception as error:  # noqa: BLE001 — падение sink'а не должно терять вакансии
-            all_succeeded = False
-            logger.warning("sink %s упал: %s", sink.name, error)
-
-    if all_succeeded:
-        repo.mark_reported([item.discovered.id for item in pending])
-        return len(pending)
-    return 0
 ```
 
-- [ ] **Step 4: Запустить тесты и убедиться, что они проходят**
+- [ ] **Step 9: Запустить тесты, типы и линтер**
 
-Run: `uv run pytest tests/test_pipeline.py -v && uv run mypy hh_search`
-Expected: 6 passed
+Run: `uv run pytest tests/test_pipeline.py -q && uv run mypy --strict hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/pipeline tests/test_pipeline.py`
+Expected: `23 passed`, `Success: no issues found`, `All checks passed!`,
+`6 files already formatted`
 
-- [ ] **Step 5: Прогнать весь набор тестов**
+- [ ] **Step 10: Проверочные прогоны — то, чего pytest не видит**
 
-Run: `uv run pytest -v && uv run ruff check . && uv run mypy hh_search`
-Expected: все тесты зелёные
+Три Critical этой задачи ревьюер нашёл не тестами, а прогонами. Их обязательно выполнить
+руками: `pytest` проверяет ожидания, а эти три проверки проверяют ФАКТЫ — число запросов к
+источнику, целость данных после убийства процесса и то, что сервис не ослеп.
 
-- [ ] **Step 6: Коммит**
+Создать **временный** `check_pipeline.py` в корне (в репозиторий он НЕ коммитится):
+
+```python
+"""Три проверочных прогона, которых не делает pytest. Скрипт временный.
+
+Запуск: `uv run python check_pipeline.py /tmp/hh-check [crash <каталог> <точка>]`
+"""
+
+import gzip
+import json
+import os
+import subprocess
+import sys
+from collections import Counter
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+
+import httpx
+
+from hh_search.config.loader import load_config
+from hh_search.config.models import Config
+from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, ScoredVacancy, VacancyDetails
+from hh_search.pipeline import RunStats, run_once
+from hh_search.scoring.keyword import KeywordScorer
+from hh_search.sinks.base import Sink
+from hh_search.sources.http import PoliteClient
+from hh_search.storage.repository import SqliteRepository
+
+HERE = Path(__file__).parent
+FIXTURES = HERE / "tests" / "fixtures"
+ROBOTS = (FIXTURES / "robots_hh.txt").read_text(encoding="utf-8")
+BROKEN = '<html><head><link rel="canonical" href="/vacancies/programmist"></head></html>'
+CRASH_POINTS = ("после-discovery", "между-обогащением-и-оценкой", "после-сохранения", "до-отчёта")
+# os._exit не исполняет ни finally, ни atexit — счётчик запросов пишется ДО
+# него, иначе родитель не узнает, сколько страниц успел скачать убитый.
+_COUNTER: "tuple[Path, Source] | None" = None
+
+
+def die() -> None:
+    if _COUNTER is not None:
+        path, source = _COUNTER
+        path.write_text(json.dumps(dict(source.calls)), encoding="utf-8")
+    os._exit(9)
+
+
+APP_YAML = """
+contact_email: "me@example.com"
+user_agent: "hh-search/0.1 (personal job search; {{contact_email}})"
+schedule: {{interval_hours: 4}}
+http: {{delay_between_requests_sec: 0.1, timeout_sec: 20, max_retries: 3, respect_robots: true}}
+enrich: {{max_attempts: 3}}
+sinks: [csv, markdown]
+paths: {{state: {root}/state/hh.db, reports: {root}/reports, logs: {root}/logs}}
+"""
+PROFILE_YAML = """
+weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, domain: 0.10}
+saturation: {stack: 5, responsibilities: 3}
+penalty_per_signal: 15
+signals:
+  title_roles: [team lead]
+  title_tech: [backend]
+  stack: [yocto]
+  responsibilities: [архитектур]
+  domain: [телеком]
+negative: [junior]
+report_threshold: 60
+"""
+QUERIES_YAML = "queries:\n  - {slug: programmist, cluster: embedded, weight: 9, pages: 1}\n"
+
+
+def unpack(name: str) -> str:
+    with gzip.open(FIXTURES / name, "rt", encoding="utf-8") as handle:
+        return handle.read()
+
+
+class Source:
+    """Подменённый транспорт: считает запросы и умеет отдавать 304."""
+
+    def __init__(self, listing: str = "", honour_etag: bool = False) -> None:
+        self.listing = listing or unpack("listing_programmist.html.gz")
+        self.page = unpack("vacancy_salary.html.gz")
+        self.honour_etag = honour_etag
+        self.calls: Counter[str] = Counter()
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handle)
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/robots.txt":
+            self.calls["robots"] += 1
+            return httpx.Response(200, text=ROBOTS, headers={"Content-Type": "text/plain"})
+        if path.startswith("/vacancies"):
+            self.calls["листинг"] += 1
+            if self.honour_etag and request.headers.get("If-None-Match"):
+                return httpx.Response(304)
+            return httpx.Response(200, text=self.listing, headers={"ETag": '"v1"'})
+        self.calls["страница"] += 1
+        return httpx.Response(200, text=self.page)
+
+
+class CountingSink:
+    name = "counting"
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> None:
+        self.seen += [item.discovered.id for item in vacancies]
+
+
+class Killer:
+    """Скорер, убивающий процесс между скачиванием страницы и записью."""
+
+    def __init__(self, profile: Config, die: bool) -> None:
+        self._real = KeywordScorer(profile.profile)
+        self._die = die
+        self.calls = 0
+
+    def score(self, discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown:
+        self.calls += 1
+        if self._die and self.calls == 2:
+            die()
+        return self._real.score(discovered, details)
+
+
+def make_config(root: Path) -> Config:
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "app.yaml").write_text(APP_YAML.format(root=root), encoding="utf-8")
+    (config_dir / "profile.yaml").write_text(PROFILE_YAML, encoding="utf-8")
+    (config_dir / "queries.yaml").write_text(QUERIES_YAML, encoding="utf-8")
+    return load_config(config_dir)
+
+
+def one_run(config: Config, source: Source, sinks: Sequence[Sink], point: str = "") -> RunStats:
+    import hh_search.pipeline as pipeline
+
+    config.app.paths.state.parent.mkdir(parents=True, exist_ok=True)
+    if point == "после-discovery":
+        pipeline.prefilter = lambda *a: die()  # type: ignore[assignment, return-value]
+    if point == "до-отчёта":
+        pipeline.report = lambda *a: die()  # type: ignore[assignment, return-value]
+    with (
+        SqliteRepository(config.app.paths.state) as repo,
+        PoliteClient(
+            config.app.http,
+            config.app.user_agent,
+            sleep=lambda _: None,
+            transport=source.transport(),
+        ) as client,
+    ):
+        repo.init_schema()
+        if point == "после-сохранения":
+            _kill_after_save(repo)
+        scorer = Killer(config, point == "между-обогащением-и-оценкой")
+        return run_once(config, client, repo, scorer, sinks)
+
+
+def _kill_after_save(repo: SqliteRepository) -> None:
+    real = repo.save_enriched
+    saved = {"n": 0}
+
+    def save_then_die(vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown) -> None:
+        real(vacancy_id, details, score)
+        saved["n"] += 1
+        if saved["n"] == 2:
+            die()
+
+    repo.save_enriched = save_then_die  # type: ignore[method-assign]
+
+
+def state(config: Config) -> str:
+    raw = SqliteRepository(config.app.paths.state)
+    with raw as repo:
+        rows = repo.reported_since(datetime.fromisoformat("2000-01-01T00:00:00+00:00"))
+        pending = repo.pending_enrichment(3)
+        scoring = repo.pending_scoring()
+    return f"отправлено в базе={len(rows)} ждут страницы={len(pending)} ждут оценки={len(scoring)}"
+
+
+def scenario_one(root: Path) -> None:
+    print("ПРОВЕРКА 1: два прогона подряд со счётчиком фактических HTTP-вызовов")
+    config = make_config(root)
+    source = Source()
+    for number in (1, 2):
+        sink = CountingSink()
+        before = Counter(source.calls)
+        stats = one_run(config, source, [sink])
+        print(
+            f"  прогон {number}: status={stats.status} discovered={stats.discovered} "
+            f"new={stats.new_count} rejected={stats.rejected} enriched={stats.enriched} "
+            f"reported={stats.reported}; запросы={dict(source.calls - before)}"
+        )
+    print(f"  ИТОГО: {dict(source.calls)}")
+    print(f"  {state(config)}")
+
+
+def scenario_two(root: Path) -> None:
+    print("\nПРОВЕРКА 2: os._exit в четырёх точках конвейера и перезапуск")
+    for point in CRASH_POINTS:
+        work = root / point
+        child = subprocess.run(
+            [sys.executable, __file__, str(work), "crash", point], capture_output=True, text=True
+        )
+        spent = json.loads((work / "calls.json").read_text(encoding="utf-8"))
+        config = make_config(work)
+        source = Source()
+        sink = CountingSink()
+        stats = one_run(config, source, [sink])
+        print(f"  {point}: код выхода {child.returncode}, до аварии {spent}")
+        print(
+            f"      прогон после аварии: status={stats.status} enriched={stats.enriched} "
+            f"rescored={stats.rescored} reported={stats.reported}; "
+            f"страниц скачано всего={spent.get('страница', 0) + source.calls['страница']}"
+        )
+        print(f"      {state(config)}")
+
+
+def scenario_three(root: Path) -> None:
+    print("\nПРОВЕРКА 3: обрезанная выдача, дальше источник отдаёт 304 на условный запрос")
+    config = make_config(root)
+    source = Source(listing=BROKEN, honour_etag=True)
+    stats = one_run(config, source, [CountingSink()])
+    print(f"  прогон 1 (обрезано): status={stats.status} discovered={stats.discovered}")
+    source.listing = unpack("listing_programmist.html.gz")
+    for number in (2, 3):
+        stats = one_run(config, source, [CountingSink()])
+        print(
+            f"  прогон {number} (источник в порядке): status={stats.status} "
+            f"discovered={stats.discovered} enriched={stats.enriched} reported={stats.reported}"
+        )
+    print(f"  {state(config)}")
+
+
+def main() -> None:
+    global _COUNTER  # noqa: PLW0603 — проверочный скрипт, не код проекта
+    root = Path(sys.argv[1])
+    if len(sys.argv) > 2 and sys.argv[2] == "crash":
+        source = Source()
+        _COUNTER = (root / "calls.json", source)
+        one_run(make_config(root), source, [CountingSink()], sys.argv[3])
+        return
+    scenario_one(root / "one")
+    scenario_two(root / "two")
+    scenario_three(root / "three")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run: `rm -rf /tmp/hh-check && uv run python check_pipeline.py /tmp/hh-check 2>/dev/null`
+Expected (фактический вывод, числа настоящие):
+
+```text
+ПРОВЕРКА 1: два прогона подряд со счётчиком фактических HTTP-вызовов
+  прогон 1: status=ok discovered=20 new=20 rejected=2 enriched=18 reported=18; запросы={'robots': 1, 'листинг': 1, 'страница': 18}
+  прогон 2: status=ok discovered=20 new=0 rejected=0 enriched=0 reported=0; запросы={'robots': 1, 'листинг': 1}
+  ИТОГО: {'robots': 2, 'листинг': 2, 'страница': 18}
+  отправлено в базе=18 ждут страницы=0 ждут оценки=0
+
+ПРОВЕРКА 2: os._exit в четырёх точках конвейера и перезапуск
+  после-discovery: код выхода 9, до аварии {'robots': 1, 'листинг': 1}
+      прогон после аварии: status=ok enriched=18 rescored=0 reported=18; страниц скачано всего=18
+      отправлено в базе=18 ждут страницы=0 ждут оценки=0
+  между-обогащением-и-оценкой: код выхода 9, до аварии {'robots': 1, 'листинг': 1, 'страница': 2}
+      прогон после аварии: status=ok enriched=17 rescored=0 reported=18; страниц скачано всего=19
+      отправлено в базе=18 ждут страницы=0 ждут оценки=0
+  после-сохранения: код выхода 9, до аварии {'robots': 1, 'листинг': 1, 'страница': 2}
+      прогон после аварии: status=ok enriched=16 rescored=0 reported=18; страниц скачано всего=18
+      отправлено в базе=18 ждут страницы=0 ждут оценки=0
+  до-отчёта: код выхода 9, до аварии {'robots': 1, 'листинг': 1, 'страница': 18}
+      прогон после аварии: status=ok enriched=0 rescored=0 reported=18; страниц скачано всего=18
+      отправлено в базе=18 ждут страницы=0 ждут оценки=0
+
+ПРОВЕРКА 3: обрезанная выдача, дальше источник отдаёт 304 на условный запрос
+  прогон 1 (обрезано): status=failed discovered=0
+  прогон 2 (источник в порядке): status=ok discovered=20 enriched=18 reported=18
+  прогон 3 (источник в порядке): status=ok discovered=0 enriched=0 reported=0
+  отправлено в базе=18 ждут страницы=0 ждут оценки=0
+```
+
+Что здесь важно прочитать, а не пролистать:
+
+- **Проверка 1.** Страница вакансии скачана 18 раз за ДВА прогона, а не 36: второй прогон
+  стоит одного запроса к листингу. `discovered=20` во втором прогоне при `new=0` — это
+  честно: мок отдаёт 200 (не 304), листинг перечитан, все двадцать id уже известны базе.
+- **Проверка 2.** Ни одна авария не потеряла ни одной вакансии: после перезапуска отправлены
+  все 18 в каждой из четырёх точек. Цена аварии между скачиванием и записью — РОВНО одна
+  перекачанная страница (19 вместо 18): описание того элемента, на котором умер процесс, в
+  базу не попало. Двухфазная запись это убрала бы, но она дороже одного запроса раз в
+  аварию. Незакрытая строка `running` в журнале остаётся (os._exit не исполняет ни `finally`,
+  ни обработчики) — `last_successful_run()` такие строки не считает, healthcheck не обманут;
+  ретенция журнала — отложенный minor задачи 6.
+- **Проверка 3.** Прогон 1 на обрезанной выдаче даёт `failed` (а не `partial` — иначе
+  healthcheck считал бы его успехом), валидатор не сохранён, и прогон 2 находит все 20 вакансий
+  несмотря на то, что мок отдаёт 304 на любой условный запрос. Прогон 3 получает 304 честно —
+  выдача не менялась — и это уже законный ноль.
+
+Удалить скрипт: `rm check_pipeline.py`
+
+- [ ] **Step 11: Мутационная проверка — каждый тест обязан краснеть**
+
+Восемь тестов прежней редакции проходили при полностью неработающем конвейере (один проверял
+отсутствие одного URL и был зелен, даже если не скачано ни одной страницы). Чтобы это не
+повторилось, каждый дефект вносится в реализацию и проверяется, что конкретный тест краснеет.
+Девятнадцать мутаций, все обязаны быть убиты:
+
+| Мутация | Кто обязан покраснеть |
+|---|---|
+| валидатор кэша пишется ДО разбора | `test_validator_is_not_stored_when_writing_vacancies_fails` |
+| прежний валидатор не сбрасывается | `test_unparsable_listing_leaves_no_cache_validator` |
+| нет агрегатного сторожа тишины | `test_run_where_no_listing_yielded_anything_is_a_failure` |
+| сторож тишины срабатывает постранично | `test_one_empty_page_among_several_is_not_a_failure` |
+| транспортный отказ жжёт попытку | `test_source_outage_does_not_burn_enrich_attempts` |
+| отказ страницы не жжёт попытку | `test_broken_page_burns_attempts_and_ends_in_enrich_failed` |
+| оценка считается без обработчика | `test_scoring_failure_keeps_the_page_and_is_loud` |
+| пересчёт и чтение одним проходом | `test_score_is_recomputed_and_sent_within_one_run` |
+| `mark_reported` при упавшем приёмнике | `test_partial_sink_failure_keeps_everything_unreported` |
+| отказ приёмника не понижает статус | `test_partial_sink_failure_keeps_everything_unreported` |
+| без приёмников вакансии помечаются отправленными | `test_run_without_sinks_marks_nothing_reported` |
+| читается только первая страница листинга | `test_pages_of_one_listing_are_requested_one_by_one` |
+| `SalaryBlockStats` не передаётся в разбор | `test_salary_drift_guard_is_wired_into_enrichment` |
+| нет канарейки на >50% отказов | `test_more_than_half_failed_pages_raise_the_canary` |
+| журнал не закрывается при 403 | `test_forbidden_stops_the_run_and_closes_the_journal` |
+| наивный `now` принимается | `test_naive_moment_is_rejected` |
+| счётчик обогащения присваивается в конце | `test_counters_survive_a_crash_in_the_middle` |
+| остаток очереди пересчёта не перепроверяется | `test_scoring_failure_keeps_the_page_and_is_loud` |
+| новыми считаются все найденные | `test_second_run_costs_one_request_and_reports_nothing` |
+
+Проверено при переписывании плана: 19 из 19 мутантов убиты. Первая мутация из таблицы —
+единственная, которая на первом заходе ВЫЖИЛА (её маскировал `reset_cache`), из-за чего в
+набор добавлен отдельный тест на сам порядок записи.
+
+- [ ] **Step 12: Прогнать весь набор**
+
+Run: `uv run pytest -q && uv run mypy --strict hh_search tests && uv run ruff check .`
+Expected: `343 passed` (281 на `f9f77bd` + 39 за задачи 7–9 + 23 здесь), `Success: no issues
+found`, `All checks passed!`
+
+- [ ] **Step 13: Коммит**
 
 ```bash
-git add hh_search/pipeline.py tests/test_pipeline.py
+git add hh_search/pipeline hh_search/storage/repository.py hh_search/storage/run_log.py \
+        tests/test_pipeline.py
 git commit -m "feat: конвейер прогона
 
-Семь шагов по спеке. Сохранение идёт до отправки, а отправка берёт
-данные из базы по status=new, поэтому падение sink'а или контейнера
-между шагами ничего не теряет. Канарейка на >50% провалов обогащения
-ловит смену вёрстки hh.ru в тот же день."
+Семь шагов по спеке §4.1. Порядок значим и закреплён тестами:
+валидатор условного запроса пишется ПОСЛЕ записи вакансий в базу
+(иначе одна обрезанная выдача ослепляет сервис навсегда через вечный
+304), сохранение идёт до отправки, а пересчёт оценки стоит между двумя
+чтениями unreported() — карантин срабатывает внутри чтения, и лечение
+обязано занимать один прогон, а не два.
+
+Транспортный отказ отделён от отказа страницы: 503 и недоступный
+robots.txt больше не жгут enrich_attempts, иначе двенадцать часов
+недоступности hh.ru терминально выбрасывали всю очередь. Отказ скоринга
+сохраняет уже скачанную страницу через save_description.
+
+Статус прогона умеет только ухудшаться и связан с кодом возврата, а
+пустой прогон при непустом списке листингов — громкий отказ, а не ok:
+класс «месяцы молчания при зелёном healthcheck» закрыт агрегатным
+сторожем."
 ```
 
 ---
@@ -3550,144 +5115,794 @@ git commit -m "feat: конвейер прогона
 
 **Files:**
 - Create: `hh_search/logging_setup.py`, `hh_search/scheduler.py`, `hh_search/__main__.py`
-- Test: `tests/test_cli.py`
+- Edit: `hh_search/storage/repository.py` (`set_status` возвращает результат, добавляется
+  `reported_since`)
+- Test: `tests/test_cli.py`, `tests/test_scheduler.py`, `tests/test_repository.py`
 
 **Interfaces:**
 - Consumes: всё предыдущее
-- Produces: `setup_logging(logs_dir: Path) -> None`; `serve(config: Config, run: Callable[[], None], sleep: Callable[[float], None] = time.sleep, iterations: int | None = None) -> None`; typer-приложение `app` с командами `run`, `serve`, `init-db`, `healthcheck`, `report`, `mark`
+- Produces: `setup_logging(logs_dir: Path, level: int = logging.INFO) -> None`;
+  `class StopSignal` (`install`, `request`, `requested`, `wait`);
+  `serve(config, run, *, stop=None, monotonic=time.monotonic, iterations=None) -> int`;
+  typer-приложение `app` с командами `run`, `serve`, `init-db`, `healthcheck`, `report`, `mark`;
+  `repo.reported_since(cutoff) -> list[ScoredVacancy]`
 
-Команды:
-- `run` — один прогон. Спека §8.3 писала `run --once`, но флаг ничего не менял: команда всегда делает ровно один прогон. Лишний параметр убран, отклонение фиксируется в Task 13.
-- `serve` — бесконечный цикл; исключение внутри прогона логируется и **не** роняет процесс, кроме `AccessForbidden`, который тоже логируется, но цикл продолжается — иначе контейнер будет перезапускаться в петле
-- `init-db` — создать схему
-- `healthcheck` — код возврата 0, если последний успешный прогон свежее `2 × interval_hours`, иначе 1
-- `report --since 7d` — перегенерировать отчёт из базы по вакансиям со статусом `reported`
-- `mark <id> <status>` — проставить статус вручную
+Команды (спека §8.3):
 
-Общая опция `--config-dir` (по умолчанию `/data/config`, переопределяется переменной `HH_CONFIG_DIR`).
+- `run` — один прогон. Спека писала `run --once`, но флаг ничего не менял; отклонение
+  фиксируется в Task 13. **Код возврата повторяет статус прогона**: `ok` → 0, `failed` → 1,
+  `partial` → 3. Код 2 занят ошибкой конфига и аргументов — его же отдаёт click.
+- `serve` — цикл по расписанию. Отказ прогона демон не роняет (иначе контейнер уходит в петлю
+  перезапусков), но два `AccessForbidden` ПОДРЯД останавливают его ненулевым кодом.
+- `init-db` — создать схему и догнать существующую до неё.
+- `healthcheck` — 0, если последний успешный прогон свежее `2 × interval_hours`.
+- `report --since 7d` — перегенерировать отчёт по уже отправленным вакансиям.
+- `mark <id> <status>` — проставить статус вручную.
 
-- [ ] **Step 1: Написать падающий тест**
+Общая опция `--config-dir` (по умолчанию `/data/config`, переопределяется `HH_CONFIG_DIR`).
+
+**Что здесь переписано и почему.** Прежняя редакция была собрана и прогнана; девять дефектов
+воспроизведены исполнением.
+
+1. **`@app.callback()` грузил конфиг раньше всего.** `--help` любой подкоманды требовал
+   существующего `/data/config`, а отсутствие конфига давало голый traceback. Теперь callback
+   запоминает только каталог; читает его та команда, которой конфиг нужен, а ошибка чтения
+   превращается в сообщение и код 2.
+2. **`healthcheck` до `init-db`** падал `OperationalError` и оставлял после себя нулевой файл
+   базы (`sqlite3.connect` создаёт файл молча) — а это первые секунды жизни контейнера, когда
+   Docker уже дёргает HEALTHCHECK. Теперь отсутствие файла и база без схемы дают внятное
+   сообщение и код 1, ничего не создавая.
+3. **`serve` продолжал работу после `AccessForbidden`** — против спеки §9. Сервис, которому
+   hh.ru закрыл доступ, стучался каждые четыре часа вечно, и никто не узнавал. Теперь считаются
+   подряд идущие 403, и после второго демон выходит кодом 1.
+4. **Расписание дрейфовало.** `sleep(interval)` ПОСЛЕ прогона добавляет к интервалу
+   длительность прогона: при четырёх часах и десятиминутном прогоне сутки уносят расписание на
+   два с половиной часа. Пауза считается до дедлайна.
+5. **Нет обработчика SIGTERM.** Ядро не применяет диспозицию по умолчанию к PID 1, поэтому
+   сигнал до процесса не доезжает: замер — `docker stop` длится все 10.2 с и завершается кодом
+   137 (SIGKILL) против 0.2 с и кода 0 с обработчиком. Обработчика при этом МАЛО: по PEP 475
+   прерванный `time.sleep` возобновляется, и процесс, взведя флаг, продолжал бы спать четыре
+   часа. Ожидание построено на `threading.Event`.
+6. **`mark 999999 applied` печатал «готово» и отдавал 0.** Теперь `set_status` возвращает
+   `rowcount > 0`, а CLI проверяет и статус тоже: `set_status` его не валидирует, а вводит
+   человек — опечатка увела бы вакансию в состояние, невидимое всем трём выборкам.
+7. **`report --since 7days`** давал traceback. Разбор периода — регулярка, отказ — сообщение.
+8. **`report` не компилировался и обходил карантин.** `reported_since` в прежней редакции не
+   импортировал `json`, звал несуществующий `self._to_discovered`, тянул `SELECT v.*` без
+   `CAST(... AS BLOB)` и брал запрос недетерминированным подзапросом. Факт после механической
+   починки импортов: порча ОДНОЙ строки роняла выборку целиком —
+   `OperationalError: Could not decode to UTF-8 column 'title'`. Команда `report` —
+   единственный способ пользователя вытащить историю, она обязана переживать порчу лучше
+   конвейера, а не хуже.
+9. **`setup_logging` вызывался только в `run`/`serve`**, поэтому `ERROR` карантина в четырёх
+   командах уходил мимо файла; `httpx` на INFO писал строку на каждый запрос, заливая ими
+   единственный след потери данных.
+
+Плюс найденное при сборке: **`run` на пустом volume падал `unable to open database file`** ещё
+до `init_schema()` — каталог базы создавал только `init-db`. Порядок команд, которого нигде не
+обещано. Теперь каталог создаёт и `_execute`.
+
+- [ ] **Step 1: Правки хранилища, нужные CLI**
+
+В `hh_search/storage/repository.py`: `set_status` возвращает `bool`, и добавляется
+`reported_since` рядом с `unreported` (тем же способом чтения — `CAST(... AS BLOB)` плюс
+`safe_rows`, иначе одна битая строка отнимает у пользователя всю историю):
+
+```python
+    def set_status(self, vacancy_id: str, status: str) -> bool:
+        """Ручная смена статуса. `False` — такой вакансии в базе нет.
+
+        Результат возвращается, потому что вызывающий — CLI, а id туда
+        вводит человек: `mark 999999 applied` на несуществующей вакансии
+        без этого печатал бы «готово» и отдавал код 0.
+        """
+        cursor = self._connection.execute(
+            "UPDATE vacancy SET status = ? WHERE id = ?", (status, vacancy_id)
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+```
+
+```python
+    def reported_since(self, cutoff: datetime) -> list[ScoredVacancy]:
+        """Уже отправленное — для повторной генерации отчёта командой `report`.
+
+        Читается ровно теми же средствами, что `unreported()`:
+        `CAST(... AS BLOB)` плюс `safe_rows`. Без них одна испорченная
+        строка роняла бы весь курсор (sqlite3 декодирует TEXT на этапе
+        fetch, до того как код увидит хоть одну строку) — то есть
+        единственный способ пользователя вернуть историю ломался бы от
+        того, что конвейер переживает. Запрос, которым вакансия найдена,
+        берётся из колонки `primary_query`, а не подзапросом по
+        `vacancy_query`: подзапрос без ORDER BY недетерминирован и мог
+        разойтись с кластером в том же отчёте.
+        """
+        rows = self._connection.execute(
+            f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
+            "CAST(valid_through AS BLOB) AS valid_through, "
+            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
+            "FROM vacancy WHERE status = ? AND reported_at >= ? "
+            "AND description IS NOT NULL AND score_detail IS NOT NULL ORDER BY score DESC",
+            (STATUS_REPORTED, to_utc_iso(cutoff)),
+        ).fetchall()
+        return safe_rows(rows, to_scored, self._quarantine)
+```
+
+Импорт `to_utc_iso` добавить к существующему из `time_utils`.
+
+Карантин здесь тот же, что и в конвейере, и это осознанно: строка со `status = 'reported'`
+терминальна, восстанавливать её нечем (заголовка и кластера на странице вакансии нет вовсе),
+поэтому нечитаемая строка пропускается с записью в лог и с сохранением улик в
+`corrupt_payload` — вместо того чтобы отнять у пользователя весь отчёт.
+
+Тест границ окна — в `tests/test_repository.py`:
+
+```python
+def test_reported_since_takes_only_reported_rows_inside_the_window(tmp_path: object) -> None:
+    """`report --since N` — выборка по окну, а не «всё, что есть».
+
+    Проверяются обе границы сразу: неотправленная вакансия в отчёт не
+    попадает (её отправит конвейер, и повтор был бы задвоением), а
+    отправленная раньше окна — не попадает тоже, иначе `--since` не значит
+    ничего.
+    """
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    for vacancy_id in ("1", "2", "3"):
+        repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+        repository.save_enriched(vacancy_id, VacancyDetails(description="текст"), make_score())
+    repository.mark_reported(["1", "2"])
+    repository.close()
+    long_ago = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    corrupt(db_path, "UPDATE vacancy SET reported_at = ? WHERE id = '2'", long_ago)
+
+    repository = SqliteRepository(db_path)
+    window = datetime.now(UTC) - timedelta(days=7)
+    assert [item.discovered.id for item in repository.reported_since(window)] == ["1"]
+    repository.close()
+```
+
+Run: `uv run pytest tests/test_repository.py -q && uv run mypy --strict hh_search`
+Expected: `57 passed` (56 + один новый), `Success: no issues found`
+
+- [ ] **Step 2: Написать падающие тесты**
 
 Создать `tests/test_cli.py`:
 
 ```python
+import logging
+import sqlite3
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from typer.testing import CliRunner
+import httpx
+import pytest
+import respx
+from typer.testing import CliRunner, Result
 
 from hh_search.__main__ import app
 from hh_search.config.loader import load_config
-from hh_search.scheduler import serve
 from hh_search.storage.repository import SqliteRepository
-from tests.test_config import write_config
+from tests.test_config import APP_YAML, write_config
+from tests.test_pipeline import TWO_VACANCIES, page_html
+
+FIXTURES = Path(__file__).parent / "fixtures"
+LISTING_URL = "https://hh.ru/vacancies/programmist"
+PAGE_PATTERN = r"^https://hh\.ru/vacancy/\d+$"
+TODAY = f"{datetime.now(UTC):%Y-%m-%d}"
 
 runner = CliRunner()
 
 
-def prepare(tmp_path: Path) -> Path:
+@pytest.fixture(autouse=True)
+def _restore_logging() -> Iterator[None]:
+    """`setup_logging` перенастраивает КОРНЕВОЙ логгер — вернём его на место.
+
+    Иначе файловый обработчик, открытый на удалённый `tmp_path`, остаётся
+    висеть на весь остаток прогона тестов.
+    """
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    yield
+    for handler in root.handlers[:]:
+        if handler not in handlers:
+            handler.close()
+    root.handlers[:] = handlers
+    root.setLevel(level)
+
+
+def prepare(tmp_path: Path, **overrides: str) -> Path:
+    """Каталог конфигов, у которого все пути ведут в `tmp_path`."""
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    write_config(config_dir)
-    state = tmp_path / "state"
-    state.mkdir()
-    app_yaml = (config_dir / "app.yaml").read_text(encoding="utf-8")
-    app_yaml = app_yaml.replace("/data/state/hh.db", str(state / "hh.db"))
-    app_yaml = app_yaml.replace("/data/reports", str(tmp_path / "reports"))
-    app_yaml = app_yaml.replace("/data/logs", str(tmp_path / "logs"))
-    (config_dir / "app.yaml").write_text(app_yaml, encoding="utf-8")
+    app_yaml = (
+        # Пауза между запросами — минимальная разрешённая: тесты ходят через
+        # настоящий `time.sleep` (клиент собирает сам CLI), и секунда на
+        # запрос превращала весь файл в двадцать три секунды.
+        APP_YAML.replace("delay_between_requests_sec: 1.0", "delay_between_requests_sec: 0.1")
+        .replace("/data/state", str(tmp_path / "state"))
+        .replace("/data/reports", str(tmp_path / "reports"))
+        .replace("/data/logs", str(tmp_path / "logs"))
+    )
+    write_config(config_dir, **{"app.yaml": app_yaml, **overrides})
     return config_dir
 
 
-def test_init_db_creates_state_file(tmp_path: Path) -> None:
-    config_dir = prepare(tmp_path)
-    result = runner.invoke(app, ["--config-dir", str(config_dir), "init-db"])
+def invoke(config_dir: Path, *args: str) -> Result:
+    return runner.invoke(app, ["--config-dir", str(config_dir), *args])
+
+
+def mock_source(listing_status: int = 200) -> None:
+    respx.get("https://hh.ru/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=(FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+    )
+    respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(listing_status, text=TWO_VACANCIES)
+    )
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+
+
+def state_path(config_dir: Path) -> Path:
+    return load_config(config_dir).app.paths.state
+
+
+# --- init-db и healthcheck: первые секунды жизни контейнера ----------------
+
+
+def test_init_db_creates_the_state_file(tmp_path: Path) -> None:
+    result = invoke(prepare(tmp_path), "init-db")
     assert result.exit_code == 0
     assert (tmp_path / "state" / "hh.db").exists()
 
 
-def test_healthcheck_fails_without_any_run(tmp_path: Path) -> None:
+def test_healthcheck_before_init_db_fails_and_creates_nothing(tmp_path: Path) -> None:
+    """Docker дёргает HEALTHCHECK с первых секунд, до первого `init-db`.
+
+    Прежняя редакция падала `OperationalError` и оставляла после себя
+    нулевой файл базы: `sqlite3.connect` создаёт файл молча, и следующий
+    `init-db` работал уже по мусору.
+    """
     config_dir = prepare(tmp_path)
-    runner.invoke(app, ["--config-dir", str(config_dir), "init-db"])
-    result = runner.invoke(app, ["--config-dir", str(config_dir), "healthcheck"])
+    result = invoke(config_dir, "healthcheck")
     assert result.exit_code == 1
+    assert "init-db" in result.output
+    assert not (tmp_path / "state" / "hh.db").exists()
 
 
-def test_healthcheck_passes_after_fresh_run(tmp_path: Path) -> None:
+def test_healthcheck_fails_on_a_database_without_schema(tmp_path: Path) -> None:
+    """Файл есть, схемы нет — для healthcheck это «работа не делается».
+
+    Кода возврата тут недостаточно: необработанное исключение внутри
+    CliRunner тоже даёт единицу, поэтому проверяется ещё и сообщение —
+    иначе тест зелен и на голом `OperationalError`.
+    """
     config_dir = prepare(tmp_path)
-    runner.invoke(app, ["--config-dir", str(config_dir), "init-db"])
-    config = load_config(config_dir)
-    with SqliteRepository(config.app.paths.state) as repo:
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "hh.db").write_bytes(b"")
+    result = invoke(config_dir, "healthcheck")
+    assert result.exit_code == 1
+    assert "журнал прогонов не читается" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_healthcheck_passes_after_a_fresh_run(tmp_path: Path) -> None:
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
+    with SqliteRepository(state_path(config_dir)) as repo:
         repo.finish_run(repo.start_run(), "ok")
-    result = runner.invoke(app, ["--config-dir", str(config_dir), "healthcheck"])
-    assert result.exit_code == 0
+    assert invoke(config_dir, "healthcheck").exit_code == 0
 
 
-def test_healthcheck_fails_on_stale_run(tmp_path: Path) -> None:
+def test_healthcheck_counts_a_partial_run_as_success(tmp_path: Path) -> None:
+    """`partial` — успех для healthcheck: прогон состоялся, часть работы
+    потеряна. Именно поэтому «прогон не сделал ничего» обязан быть
+    `failed`, иначе индикатор зелен при полной тишине."""
     config_dir = prepare(tmp_path)
-    runner.invoke(app, ["--config-dir", str(config_dir), "init-db"])
-    config = load_config(config_dir)
+    invoke(config_dir, "init-db")
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.finish_run(repo.start_run(), "partial")
+    assert invoke(config_dir, "healthcheck").exit_code == 0
+
+
+def test_healthcheck_fails_on_a_stale_run(tmp_path: Path) -> None:
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
     stale = datetime.now(UTC) - timedelta(hours=24)
-    with SqliteRepository(config.app.paths.state) as repo:
+    with SqliteRepository(state_path(config_dir)) as repo:
         repo.finish_run(repo.start_run(), "ok", finished_at=stale)
-    result = runner.invoke(app, ["--config-dir", str(config_dir), "healthcheck"])
+    result = invoke(config_dir, "healthcheck")
     assert result.exit_code == 1
+    assert "последний успешный прогон" in result.output
 
 
-def test_mark_sets_status(tmp_path: Path) -> None:
+def test_failed_run_does_not_make_healthcheck_green(tmp_path: Path) -> None:
+    """Строка журнала есть, но статус `failed` — индикатор обязан краснеть."""
     config_dir = prepare(tmp_path)
-    runner.invoke(app, ["--config-dir", str(config_dir), "init-db"])
-    result = runner.invoke(app, ["--config-dir", str(config_dir), "mark", "111", "applied"])
+    invoke(config_dir, "init-db")
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.finish_run(repo.start_run(), "failed", error="источник закрыт")
+    assert invoke(config_dir, "healthcheck").exit_code == 1
+
+
+# --- конфиг читается лениво ------------------------------------------------
+
+
+def test_subcommand_help_works_without_any_config() -> None:
+    """`--help` не имеет права требовать существующего /data/config.
+
+    Пока конфиг грузил `@app.callback()`, любая подсказка по подкоманде
+    падала на отсутствующем каталоге — то есть первый же способ разобраться
+    с CLI не работал.
+    """
+    result = runner.invoke(app, ["--config-dir", "/nonexistent", "run", "--help"])
     assert result.exit_code == 0
+    assert "прогон" in result.output
 
 
-def test_serve_runs_requested_number_of_iterations() -> None:
-    from hh_search.config.models import AppConfig, Config, PathsConfig, ScheduleConfig
+def test_missing_config_gives_a_message_and_not_a_traceback(tmp_path: Path) -> None:
+    result = invoke(tmp_path / "nowhere", "healthcheck")
+    assert result.exit_code == 2
+    assert "не прочитан" in result.output
+    assert "Traceback" not in result.output
 
-    calls: list[int] = []
-    delays: list[float] = []
 
-    def one_run() -> None:
-        calls.append(1)
+def test_config_dir_comes_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`HH_CONFIG_DIR` читается в момент вызова, а не при импорте модуля."""
+    config_dir = prepare(tmp_path)
+    monkeypatch.setenv("HH_CONFIG_DIR", str(config_dir))
+    result = runner.invoke(app, ["init-db"])
+    assert result.exit_code == 0
+    assert (tmp_path / "state" / "hh.db").exists()
 
-    config = Config.model_construct(
-        app=AppConfig.model_construct(
-            schedule=ScheduleConfig(interval_hours=2),
-            paths=PathsConfig(state=Path("x"), reports=Path("y"), logs=Path("z")),
+
+def test_unknown_sink_stops_the_run_before_the_database_is_touched(tmp_path: Path) -> None:
+    """Опечатка в `sinks` роняет процесс на старте — контракт задачи 9.
+
+    До сети и до `start_run()`: иначе за страницы уже заплачено запросами,
+    а отчёт всё равно не выйдет.
+    """
+    broken = APP_YAML.replace("sinks: [csv, markdown]", "sinks: [csv, telegram]")
+    config_dir = prepare(tmp_path, **{"app.yaml": broken})
+    result = invoke(config_dir, "run")
+    assert result.exit_code == 2
+    assert "telegram" in result.output
+    assert not (tmp_path / "state" / "hh.db").exists()
+
+
+# --- run: код возврата повторяет статус прогона ---------------------------
+
+
+@respx.mock
+def test_run_writes_both_reports_and_exits_zero(tmp_path: Path) -> None:
+    """Сквозной прогон через CLI: файлы отчётов на диске, код 0."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    result = invoke(config_dir, "run")
+    assert result.exit_code == 0
+    csv_report = tmp_path / "reports" / f"{TODAY}-new.csv"
+    assert "111" in csv_report.read_text(encoding="utf-8-sig")
+    assert (tmp_path / "reports" / f"{TODAY}-new.md").exists()
+
+
+@respx.mock
+def test_run_exits_nonzero_when_reports_cannot_be_written(tmp_path: Path) -> None:
+    """Главный сценарий I2: работа не сделана, а код возврата ноль.
+
+    Каталог отчётов занят файлом, поэтому оба приёмника падают. Прогон
+    обязан не помечать вакансии отправленными, понизить статус и отдать
+    ненулевой код: cron про испорченный volume иначе не узнает никогда.
+    """
+    config_dir = prepare(tmp_path)
+    (tmp_path / "reports").write_text("не каталог", encoding="utf-8")
+    mock_source()
+    result = invoke(config_dir, "run")
+    assert result.exit_code == 3
+    assert "partial" in result.output
+    with SqliteRepository(state_path(config_dir)) as repo:
+        assert [item.discovered.id for item in repo.unreported()] == ["111"]
+
+
+@respx.mock
+def test_run_exits_one_when_the_source_is_silent(tmp_path: Path) -> None:
+    """Пустая выдача по всем листингам — `failed` и код 1, а не тихий ноль."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text='<html><head><link rel="canonical" href="/vacancies/programmist">'
+            '<script type="application/ld+json">{"@type": "ItemList", '
+            '"itemListElement": []}</script></head></html>',
         )
     )
-    serve(config, one_run, sleep=delays.append, iterations=3)
-    assert len(calls) == 3
-    assert delays == [7200.0, 7200.0, 7200.0]
+    result = invoke(config_dir, "run")
+    assert result.exit_code == 1
+    assert "failed" in result.output
 
 
-def test_serve_survives_an_exception_in_a_run() -> None:
-    from hh_search.config.models import AppConfig, Config, PathsConfig, ScheduleConfig
+@respx.mock
+def test_run_exits_one_on_forbidden(tmp_path: Path) -> None:
+    """403 — остановка прогона и внятное сообщение, а не traceback (спека §9)."""
+    config_dir = prepare(tmp_path)
+    mock_source(listing_status=403)
+    result = invoke(config_dir, "run")
+    assert result.exit_code == 1
+    assert "закрыл доступ" in result.output
+    assert "Traceback" not in result.output
 
-    attempts: list[int] = []
 
-    def failing_run() -> None:
-        attempts.append(1)
-        raise RuntimeError("сеть отвалилась")
+# --- mark: id и статус вводит человек -------------------------------------
 
-    config = Config.model_construct(
-        app=AppConfig.model_construct(
-            schedule=ScheduleConfig(interval_hours=1),
-            paths=PathsConfig(state=Path("x"), reports=Path("y"), logs=Path("z")),
+
+@respx.mock
+def test_mark_sets_the_status_of_an_existing_vacancy(tmp_path: Path) -> None:
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    result = invoke(config_dir, "mark", "111", "applied")
+    assert result.exit_code == 0
+    assert read_status(state_path(config_dir), "111") == "applied"
+
+
+def test_mark_fails_on_an_unknown_id(tmp_path: Path) -> None:
+    """`rowcount`, а не «команда не упала».
+
+    Прежняя редакция печатала «111 → applied» и отдавала ноль на любой
+    выдуманный id: единственный способ узнать об опечатке — сходить в базу
+    руками.
+    """
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
+    result = invoke(config_dir, "mark", "999999", "applied")
+    assert result.exit_code == 1
+    assert "нет в базе" in result.output
+
+
+def test_mark_rejects_an_unknown_status(tmp_path: Path) -> None:
+    """`set_status` статус не валидирует, а вводит его человек: опечатка
+    (`aplied`) увела бы вакансию в состояние, невидимое всем трём выборкам."""
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
+    result = invoke(config_dir, "mark", "111", "aplied")
+    assert result.exit_code == 2
+    assert "допустимы" in result.output
+
+
+# --- report: единственный способ вернуть историю --------------------------
+
+
+@respx.mock
+def test_report_regenerates_the_files_from_the_database(tmp_path: Path) -> None:
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    for report in (tmp_path / "reports").iterdir():
+        report.unlink()
+
+    result = invoke(config_dir, "report", "--since", "7d")
+    assert result.exit_code == 0
+    assert "перегенерировано вакансий: 1" in result.output
+    assert "111" in (tmp_path / "reports" / f"{TODAY}-new.csv").read_text(encoding="utf-8-sig")
+
+
+@respx.mock
+def test_report_survives_a_corrupted_row(tmp_path: Path) -> None:
+    """C5: `report` обязан переживать порчу базы ЛУЧШЕ конвейера, а не хуже.
+
+    Одна строка с битым UTF-8 в `title` роняла весь курсор
+    (`OperationalError: Could not decode to UTF-8 column 'title'`) — то
+    есть единственный способ пользователя вернуть историю отнимался
+    целиком. Здесь порча ровно та же, а вторая вакансия обязана доехать до
+    отчёта.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text='<html><head><link rel="canonical" href="/vacancies/programmist">'
+            '<script type="application/ld+json">{"@type": "ItemList", "itemListElement": ['
+            '{"url": "https://hh.ru/vacancy/111", "name": "Embedded Engineer"},'
+            '{"url": "https://hh.ru/vacancy/333", "name": "Linux Engineer"}]}'
+            "</script></head></html>",
         )
     )
-    serve(config, failing_run, sleep=lambda _: None, iterations=2)
-    assert len(attempts) == 2
+    invoke(config_dir, "run")
+    db = str(state_path(config_dir))
+    raw = sqlite3.connect(db)
+    raw.execute("UPDATE vacancy SET title = CAST(? AS TEXT) WHERE id = '111'", (b"\xff\xfe",))
+    raw.commit()
+    raw.close()
+    for report in (tmp_path / "reports").iterdir():
+        report.unlink()
+
+    result = invoke(config_dir, "report", "--since", "7")
+    assert result.exit_code == 0
+    assert "перегенерировано вакансий: 1" in result.output
+    body = (tmp_path / "reports" / f"{TODAY}-new.csv").read_text(encoding="utf-8-sig")
+    assert "333" in body
+
+
+def test_report_rejects_an_unparsable_period(tmp_path: Path) -> None:
+    """`--since 7days` давал traceback: единственный признак — стектрейс."""
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
+    result = invoke(config_dir, "report", "--since", "7days")
+    assert result.exit_code == 2
+    assert "число дней" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_report_says_when_there_is_nothing(tmp_path: Path) -> None:
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
+    result = invoke(config_dir, "report")
+    assert result.exit_code == 0
+    assert "не найдено" in result.output
+
+
+# --- логи -----------------------------------------------------------------
+
+
+@respx.mock
+def test_every_command_writes_the_log_file(tmp_path: Path) -> None:
+    """`setup_logging` вызывается не только в `run`/`serve`.
+
+    Карантин пишет `ERROR` из `report` и `mark` тоже, и эти записи —
+    единственный след порчи данных. Пока логирование настраивали два
+    места из шести, они уходили в никуда.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    db = str(state_path(config_dir))
+    raw = sqlite3.connect(db)
+    raw.execute("UPDATE vacancy SET title = CAST(? AS TEXT) WHERE id = '111'", (b"\xff\xfe",))
+    raw.commit()
+    raw.close()
+    (tmp_path / "logs" / "hh.log").write_text("", encoding="utf-8")
+
+    invoke(config_dir, "report", "--since", "7")
+    assert "повреждены данные" in (tmp_path / "logs" / "hh.log").read_text(encoding="utf-8")
+
+
+def read_status(db: Path, vacancy_id: str) -> str | None:
+    raw = sqlite3.connect(str(db))
+    row = raw.execute("SELECT status FROM vacancy WHERE id = ?", (vacancy_id,)).fetchone()
+    raw.close()
+    return None if row is None else str(row[0])
 ```
 
-- [ ] **Step 2: Запустить тест и убедиться, что он падает**
-
-Run: `uv run pytest tests/test_cli.py -v`
-Expected: FAIL с `ModuleNotFoundError: No module named 'hh_search.__main__'`
-
-- [ ] **Step 3: Реализовать `hh_search/logging_setup.py`**
+Создать `tests/test_scheduler.py`:
 
 ```python
+import os
+import signal
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from hh_search.config.loader import load_config
+from hh_search.config.models import Config
+from hh_search.errors import AccessForbidden
+from hh_search.scheduler import EXIT_FORBIDDEN, EXIT_OK, StopSignal, serve
+from tests.test_config import write_config
+
+HOUR = 3600.0
+
+
+@pytest.fixture()
+def config(tmp_path: Path) -> Config:
+    """Настоящий валидированный конфиг, а не `model_construct`.
+
+    `model_construct` проверок не выполняет, поэтому тест на нём проходил
+    бы и с конфигом, который в проде не загрузится; заодно он не проходит
+    `mypy --strict` — плагин pydantic требует все поля.
+    """
+    return load_config(write_config(tmp_path))
+
+
+class FakeClock(StopSignal):
+    """Часы и ожидание под контролем теста.
+
+    Наследуется от `StopSignal`, а не подменяет `time.sleep`: расписание
+    считается по монотонным часам, и подделать нужно именно их — иначе
+    дрейф проверить нечем.
+    """
+
+    def __init__(self, run_duration: float = 0.0, stop_after: int | None = None) -> None:
+        super().__init__()
+        self.now = 1000.0
+        self.delays: list[float] = []
+        self.runs = 0
+        self._run_duration = run_duration
+        self._stop_after = stop_after
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def wait(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        self.now += seconds
+
+    def run(self) -> None:
+        self.runs += 1
+        self.now += self._run_duration
+        if self._stop_after is not None and self.runs >= self._stop_after:
+            self.request()
+
+
+def test_serve_makes_exactly_the_requested_number_of_runs(config: Config) -> None:
+    """Три прогона — ДВЕ паузы: после последнего ждать незачем.
+
+    Прежняя редакция закрепляла тестом лишний `sleep` после финального
+    прогона, то есть фиксировала как правильное то, что просто удлиняло
+    выход.
+    """
+    clock = FakeClock()
+    assert serve(config, clock.run, stop=clock, monotonic=clock.monotonic, iterations=3) == 0
+    assert clock.runs == 3
+    assert clock.delays == [4 * HOUR, 4 * HOUR]
+
+
+def test_schedule_does_not_drift_by_the_length_of_the_run(config: Config) -> None:
+    """Пауза считается до ДЕДЛАЙНА, а не «интервал после прогона».
+
+    Иначе к каждому интервалу прибавляется длительность прогона: при
+    четырёх часах и десятиминутном прогоне сутки уносят расписание на два
+    с половиной часа, а через неделю утренний прогон становится ночным.
+    """
+    clock = FakeClock(run_duration=600.0)
+    serve(config, clock.run, stop=clock, monotonic=clock.monotonic, iterations=3)
+    assert clock.delays == [4 * HOUR - 600.0, 4 * HOUR - 600.0]
+
+
+def test_run_longer_than_the_interval_does_not_sleep_negative(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Прогон длиннее интервала: следующий начинается сразу, без sleep(-x)."""
+    clock = FakeClock(run_duration=5 * HOUR)
+    serve(config, clock.run, stop=clock, monotonic=clock.monotonic, iterations=2)
+    assert clock.delays == []
+    assert "дольше интервала" in caplog.text
+
+
+def test_failing_run_does_not_stop_the_daemon(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Падение прогона не роняет демон: иначе контейнер уходит в петлю
+    перезапусков, теряя расписание."""
+    clock = FakeClock()
+    attempts = {"n": 0}
+
+    def failing() -> None:
+        attempts["n"] += 1
+        raise RuntimeError("сеть отвалилась")
+
+    assert serve(config, failing, stop=clock, monotonic=clock.monotonic, iterations=2) == 0
+    assert attempts["n"] == 2
+    assert "продолжаем по расписанию" in caplog.text
+
+
+# --- устойчивый 403: спека §9 требует остановки ----------------------------
+
+
+def test_two_forbidden_in_a_row_stop_the_daemon(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Сервис, которому hh.ru закрыл доступ, обязан перестать стучаться.
+
+    Прежняя редакция логировала 403 и продолжала цикл вечно: каждые четыре
+    часа, годами, и никто об этом не узнавал. Спека §9 требует остановки с
+    громким логом.
+    """
+    clock = FakeClock()
+    calls = {"n": 0}
+
+    def forbidden() -> None:
+        calls["n"] += 1
+        raise AccessForbidden("hh.ru ответил 403")
+
+    code = serve(config, forbidden, stop=clock, monotonic=clock.monotonic, iterations=10)
+    assert code == EXIT_FORBIDDEN
+    assert calls["n"] == 2
+    assert "устойчиво" in caplog.text
+
+
+def test_a_single_forbidden_between_successes_does_not_stop_the_daemon(config: Config) -> None:
+    """Считаются ПОДРЯД идущие: одиночный 403 бывает антиботом на запросе."""
+    clock = FakeClock()
+    calls = {"n": 0}
+
+    def flaky() -> None:
+        calls["n"] += 1
+        if calls["n"] in (1, 3):
+            raise AccessForbidden("hh.ru ответил 403")
+
+    code = serve(config, flaky, stop=clock, monotonic=clock.monotonic, iterations=4)
+    assert (code, calls["n"]) == (EXIT_OK, 4)
+
+
+# --- остановка по сигналу --------------------------------------------------
+
+
+def test_stop_request_ends_the_loop_without_another_run(config: Config) -> None:
+    """Флаг проверяется МЕЖДУ прогонами: начатый прогон дорабатывает.
+
+    `iterations=10`, но остановка запрошена во втором прогоне, значит
+    третьего быть не должно — и ждать после него нечего.
+    """
+    clock = FakeClock(stop_after=2)
+    code = serve(config, clock.run, stop=clock, monotonic=clock.monotonic, iterations=10)
+    assert (code, clock.runs, clock.delays) == (EXIT_OK, 2, [4 * HOUR])
+
+
+def test_sigterm_sets_the_flag() -> None:
+    """Обработчик SIGTERM обязан существовать.
+
+    Ядро не применяет диспозицию по умолчанию к PID 1: без обработчика
+    сигнал до процесса не доезжает, `docker stop` выжидает весь grace
+    period и добивает SIGKILL (замер: 10.2 с и код 137 против 0.2 с и
+    кода 0).
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+    stop = StopSignal()
+    try:
+        stop.install()
+        assert not stop.requested()
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert stop.requested()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_waiting_is_interrupted_by_the_signal() -> None:
+    """Обработчика мало: прерванный сигналом `time.sleep` возобновляется.
+
+    PEP 475 повторяет прерванный вызов, поэтому обработчик, который только
+    взводит флаг, оставил бы процесс спать все четыре часа — то есть
+    SIGKILL всё равно. Здесь ожидание построено на `threading.Event`:
+    `set()` из обработчика освобождает замок, и `wait()` возвращается
+    немедленно. Если это сломать, тест не «упадёт быстро», а провисит
+    указанные тридцать секунд — и именно это и есть проверяемый факт.
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+    stop = StopSignal()
+    try:
+        stop.install()
+        timer = threading.Timer(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM))
+        timer.start()
+        started = time.monotonic()
+        stop.wait(30.0)
+        elapsed = time.monotonic() - started
+        timer.cancel()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert stop.requested()
+    assert elapsed < 5.0
+```
+
+- [ ] **Step 3: Запустить тесты и убедиться, что они падают**
+
+Run: `uv run pytest tests/test_cli.py tests/test_scheduler.py -q`
+Expected: `ModuleNotFoundError: No module named 'hh_search.__main__'` и
+`No module named 'hh_search.scheduler'`, «2 errors»
+
+- [ ] **Step 4: Реализовать `hh_search/logging_setup.py`**
+
+```python
+"""Логи одновременно в stdout (их забирает `docker logs`) и в файл с ротацией."""
+
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
@@ -3695,114 +5910,312 @@ from pathlib import Path
 
 FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
+# httpx на INFO пишет строку на КАЖДЫЙ запрос, включая robots.txt. За сутки
+# это несколько сотен строк, среди которых теряются наши ERROR — а именно
+# они здесь единственный способ узнать о потере данных.
+QUIET_LOGGERS = ("httpx", "httpcore")
+
 
 def setup_logging(logs_dir: Path, level: int = logging.INFO) -> None:
-    """Логи одновременно в stdout (их забирает docker logs) и в файл с ротацией."""
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    """Настроить корневой логгер. Вызывается КАЖДОЙ командой CLI.
+
+    Не только `run`/`serve`: карантин хранилища пишет `ERROR` из любой
+    команды, включая `report` и `mark`, и эти записи — единственный след
+    порчи данных. Уходить в никуда они не имеют права.
+    """
     formatter = logging.Formatter(FORMAT)
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
-    file_handler = RotatingFileHandler(
-        logs_dir / "hh.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    file_error: OSError | None = None
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                logs_dir / "hh.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+            )
+        )
+    except OSError as error:
+        # Недоступный каталог логов — не причина не искать вакансии:
+        # stdout остаётся, и в него же уходит жалоба на потерю файла.
+        file_error = error
 
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers.clear()
-    root.addHandler(stream_handler)
-    root.addHandler(file_handler)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    if file_error is not None:
+        root.error("логи пишутся только в stdout: каталог %s недоступен (%s)", logs_dir, file_error)
 ```
 
-- [ ] **Step 4: Реализовать `hh_search/scheduler.py`**
+- [ ] **Step 5: Реализовать `hh_search/scheduler.py`**
 
 ```python
+"""Цикл режима `serve`: расписание, остановка по сигналу, устойчивый 403."""
+
 import logging
+import signal
+import threading
 import time
 from collections.abc import Callable
+from types import FrameType
 
 from hh_search.config.models import Config
+from hh_search.errors import AccessForbidden
 
 logger = logging.getLogger(__name__)
+
+# Одиночный 403 бывает случайным (антибот на конкретном запросе). Второй
+# ПОДРЯД — это уже устойчивый отказ доступа, а спека §9 требует на него
+# остановку с громким логом. Стучаться каждые четыре часа вечно значит и
+# продолжать нарушать запрет, и не дать никому об этом узнать.
+MAX_FORBIDDEN_IN_A_ROW = 2
+
+EXIT_OK = 0
+EXIT_FORBIDDEN = 1
+
+# Сигналы, по которым демон завершается штатно. SIGINT сюда не входит
+# намеренно: Ctrl+C должен прерывать процесс сразу (KeyboardInterrupt),
+# а не «после текущего прогона».
+STOP_SIGNALS = (signal.SIGTERM,)
+
+
+class StopSignal:
+    """Флаг «пора остановиться» плюс прерываемое ожидание.
+
+    Ожидание построено на `threading.Event`, а не на `time.sleep`, и это
+    не стилистика. Ядро не применяет диспозицию по умолчанию к PID 1,
+    поэтому без явного обработчика SIGTERM до процесса просто не
+    доезжает: `docker stop` выжидает весь grace period и добивает
+    SIGKILL (замер: 10.2 с и код 137 против 0.2 с и кода 0). А
+    обработчика мало: по PEP 475 прерванный сигналом `time.sleep`
+    возобновляется, то есть флаг взводится и процесс продолжает спать все
+    четыре часа. `Event.set()` из обработчика освобождает замок, которого
+    ждёт `Event.wait()`, поэтому ожидание кончается немедленно.
+
+    Цена честного завершения — незакрытая строка `run` в журнале при
+    остановке посреди прогона; конвейер закрывает её сам, потому что
+    остановка проверяется только МЕЖДУ прогонами.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def install(self, numbers: tuple[signal.Signals, ...] = STOP_SIGNALS) -> None:
+        for number in numbers:
+            signal.signal(number, self._handle)
+
+    def _handle(self, number: int, frame: FrameType | None) -> None:
+        logger.warning(
+            "получен %s: завершаем работу после текущего прогона", signal.Signals(number).name
+        )
+        self.request()
+
+    def request(self) -> None:
+        """Попросить остановиться. Взводит флаг и обрывает ожидание."""
+        self._event.set()
+
+    def requested(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, seconds: float) -> None:
+        self._event.wait(seconds)
 
 
 def serve(
     config: Config,
-    run: Callable[[], None],
-    sleep: Callable[[float], None] = time.sleep,
+    run: Callable[[], object],
+    *,
+    stop: StopSignal | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
     iterations: int | None = None,
-) -> None:
-    """Бесконечный цикл прогонов. Падение одного прогона не роняет процесс."""
-    interval_seconds = config.app.schedule.interval_hours * 3600.0
+) -> int:
+    """Прогоны по расписанию. Возвращает код возврата процесса.
+
+    Расписание считается по ДЕДЛАЙНУ, а не паузой после прогона: пауза на
+    фиксированный интервал добавляет к нему длительность самого прогона, и
+    при четырёх часах и десятиминутном прогоне сутки уносят расписание на
+    два с половиной часа. Через неделю «утренний» прогон становится
+    ночным.
+
+    Отказ одного прогона не роняет демон (иначе контейнер уходил бы в
+    петлю перезапусков), но `AccessForbidden` подряд — исключение из
+    правила: см. `MAX_FORBIDDEN_IN_A_ROW`.
+    """
+    interval = config.app.schedule.interval_hours * 3600.0
+    signal_ = stop if stop is not None else StopSignal()
+    forbidden = 0
     completed = 0
-    while iterations is None or completed < iterations:
-        try:
-            run()
-        except Exception:
-            logger.exception("прогон завершился с ошибкой, продолжаем по расписанию")
-        completed += 1
-        sleep(interval_seconds)
+    try:
+        while iterations is None or completed < iterations:
+            deadline = monotonic() + interval
+            try:
+                run()
+            except AccessForbidden as error:
+                forbidden += 1
+                logger.error(
+                    "hh.ru закрыл доступ (%d-й раз подряд): %s", forbidden, error, exc_info=True
+                )
+                if forbidden >= MAX_FORBIDDEN_IN_A_ROW:
+                    logger.error(
+                        "доступ закрыт устойчиво (%d прогона подряд), демон остановлен. "
+                        "Обходные пути не применяются — нужен человек",
+                        forbidden,
+                    )
+                    return EXIT_FORBIDDEN
+            except Exception:
+                logger.exception("прогон завершился с ошибкой, продолжаем по расписанию")
+            else:
+                forbidden = 0
+            completed += 1
+            if signal_.requested():
+                break
+            if iterations is not None and completed >= iterations:
+                # Ждать после последнего прогона незачем: пауза перед
+                # выходом только удлиняет тест и маскирует дрейф.
+                break
+            _wait_until(signal_, deadline - monotonic(), interval)
+            if signal_.requested():
+                break
+    except KeyboardInterrupt:
+        logger.warning("прерван с клавиатуры, выходим")
+        return EXIT_OK
+    logger.info("демон остановлен, выполнено прогонов: %d", completed)
+    return EXIT_OK
+
+
+def _wait_until(signal_: StopSignal, remaining: float, interval: float) -> None:
+    if remaining <= 0:
+        logger.warning(
+            "прогон занял дольше интервала (%.0f с), следующий начинается немедленно; "
+            "расписание не сдвигается",
+            interval,
+        )
+        return
+    signal_.wait(remaining)
 ```
 
-- [ ] **Step 5: Реализовать `hh_search/__main__.py`**
+- [ ] **Step 6: Реализовать `hh_search/__main__.py`**
 
 ```python
+"""CLI (спека §8.3). Конфиг читается ЛЕНИВО, внутри команды.
+
+`@app.callback()`, загружающий конфиг, ломал две вещи сразу: `--help` любой
+подкоманды требовал существующего `/data/config`, а отсутствие конфига
+давало голый traceback вместо внятного сообщения. Здесь callback запоминает
+только каталог, а читает его та команда, которой конфиг действительно нужен.
+"""
+
 import logging
 import os
+import re
+import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
+from hh_search.errors import AccessForbidden
 from hh_search.logging_setup import setup_logging
-from hh_search.pipeline import run_once
-from hh_search.scheduler import serve
+from hh_search.pipeline import OK, RunStats, run_once
+from hh_search.scheduler import StopSignal, serve
 from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sinks import build_sinks
+from hh_search.sinks.base import Sink
 from hh_search.sources.http import PoliteClient
 from hh_search.storage.repository import SqliteRepository
 
 logger = logging.getLogger(__name__)
 app = typer.Typer(help="Автопоиск вакансий на hh.ru", no_args_is_help=True)
 
-DEFAULT_CONFIG_DIR = Path(os.environ.get("HH_CONFIG_DIR", "/data/config"))
-ConfigDir = Annotated[Path, typer.Option("--config-dir", help="Каталог с YAML-конфигами")]
+DEFAULT_CONFIG_DIR = Path("/data/config")
+# 2 — код click'а для ошибки в аргументах; ошибка конфига по смыслу та же.
+# 1 и 3 приходят из статуса прогона (см. pipeline/stats.py).
+EXIT_CONFIG = 2
+EXIT_FAILED = 1
+# Ручные статусы из спеки §5.2 плюс те, что ставит конвейер: `mark`
+# получает статус от человека, а `set_status` его не валидирует, и опечатка
+# (`mark 1 aplied`) увела бы вакансию в состояние, невидимое всем выборкам.
+MANUAL_STATUSES = ("interesting", "applied", "archived", "new", "rejected", "reported")
+_SINCE_RE = re.compile(r"^(\d+)\s*d?$")
+
+ConfigDir = Annotated[Path | None, typer.Option("--config-dir", help="Каталог с YAML-конфигами")]
+Since = Annotated[str, typer.Option("--since", help="Период в днях: 7 или 7d")]
 
 
 @app.callback()
-def main(ctx: typer.Context, config_dir: ConfigDir = DEFAULT_CONFIG_DIR) -> None:
-    ctx.obj = load_config(config_dir)
+def main(ctx: typer.Context, config_dir: ConfigDir = None) -> None:
+    """Запоминает каталог конфигов. Ничего не читает и не создаёт."""
+    ctx.obj = config_dir or Path(os.environ.get("HH_CONFIG_DIR", DEFAULT_CONFIG_DIR))
+
+
+def _die(message: str, code: int) -> NoReturn:
+    typer.echo(message, err=True)
+    raise typer.Exit(code)
 
 
 def _config(ctx: typer.Context) -> Config:
-    assert isinstance(ctx.obj, Config)
-    return ctx.obj
+    """Прочитать конфиг и включить логи. Ошибка конфига — внятный текст."""
+    config_dir = ctx.obj if isinstance(ctx.obj, Path) else DEFAULT_CONFIG_DIR
+    try:
+        config = load_config(config_dir)
+    except (OSError, ValueError) as error:
+        _die(f"конфиг в {config_dir} не прочитан: {error}", EXIT_CONFIG)
+    setup_logging(config.app.paths.logs)
+    return config
 
 
-def _execute(config: Config) -> None:
-    with SqliteRepository(config.app.paths.state) as repo, PoliteClient(
-        config.app.http, config.app.user_agent
-    ) as client:
-        repo.init_schema()
-        run_once(
-            config,
-            client,
-            repo,
-            KeywordScorer(config.profile),
-            build_sinks(
-                config.app.sinks, config.app.paths.reports, config.profile.report_threshold
-            ),
+def _sinks(config: Config) -> list[Sink]:
+    """Приёмники строятся ДО сети и до `start_run()` — контракт задачи 9.
+
+    В режиме `serve` это ещё важнее: собранное внутри прогона неизвестное
+    имя приёмника попало бы в `except Exception` планировщика, и демон
+    крутил бы бесполезный цикл каждые четыре часа.
+    """
+    try:
+        return build_sinks(
+            config.app.sinks, config.app.paths.reports, config.profile.report_threshold
         )
+    except ValueError as error:
+        _die(f"в app.yaml неизвестный приёмник: {error}", EXIT_CONFIG)
+
+
+def _open(config: Config) -> SqliteRepository:
+    """Открыть существующую базу. Отсутствие файла — не повод создавать его.
+
+    `sqlite3.connect` создаёт файл молча, поэтому `healthcheck` до
+    `init-db` не только падал `OperationalError`, но и оставлял после себя
+    нулевой файл базы. Docker дёргает HEALTHCHECK с первых секунд жизни
+    контейнера — то есть ровно в этот момент.
+    """
+    if not config.app.paths.state.exists():
+        _die(f"базы нет: {config.app.paths.state}. Сначала `init-db`", EXIT_FAILED)
+    return SqliteRepository(config.app.paths.state)
+
+
+def _execute(config: Config, sinks: Sequence[Sink]) -> RunStats:
+    # Каталог создаётся здесь, а не только в `init-db`: на пустом volume
+    # `sqlite3.connect` падает «unable to open database file» ещё до
+    # `init_schema()`, и первый прогон давал голый traceback, требуя
+    # необъявленного порядка команд.
+    config.app.paths.state.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        SqliteRepository(config.app.paths.state) as repo,
+        PoliteClient(config.app.http, config.app.user_agent) as client,
+    ):
+        repo.init_schema()
+        return run_once(config, client, repo, KeywordScorer(config.profile), sinks)
 
 
 @app.command("init-db")
 def init_db(ctx: typer.Context) -> None:
-    """Создать схему базы."""
+    """Создать схему базы (и догнать существующую до неё)."""
     config = _config(ctx)
     config.app.paths.state.parent.mkdir(parents=True, exist_ok=True)
     with SqliteRepository(config.app.paths.state) as repo:
@@ -3811,56 +6224,84 @@ def init_db(ctx: typer.Context) -> None:
 
 
 @app.command("run")
-def run(ctx: typer.Context) -> None:
-    """Выполнить один прогон."""
+def run_command(ctx: typer.Context) -> None:
+    """Выполнить один прогон. Код возврата повторяет статус прогона."""
     config = _config(ctx)
-    setup_logging(config.app.paths.logs)
-    _execute(config)
+    sinks = _sinks(config)
+    try:
+        stats = _execute(config, sinks)
+    except AccessForbidden as error:
+        _die(f"hh.ru закрыл доступ: {error}. Обходные пути не применяются", EXIT_FAILED)
+    if stats.status != OK:
+        # Молчаливый ноль здесь — это cron, который никогда не узнает, что
+        # отчёт не вышел: ровно тот случай, ради которого статус прогона и
+        # существует.
+        typer.echo(f"прогон завершён со статусом {stats.status}: {stats.error}", err=True)
+    raise typer.Exit(stats.exit_code())
 
 
 @app.command("serve")
 def serve_command(ctx: typer.Context) -> None:
-    """Запустить бесконечный цикл прогонов по расписанию."""
+    """Бесконечный цикл прогонов по расписанию (точка входа контейнера)."""
     config = _config(ctx)
-    setup_logging(config.app.paths.logs)
+    sinks = _sinks(config)
+    stop = StopSignal()
+    stop.install()
     logger.info("старт, интервал %d ч", config.app.schedule.interval_hours)
-    serve(config, lambda: _execute(config))
+    raise typer.Exit(serve(config, lambda: _execute(config, sinks), stop=stop))
 
 
 @app.command("healthcheck")
 def healthcheck(ctx: typer.Context) -> None:
     """Код 0, если последний успешный прогон свежее двух интервалов."""
     config = _config(ctx)
-    with SqliteRepository(config.app.paths.state) as repo:
-        last = repo.last_successful_run()
     deadline = datetime.now(UTC) - timedelta(hours=2 * config.app.schedule.interval_hours)
+    with _open(config) as repo:
+        try:
+            last = repo.last_successful_run()
+        except sqlite3.Error as error:
+            # Тип исключения — не SQL: файл базы есть, но схемы в нём нет
+            # (или он не база вовсе). Для healthcheck это «работа не
+            # делается», а не повод падать traceback'ом.
+            _die(f"журнал прогонов не читается: {error}. Сначала `init-db`", EXIT_FAILED)
     if last is None or last < deadline:
-        typer.echo(f"последний успешный прогон: {last or 'никогда'}", err=True)
-        raise typer.Exit(code=1)
+        typer.echo(
+            f"последний успешный прогон: {last.isoformat() if last else 'никогда'}, "
+            f"порог: {deadline.isoformat()}",
+            err=True,
+        )
+        raise typer.Exit(EXIT_FAILED)
     typer.echo(f"ok, последний успешный прогон: {last.isoformat()}")
 
 
 @app.command("mark")
 def mark(ctx: typer.Context, vacancy_id: str, status: str) -> None:
     """Проставить статус вакансии вручную."""
-    with SqliteRepository(_config(ctx).app.paths.state) as repo:
-        repo.set_status(vacancy_id, status)
+    config = _config(ctx)
+    if status not in MANUAL_STATUSES:
+        _die(f"неизвестный статус {status!r}; допустимы: {', '.join(MANUAL_STATUSES)}", EXIT_CONFIG)
+    with _open(config) as repo:
+        if not repo.set_status(vacancy_id, status):
+            _die(f"вакансии {vacancy_id} нет в базе, статус не изменён", EXIT_FAILED)
     typer.echo(f"{vacancy_id} → {status}")
 
 
 @app.command("report")
-def report(ctx: typer.Context, since: str = typer.Option("7d", "--since")) -> None:
-    """Перегенерировать отчёт из базы за последние N дней."""
+def report_command(ctx: typer.Context, since: Since = "7d") -> None:
+    """Перегенерировать отчёт из базы по уже отправленным вакансиям."""
     config = _config(ctx)
-    days = int(since.rstrip("d") or 7)
-    cutoff = datetime.now(UTC) - timedelta(days=days)
-    with SqliteRepository(config.app.paths.state) as repo:
+    match = _SINCE_RE.match(since.strip())
+    if match is None:
+        _die(f"--since ожидает число дней (7 или 7d), получено {since!r}", EXIT_CONFIG)
+    sinks = _sinks(config)
+    cutoff = datetime.now(UTC) - timedelta(days=int(match.group(1)))
+    with _open(config) as repo:
         vacancies = repo.reported_since(cutoff)
-    sinks = build_sinks(
-        config.app.sinks, config.app.paths.reports, config.profile.report_threshold
-    )
+    if not vacancies:
+        typer.echo(f"с {cutoff:%Y-%m-%d} отправленных вакансий не найдено")
+        return
     for sink in sinks:
-        sink.emit(vacancies, datetime.now())
+        sink.emit(vacancies, datetime.now(UTC))
     typer.echo(f"перегенерировано вакансий: {len(vacancies)}")
 
 
@@ -3868,63 +6309,82 @@ if __name__ == "__main__":
     app()
 ```
 
-- [ ] **Step 6: Дописать `reported_since` в репозиторий**
+- [ ] **Step 7: Запустить тесты, типы и линтер**
 
-Команда `report` требует метода, которого нет в Task 6. Добавить в `hh_search/storage/repository.py` рядом с `unreported`:
+Run: `uv run pytest tests/test_cli.py tests/test_scheduler.py -q && uv run mypy --strict hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/scheduler.py hh_search/logging_setup.py hh_search/__main__.py tests/test_cli.py tests/test_scheduler.py`
+Expected: `32 passed` (23 + 9), `Success: no issues found`, `All checks passed!`,
+`5 files already formatted`
 
-```python
-    def reported_since(self, cutoff: datetime) -> list[ScoredVacancy]:
-        rows = self._connection.execute(
-            """
-            SELECT v.*, (SELECT query FROM vacancy_query q WHERE q.vacancy_id = v.id LIMIT 1)
-                   AS found_by_query
-            FROM vacancy v
-            WHERE v.reported_at >= ? AND v.score IS NOT NULL AND v.description IS NOT NULL
-            ORDER BY v.score DESC
-            """,
-            (cutoff.isoformat(),),
-        ).fetchall()
-        return [
-            ScoredVacancy(
-                discovered=self._to_discovered(row),
-                details=VacancyDetails(description=row["description"]),
-                score=ScoreBreakdown.model_validate(json.loads(row["score_detail"])),
-                cluster=row["cluster"] or "",
-            )
-            for row in rows
-        ]
-```
+`tests/test_cli.py` намеренно ходит через настоящий `time.sleep` (клиент собирает сам CLI,
+подменить его нечем), поэтому `delay_between_requests_sec` в тестовом `app.yaml` понижен до
+минимально разрешённых 0.1 с: с секундой файл шёл 23 секунды вместо трёх.
 
-И тест в `tests/test_repository.py`:
+- [ ] **Step 8: Мутационная проверка**
 
-```python
-def test_reported_since_returns_recent_reports(repo: SqliteRepository) -> None:
-    from datetime import UTC, timedelta
+Двадцать две мутации, все обязаны быть убиты:
 
-    repo.add_discovered(make_vacancy(), "embedded", 9)
-    repo.save_details("1", VacancyDetails(description="текст"))
-    repo.save_score("1", make_score())
-    repo.mark_reported(["1"])
-    cutoff = datetime.now(UTC) - timedelta(days=1)
-    assert [item.discovered.id for item in repo.reported_since(cutoff)] == ["1"]
-```
+| Мутация | Кто обязан покраснеть |
+|---|---|
+| конфиг грузится в `@app.callback()` | `test_subcommand_help_works_without_any_config` |
+| ошибка конфига летит traceback'ом | `test_missing_config_gives_a_message_and_not_a_traceback` |
+| `healthcheck` открывает базу, которой нет | `test_healthcheck_before_init_db_fails_and_creates_nothing` |
+| `healthcheck` падает на базе без схемы | `test_healthcheck_fails_on_a_database_without_schema` |
+| код возврата не зависит от статуса прогона | `test_run_exits_nonzero_when_reports_cannot_be_written` |
+| 403 в CLI даёт traceback | `test_run_exits_one_on_forbidden` |
+| `mark` не проверяет `rowcount` | `test_mark_fails_on_an_unknown_id` |
+| `mark` принимает любой статус | `test_mark_rejects_an_unknown_status` |
+| `--since` разбирается через `int()` | `test_report_rejects_an_unparsable_period` |
+| приёмники строятся внутри прогона | `test_unknown_sink_stops_the_run_before_the_database_is_touched` |
+| логи настраиваются только в `run`/`serve` | `test_every_command_writes_the_log_file` |
+| файловый обработчик логов не добавляется | `test_every_command_writes_the_log_file` |
+| пауза считается после прогона | `test_schedule_does_not_drift_by_the_length_of_the_run` |
+| лишняя пауза после последнего прогона | `test_serve_makes_exactly_the_requested_number_of_runs` |
+| `serve` продолжает после устойчивого 403 | `test_two_forbidden_in_a_row_stop_the_daemon` |
+| счётчик 403 не сбрасывается успехом | `test_a_single_forbidden_between_successes_does_not_stop_the_daemon` |
+| флаг остановки не проверяется | `test_stop_request_ends_the_loop_without_another_run` |
+| нет обработчика SIGTERM | `test_sigterm_sets_the_flag` |
+| ожидание на `time.sleep` вместо `Event` | `test_waiting_is_interrupted_by_the_signal` |
+| `reported_since` без `safe_rows` | `test_report_survives_a_corrupted_row` |
+| `reported_since` без `CAST AS BLOB` | `test_report_survives_a_corrupted_row` |
+| `reported_since` игнорирует окно | `test_reported_since_takes_only_reported_rows_inside_the_window` |
 
-- [ ] **Step 7: Запустить тесты и убедиться, что они проходят**
+Проверено при переписывании плана: 22 из 22 убиты. Мутация «`healthcheck` падает на базе без
+схемы» на первом заходе ВЫЖИЛА — тест проверял только код возврата, а необработанное исключение
+внутри `CliRunner` тоже даёт единицу; поэтому тест теперь проверяет и сообщение, и что
+исключение не улетело наружу.
 
-Run: `uv run pytest -v && uv run ruff check . && uv run mypy hh_search`
-Expected: все зелёные
+- [ ] **Step 9: Прогнать весь набор**
 
-- [ ] **Step 8: Коммит**
+Run: `uv run pytest -q && uv run mypy --strict hh_search tests && uv run ruff check .`
+Expected: `376 passed` (343 после задачи 10 + 32 здесь + 1 в тестах хранилища),
+`Success: no issues found`, `All checks passed!`
+
+- [ ] **Step 10: Коммит**
 
 ```bash
 git add hh_search/__main__.py hh_search/scheduler.py hh_search/logging_setup.py \
-        hh_search/storage/repository.py tests/test_cli.py tests/test_repository.py
+        hh_search/storage/repository.py tests/test_cli.py tests/test_scheduler.py \
+        tests/test_repository.py
 git commit -m "feat: CLI, логирование и планировщик
 
-serve и run вызывают одну и ту же функцию — один код, два
-способа запуска. Падение прогона не роняет демон: иначе контейнер
-уходил бы в петлю перезапусков. healthcheck смотрит в журнал прогонов
-и ловит ситуацию «процесс жив, работа не делается»."
+serve и run вызывают одну и ту же функцию — один код, два способа
+запуска. Код возврата повторяет статус прогона: молчаливый ноль при
+недоступном каталоге отчётов означал бы, что cron никогда не узнает о
+неработающем сервисе.
+
+Конфиг читается лениво: с загрузкой в callback не работал --help
+подкоманд, а отсутствие конфига давало traceback. healthcheck до init-db
+больше не создаёт мусорный файл базы. Устойчивый 403 останавливает
+демон, а не заставляет его стучаться каждые четыре часа вечно.
+
+Расписание считается по дедлайну (иначе сутки уносят его на 2.5 часа), а
+остановка по SIGTERM ждёт на threading.Event: PEP 475 возобновляет
+прерванный sleep, поэтому обработчика, взводящего флаг, недостаточно —
+docker stop всё равно добивал SIGKILL.
+
+report читает историю через safe_rows и CAST AS BLOB: единственный
+способ пользователя вернуть отчёт обязан переживать порчу базы лучше
+конвейера, а не хуже."
 ```
 
 ---
