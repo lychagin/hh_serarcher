@@ -2190,7 +2190,7 @@ git commit -m "feat: префильтр по стоп-словам в загол
 паттерн, а не на уникальное слово. Дубликат в YAML — законный ключ с законным значением,
 ловить его нечем; проверяется глазами при правке профиля.
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 Создать `tests/test_scoring.py`:
 
@@ -2422,12 +2422,12 @@ def test_live_vacancy_page_scores_as_measured() -> None:
 текст описания. Его вывод (80.0 при нулевых обязанностях) — вход для настройки профиля в
 задаче 12, а не повод подкрутить ожидание.
 
-- [ ] **Step 2: Запустить тест и убедиться, что он падает**
+- [x] **Step 2: Запустить тест и убедиться, что он падает**
 
 Run: `uv run pytest tests/test_scoring.py -v`
 Expected: `ModuleNotFoundError: No module named 'hh_search.scoring'`, «1 error»
 
-- [ ] **Step 3: Реализовать `hh_search/scoring/base.py`**
+- [x] **Step 3: Реализовать `hh_search/scoring/base.py`**
 
 ```python
 from typing import Protocol
@@ -2441,7 +2441,7 @@ class Scorer(Protocol):
     def score(self, discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown: ...
 ```
 
-- [ ] **Step 4: Реализовать `hh_search/scoring/keyword.py`**
+- [x] **Step 4: Реализовать `hh_search/scoring/keyword.py`**
 
 ```python
 from hh_search.config.models import ProfileConfig
@@ -2537,13 +2537,13 @@ class KeywordScorer:
 
 Создать пустой `hh_search/scoring/__init__.py`.
 
-- [ ] **Step 5: Запустить все проверки**
+- [x] **Step 5: Запустить все проверки**
 
 Run: `uv run pytest tests/test_scoring.py -v && uv run pytest -q && uv run mypy hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/scoring tests/test_scoring.py`
 Expected: `14 passed`, затем `259 passed`, `Success: no issues found`, `All checks passed!`,
 `4 files already formatted`
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git add hh_search/scoring tests/test_scoring.py
