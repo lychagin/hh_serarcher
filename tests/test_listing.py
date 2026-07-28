@@ -1,6 +1,7 @@
 import gzip
 import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,27 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # несуществующий slug, который hh.ru молча отдаёт как общий индекс /vacancies.
 LIVE_LISTING = "listing_programmist.html.gz"
 LIVE_INDEX_INSTEAD_OF_SLUG = "listing_unknown_slug.html.gz"
+# Та же самая страница `/vacancies/programmist`, но снятая с не-московского
+# выхода: hh.ru отвечает на неё редиректом 302 на региональный поддомен
+# (`https://nn.hh.ru/vacancies/programmist`), и у отданной страницы и canonical,
+# и все двадцать ссылок элементов ведут уже на поддомен.
+LIVE_REGIONAL_LISTING = "listing_regional_redirect.html.gz"
+
+# Хосты, похожие на свой, но чужие. Суффиксное сравнение «заканчивается на
+# hh.ru» пропустило бы первые два; `xn--hh-8cd.ru` — попытка сыграть на том,
+# что юникодное имя выглядит как hh.ru, но пишется иначе; последний — на том,
+# что «hh.ru» стоит в начале строки хоста, но является userinfo, а настоящий
+# хост — evil.com.
+LOOKALIKE_HOSTS = [
+    "evil-hh.ru",
+    "evilhh.ru",
+    "hh.ru.evil.com",
+    "xn--hh-8cd.ru",
+    "hh.ru@evil.com",
+]
+# Другие сайты группы: свои правила, свои id. Расширять «свой хост» до них
+# нельзя — id вакансии hh.kz не адресуется как https://hh.ru/vacancy/{id}.
+SIBLING_SITES = ["hh.kz", "rabota.by", "hh.uz"]
 
 
 def load(name: str) -> str:
@@ -273,3 +295,79 @@ def test_canonical_outside_the_head_does_not_get_a_vote() -> None:
         "<body>", '<body><!-- <link rel="canonical" href="https://hh.ru/vacancies"> -->'
     )
     assert [v.id for v in parse_listing(html, "programmist")] == ["1"]
+
+
+# --- Раунд исправлений 7: региональный редирект ---------------------------
+
+
+def test_the_regional_fixture_is_really_a_page_from_a_subdomain() -> None:
+    """Сторож самой фикстуры: она ценна ровно тем, что снята после редиректа.
+
+    Если её однажды переснимут с московского выхода, следующий тест станет
+    зелёным, ничего не проверяя, — и разбор региональной страницы снова
+    останется без покрытия."""
+    html = load(LIVE_REGIONAL_LISTING)
+    assert '<link data-rh="" rel="canonical" href="https://nn.hh.ru/vacancies/programmist">' in html
+    assert '"url":"https://nn.hh.ru/vacancy/' in html
+
+
+def test_live_regional_listing_parses_into_twenty_vacancies() -> None:
+    """Discovery против живого hh.ru с любого не-московского IP.
+
+    hh.ru отвечает на `/vacancies/{slug}` редиректом 302 на региональный
+    поддомен по геолокации, и до этого раунда шаг падал целиком: сторож
+    canonical считал, что запрошенного slug не существует, а проверка хоста
+    элементов отбрасывала все двадцать ссылок как «чужой хост nn.hh.ru»."""
+    found = parse_listing(load(LIVE_REGIONAL_LISTING), "programmist")
+    assert len(found) == 20
+    assert len({v.id for v in found}) == 20
+    assert all(v.id.isdigit() for v in found)
+    assert all(v.title.strip() for v in found)
+    assert all(v.found_by_query == "programmist" for v in found)
+
+
+def test_regional_listing_still_stores_the_canonical_hh_ru_url() -> None:
+    """URL поддомена в базу не попадает: id у вакансии один независимо от
+    региона, дедупликация идёт по нему, а клиент сам пройдёт редирект с
+    проверкой robots на каждом хопе. Сохранённый `nn.hh.ru` означал бы, что
+    одна и та же вакансия хранится по-разному в зависимости от того, с
+    какого выхода её нашли."""
+    found = parse_listing(load(LIVE_REGIONAL_LISTING), "programmist")
+    assert all(v.url == f"https://hh.ru/vacancy/{v.id}" for v in found)
+
+
+@pytest.mark.parametrize("host", ["hh.ru", "nn.hh.ru", "spb.hh.ru", "NN.HH.RU"])
+def test_canonical_on_hh_ru_or_its_subdomain_confirms_the_listing(host: str) -> None:
+    """Свой хост — hh.ru и любой его поддомен, регистр значения не имеет
+    (имена хостов регистронезависимы, и сравнение идёт по разобранному
+    hostname, а не по сырому netloc)."""
+    html = page("programmist", [item("1")], canonical=f"https://{host}/vacancies/programmist")
+    assert [v.id for v in parse_listing(html, "programmist")] == ["1"]
+
+
+@pytest.mark.parametrize("host", LOOKALIKE_HOSTS + SIBLING_SITES)
+def test_canonical_on_a_lookalike_host_does_not_confirm_the_listing(host: str) -> None:
+    """Расширение «своего хоста» до поддоменов обязано остаться сужением.
+
+    `evil-hh.ru` и `hh.ru.evil.com` — чужие домены, которые проходят наивную
+    проверку «заканчивается на hh.ru»; hh.kz и rabota.by — другие сайты со
+    своими правилами и своей нумерацией вакансий."""
+    html = page("programmist", [item("1")], canonical=f"https://{host}/vacancies/programmist")
+    with pytest.raises(FetchFailed, match=re.escape(host)):
+        parse_listing(html, "programmist")
+
+
+@pytest.mark.parametrize("host", LOOKALIKE_HOSTS + SIBLING_SITES)
+def test_item_from_a_lookalike_host_is_not_laundered_into_an_hh_url(host: str) -> None:
+    """Та же граница на элементах ленты: url собирается канонический, поэтому
+    пропущенная ссылка чужого хоста ушла бы в базу как вакансия hh.ru."""
+    items = [item("1"), {"@type": "ListItem", "url": f"https://{host}/vacancy/2", "name": "Чужая"}]
+    assert [v.id for v in parse_listing(page("programmist", items), "programmist")] == ["1"]
+
+
+def test_regional_index_instead_of_the_requested_slug_is_still_refused() -> None:
+    """Сторож подмены slug не должен ослабнуть вместе с проверкой хоста:
+    общий индекс на поддомене — такая же подмена, как на hh.ru."""
+    html = page("programmist", [item("1")], canonical="https://nn.hh.ru/vacancies")
+    with pytest.raises(FetchFailed, match="programmist"):
+        parse_listing(html, "programmist")

@@ -7335,62 +7335,38 @@ def test_vacancy_page_still_exposes_job_posting(client: PoliteClient, listing_ht
 сторожа за дрейфом атрибута играет агрегатный `SalaryBlockStats` («ни на одной странице
 прогона»), а не тест на одной случайной вакансии.
 
-- [ ] **Step 3: Прогнать контрактный тест вручную — и починить то, что он нашёл**
+- [ ] **Step 3: Прогнать контрактный тест вручную**
 
 Run: `uv run pytest tests/test_contract_network.py -m network -v`
+Expected: `3 passed`
 
-Первый же прогон на `c3bc4b7` **красный**, и это настоящая находка, а не шум:
+Главное, что подтверждает этот прогон, — **редирект на региональный поддомен
+проходится насквозь**. hh.ru отвечает на `/vacancies/{slug}` редиректом 302 на
+региональный поддомен по геолокации IP (с нижегородского адреса —
+`https://nn.hh.ru/vacancies/programmist`), и на отданной странице и
+`<link rel="canonical">`, и все двадцать ссылок элементов ведут уже на поддомен.
+Пока своим хостом считался ровно `hh.ru`, discovery не работал против живого
+источника ни на одном не-московском IP: сторож canonical решал, что запрошенного
+slug не существует, а следом отбраковывались все двадцать элементов как «чужой
+хост nn.hh.ru». Починено раундом исправлений 7 — `_is_own_host` в
+`hh_search/sources/listing.py` (свой хост — hh.ru и его поддомены; сравнение по
+hostname с точкой в суффиксе, поэтому `evil-hh.ru`, `hh.ru.evil.com`, `hh.kz`
+остаются чужими), живая фикстура `tests/fixtures/listing_regional_redirect.html.gz`
+и тесты в `tests/test_listing.py`. Сохраняемый url вакансии остался каноническим
+`https://hh.ru/vacancy/{id}`: id один независимо от региона.
 
-```
-FAILED test_listing_items_still_parse_into_vacancies
-FAILED test_vacancy_page_still_exposes_job_posting
-hh_search.errors.FetchFailed: запрошен листинг /vacancies/programmist, а hh.ru отдал
-['https://nn.hh.ru/vacancies/programmist']. Скорее всего, slug 'programmist' не
-существует — hh.ru не отвечает на такой 404, а молча показывает общий индекс вакансий
-```
+Здесь этот факт проверяется целиком, а не по разметке: `listing_html` идёт через
+`PoliteClient`, то есть проходит 302 с проверкой robots.txt на КАЖДОМ хопе (кэш
+robots — по origin, поэтому для поддомена честно берётся его собственный
+`https://nn.hh.ru/robots.txt`; проверено 2026-07-28 — правила там те же, что у
+hh.ru, отличаются только игнорируемые поля `Host` и `Sitemap`), а
+`test_listing_items_still_parse_into_vacancies` разбирает отданную страницу в
+вакансии. Если «свой хост» когда-нибудь снова сузится до одного `hh.ru`, красным
+станет именно этот тест.
 
-**hh.ru редиректит `/vacancies/{slug}` на региональный поддомен по геолокации IP**
-(302 → `https://nn.hh.ru/vacancies/programmist` с нижегородского адреса). На отданной
-странице и `<link rel="canonical">`, и все двадцать ссылок элементов ведут на поддомен, а
-`LISTING_HOST` — это ровно `hh.ru`. Отказ двойной:
-
-```
-листинг 'programmist': пропущено 20 из 20 элементов; причины: ссылка ведёт на чужой
-хост 'nn.hh.ru': 'https://nn.hh.ru/vacancy/134577040'; ...
-```
-
-То есть **discovery не работает против живого hh.ru ни на одном не-московском IP** —
-фикстура `listing_programmist.html.gz` содержит canonical на `hh.ru` и этот случай не
-покрывает. Дальше по плану идти нельзя.
-
-Починка — в `hh_search/sources/listing.py`: своим считается не только `hh.ru`, но и любой
-его поддомен. Обе точки сравнения (`_canonical_targets` и `_parse_item`) идут через одну
-функцию, чтобы не разъехаться:
-
-```python
-def _is_own_host(netloc: str) -> bool:
-    """Свой ли хост. Региональные поддомены hh.ru — свои.
-
-    hh.ru отвечает на `/vacancies/{slug}` редиректом 302 на поддомен по
-    геолокации IP: с нижегородского адреса — на `nn.hh.ru`. На отданной
-    странице и `<link rel="canonical">`, и ВСЕ ссылки элементов ведут на
-    этот поддомен, поэтому сравнение с одним `hh.ru` отбраковывало
-    сначала canonical, а затем все двадцать элементов подряд.
-    """
-    return netloc == LISTING_HOST or netloc.endswith("." + LISTING_HOST)
-```
-
-и в обоих местах `parts.netloc != LISTING_HOST` заменяется на
-`not _is_own_host(parts.netloc)`. Проверка остаётся строгой: `evilhh.ru` и
-`hh.ru.evil.com` под суффикс `.hh.ru` не подходят, а `nn.hh.ru` и `hh.kz` различаются.
-
-Добавить в `tests/test_listing.py` два регрессионных теста на фикстуре с подменённым
-хостом: (1) листинг с canonical и ссылками на `nn.hh.ru` разбирается в двадцать вакансий,
-и `url` у них — канонический `https://hh.ru/vacancy/{id}`; (2) canonical на
-`evil.hh.ru.attacker.com` по-прежнему даёт `FetchFailed`.
-
-Run: `uv run pytest -q && uv run pytest tests/test_contract_network.py -m network -q`
-Expected: вся база зелёная, затем `3 passed in ~11s`.
+Живой прогон 2026-07-28 по фактическим запросам: `hh.ru` — 2 (robots.txt и 302),
+`nn.hh.ru` — 2 (robots.txt поддомена и сама страница), `parse_listing` — 20 вакансий
+с уникальными id.
 
 Проверено, что «нет сети» отличается от «формат сменился»: при недоступном хосте те же
 три теста дают `3 skipped` с причиной

@@ -30,7 +30,7 @@
 import logging
 import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from hh_search.config.models import QuerySpec
 from hh_search.domain.models import DiscoveredVacancy
@@ -40,8 +40,9 @@ from hh_search.sources.vacancy_page import find_ld_json, vacancy_url
 logger = logging.getLogger(__name__)
 
 LISTING_BASE_URL = "https://hh.ru/vacancies"
-# Хост, и только он, считается своим: и у canonical страницы, и у ссылок
-# в ленте. Берётся из LISTING_BASE_URL, чтобы не разойтись с ним.
+# Свой хост — этот и его поддомены (см. `_is_own_host`): и у canonical
+# страницы, и у ссылок в ленте. Берётся из LISTING_BASE_URL, чтобы не
+# разойтись с ним.
 LISTING_HOST = urlsplit(LISTING_BASE_URL).netloc
 # Сколько причин пропуска попадает в лог целиком: страница отдаёт 20
 # элементов, и однотипных причин там обычно одна-две.
@@ -71,6 +72,39 @@ def build_listing_url(query: QuerySpec, page: int = 0) -> str:
     return base if page == 0 else f"{base}?page={page}"
 
 
+def _is_own_host(url_parts: SplitResult) -> bool:
+    """Свой ли хост у разобранного URL. Поддомены hh.ru — свои.
+
+    hh.ru отвечает на `/vacancies/{slug}` редиректом 302 на региональный
+    поддомен по геолокации IP: с нижегородского адреса — на `nn.hh.ru`.
+    На отданной странице и `<link rel="canonical">`, и ВСЕ двадцать ссылок
+    элементов ведут уже на поддомен, поэтому сравнение с одним `hh.ru`
+    отбраковывало сначала canonical (шаг падал как «slug не существует»),
+    а затем каждый элемент ленты — то есть discovery не работал вовсе ни
+    на одном не-московском выходе. Легальность от расширения не страдает:
+    robots.txt клиент кэширует по origin и проверяет на каждом хопе
+    редиректа, так что для поддомена берутся его собственные правила.
+
+    Расширение обязано остаться сужением, поэтому:
+
+    * сравнивается `hostname`, а не `netloc` — он уже приведён к нижнему
+      регистру и очищен от порта и userinfo, так что `https://nn.HH.ru`
+      и `https://hh.ru@evil.com` не расходятся с записанным правилом;
+    * суффикс проверяется вместе с точкой (`.hh.ru`), иначе `evil-hh.ru`
+      и `evilhh.ru` стали бы своими;
+    * совпадение суффикса — только в конце имени, поэтому `hh.ru.evil.com`
+      чужой;
+    * `hh.kz`, `rabota.by` и прочие сайты группы остаются чужими: это
+      другие сайты со своими правилами и своей нумерацией вакансий, и
+      их id не адресуется как `https://hh.ru/vacancy/{id}`.
+    """
+    host = url_parts.hostname
+    if host is None:
+        # Относительная ссылка — свой хост по построению.
+        return True
+    return host == LISTING_HOST or host.endswith(f".{LISTING_HOST}")
+
+
 def _canonical_targets(html: str) -> set[str]:
     """На что ссылаются ВСЕ теги `<link rel="canonical">` страницы.
 
@@ -96,7 +130,7 @@ def _canonical_targets(html: str) -> set[str]:
         if href is None:
             continue
         parts = urlsplit(href.group(1))
-        if parts.netloc and parts.netloc != LISTING_HOST:
+        if not _is_own_host(parts):
             targets.add(href.group(1))
             continue
         targets.add(parts.path.rstrip("/"))
@@ -156,7 +190,7 @@ def _parse_item(raw: Any, query_text: str) -> tuple[DiscoveredVacancy | None, st
     # Хост обязателен к проверке именно потому, что ниже url собирается
     # заново: без неё ссылка чужого хоста «отмывалась» в
     # https://hh.ru/vacancy/{id} и уходила в базу как настоящая вакансия.
-    if parts.netloc and parts.netloc != LISTING_HOST:
+    if not _is_own_host(parts):
         return None, f"ссылка ведёт на чужой хост {parts.netloc!r}: {url!r}"
     match = _ID_RE.match(parts.path)
     if match is None:
