@@ -2642,7 +2642,7 @@ BOM пишутся только при создании.
 `app.yaml`) не стали: список приёмников раздвоился бы между схемой конфига и фабрикой, а
 расширение через `Sink` — заявленная точка роста (спека §4.2).
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 Создать `tests/test_sinks.py`:
 
@@ -3003,12 +3003,12 @@ def test_markdown_dedup_is_not_fooled_by_a_link_from_the_employer(tmp_path: Path
     assert "Настоящая вторая" in text
 ```
 
-- [ ] **Step 2: Запустить тест и убедиться, что он падает**
+- [x] **Step 2: Запустить тест и убедиться, что он падает**
 
 Run: `uv run pytest tests/test_sinks.py -v`
 Expected: `ModuleNotFoundError: No module named 'hh_search.sinks'`, «1 error»
 
-- [ ] **Step 3: Реализовать `hh_search/sinks/base.py`**
+- [x] **Step 3: Реализовать `hh_search/sinks/base.py`**
 
 ```python
 from collections.abc import Sequence
@@ -3032,7 +3032,7 @@ class Sink(Protocol):
     def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> None: ...
 ```
 
-- [ ] **Step 4: Реализовать `hh_search/sinks/csv_sink.py`**
+- [x] **Step 4: Реализовать `hh_search/sinks/csv_sink.py`**
 
 ```python
 import csv
@@ -3159,7 +3159,7 @@ class CsvSink:
         }
 ```
 
-- [ ] **Step 5: Реализовать `hh_search/sinks/markdown_sink.py`**
+- [x] **Step 5: Реализовать `hh_search/sinks/markdown_sink.py`**
 
 ```python
 import re
@@ -3283,7 +3283,7 @@ class MarkdownSink:
         )
 ```
 
-- [ ] **Step 6: Реализовать `hh_search/sinks/__init__.py`**
+- [x] **Step 6: Реализовать `hh_search/sinks/__init__.py`**
 
 ```python
 """Приёмники отчётов и их фабрика.
@@ -3319,7 +3319,7 @@ def build_sinks(names: Sequence[str], reports_dir: Path, threshold: float) -> li
     return sinks
 ```
 
-- [ ] **Step 7: Запустить все проверки**
+- [x] **Step 7: Запустить все проверки**
 
 Run: `uv run pytest tests/test_sinks.py -v && uv run pytest -q && uv run mypy hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/sinks tests/test_sinks.py`
 Expected: `24 passed`, затем `305 passed`, `Success: no issues found in 36 source files`,
@@ -3328,7 +3328,7 @@ Expected: `24 passed`, затем `305 passed`, `Success: no issues found in 36 
 Числа проверены сборкой кода этой задачи против рабочего дерева на `c3bc4b7` (281 тест
 до задачи, 24 в `test_sinks.py`).
 
-- [ ] **Step 7a: Убедиться, что сторожа дедупликации настоящие**
+- [x] **Step 7a: Убедиться, что сторожа дедупликации настоящие**
 
 Мутация: заменить в `csv_sink.emit` и `markdown_sink.emit` строку
 `written = self._written_ids(path)` / `self._written_urls(path)` на `written = set()`.
@@ -3347,7 +3347,7 @@ Expected: `5 failed, 19 passed` — краснеют `..._does_not_repeat_...` (
 
 Вернуть обе строки и убедиться, что снова `24 passed`.
 
-- [ ] **Step 8: Коммит**
+- [x] **Step 8: Коммит**
 
 ```bash
 git add hh_search/sinks tests/test_sinks.py
