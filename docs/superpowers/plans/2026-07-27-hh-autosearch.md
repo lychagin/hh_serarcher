@@ -1915,7 +1915,7 @@ git commit -m "feat: хранилище на SQLite
 конфига (`Signal` в `config/models.py`), и самим `_compile`. Задача 7 на это опирается и
 ничего не изобретает заново; тест остаётся как страховка на самое дорогое.
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 Создать `tests/test_prefilter.py`:
 
@@ -2071,13 +2071,13 @@ def test_no_good_title_is_lost_on_the_live_listing() -> None:
 школы») — это правильная сторона размена: их отсеет скоринг, и они стоят одного запроса,
 а не потерянной вакансии.
 
-- [ ] **Step 2: Запустить тест и убедиться, что он падает**
+- [x] **Step 2: Запустить тест и убедиться, что он падает**
 
 Run: `uv run pytest tests/test_prefilter.py -v`
 Expected: `ModuleNotFoundError: No module named 'hh_search.filtering.prefilter'`, «1 error»
 (падение на сборке модуля — файла ещё нет)
 
-- [ ] **Step 3: Реализовать `hh_search/filtering/prefilter.py`**
+- [x] **Step 3: Реализовать `hh_search/filtering/prefilter.py`**
 
 ```python
 """Шаг 3 конвейера: единственный барьер перед дорогим шагом 4.
@@ -2123,7 +2123,7 @@ class Prefilter:
         return None
 ```
 
-- [ ] **Step 4: Запустить все проверки**
+- [x] **Step 4: Запустить все проверки**
 
 Run: `uv run pytest tests/test_prefilter.py -v && uv run pytest -q && uv run mypy hh_search tests && uv run ruff check hh_search tests && uv run ruff format --check hh_search/filtering/prefilter.py tests/test_prefilter.py`
 Expected: `7 passed`, затем `245 passed` (238 до задачи + 7), `Success: no issues found`,
@@ -2134,7 +2134,7 @@ Expected: `7 passed`, затем `245 passed` (238 до задачи + 7), `Succ
 Новый код обязан соответствовать сразу, чтобы задача 13 не превратилась в переформатирование
 всего проекта.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git add hh_search/filtering/prefilter.py tests/test_prefilter.py
