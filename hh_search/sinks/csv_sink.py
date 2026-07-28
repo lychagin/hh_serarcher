@@ -1,4 +1,5 @@
 import csv
+import io
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -30,17 +31,39 @@ COLUMNS = [
 # не защищает — оно про разделители, а не про интерпретацию.
 _FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
 
+# Строки csv.writer кончаются CRLF (умолчание диалекта), и дописанный нами
+# разделитель обязан быть таким же, иначе в файле окажутся оба вида.
+_LINE_END = "\r\n"
+
 
 def _cell(value: object) -> str:
     """Значение ячейки: строка, обезвреженная от интерпретации формулой.
 
     Апостроф перед значением — то, что понимают и Excel, и LibreOffice:
-    ячейка остаётся текстом. Числовые колонки этого не боятся (они
-    формируются нами и неотрицательны), но правило применяется ко всем,
-    чтобы не пришлось помнить, какая колонка внешняя.
+    ячейка остаётся текстом. Применяется только к текстовым колонкам:
+    числовые формируем мы, там некого обезвреживать, а `'` превратил бы
+    отрицательное число в текст (см. `_score`).
     """
     text = "" if value is None else str(value)
     return f"'{text}" if text.startswith(_FORMULA_STARTS) else text
+
+
+def _score(value: float) -> str:
+    """Балл числом для того Excel, ради которого выбраны BOM и `;`.
+
+    В русской локали разделитель дробной части — запятая; точку такой
+    Excel числом не признаёт, колонка становится текстовой, и фильтр
+    «score > 60» вместе с числовой сортировкой молча перестают работать.
+    Один знак после запятой — тот же, что в markdown-отчёте: `{:.0f}`
+    печатал бы `60` по обе стороны порога.
+    """
+    return f"{value:.1f}".replace(".", ",")
+
+
+def _amount(value: int | None) -> str:
+    """Сумма зарплаты: целое или пустая ячейка. Обезвреживать нечего —
+    значение приходит числом с распознанной страницы, а не текстом."""
+    return "" if value is None else str(value)
 
 
 class CsvSink:
@@ -49,6 +72,13 @@ class CsvSink:
     Формат подчинён единственному потребителю — таблице на рабочем столе:
     UTF-8 с BOM и разделитель `;`, иначе русский текст в Excel читается как
     `ÐžÐžÐž`, а с русской локалью вся строка ложится в одну колонку.
+
+    Файл дня — единственное состояние приёмника, и он переживает аварии в
+    любой момент записи: прогон может быть убит после `open()`, но до
+    сброса буфера (файл нулевой длины), а запись — оборвана на полном
+    диске посреди символа (невалидный UTF-8 в хвосте). Отсюда три правила
+    чтения и дозаписи: файл без содержимого считается новым, чтение
+    терпимо к порче хвоста, а дозапись начинается с новой строки.
     """
 
     name = "csv"
@@ -61,8 +91,8 @@ class CsvSink:
             return
         self._reports_dir.mkdir(parents=True, exist_ok=True)
         path = self._reports_dir / f"{now:%Y-%m-%d}-new.csv"
-        first_write = not path.exists()
-        written = self._written_ids(path)
+        existing = _read_day_file(path)
+        written = _written_ids(existing)
         fresh: list[ScoredVacancy] = []
         for item in vacancies:
             if item.discovered.id in written:
@@ -72,31 +102,24 @@ class CsvSink:
             fresh.append(item)
         if not fresh:
             return
-        # BOM обязан быть ровно один: кодек utf-8-sig пишет его при каждом
-        # открытии файла, поэтому второй прогон того же дня вставил бы
-        # ещё один U+FEFF посреди данных.
-        encoding = "utf-8-sig" if first_write else "utf-8"
-        with path.open("a", newline="", encoding=encoding) as handle:
+        # BOM пишет сам кодек и ровно один раз за файл: при открытии на
+        # дозапись TextIOWrapper сбрасывает состояние кодировщика, если
+        # позиция ненулевая, и второй прогон дня BOM уже не вставляет
+        # (проверено исполнением). Условие «utf-8-sig только в первый раз»
+        # было не только лишним, но и вредным: файл нулевой длины оно
+        # оставляло навсегда без BOM.
+        with path.open("a", newline="", encoding="utf-8-sig") as handle:
+            if existing and not existing.endswith(("\n", "\r")):
+                # Предыдущая запись оборвалась на полуслове (полный диск,
+                # SIGKILL). Без этого перевода строки новая строка
+                # приклеивается к обрывку: одна вакансия растворяется в
+                # колонке `url` другой, и вернуть её нечем.
+                handle.write(_LINE_END)
             writer = csv.DictWriter(handle, fieldnames=COLUMNS, delimiter=";")
-            if first_write:
+            if not existing:
                 writer.writeheader()
             for item in fresh:
                 writer.writerow(self._row(item))
-
-    def _written_ids(self, path: Path) -> set[str]:
-        """id, уже лежащие в файле текущего дня.
-
-        Доставка в приёмник — at-least-once по построению: `mark_reported()`
-        вызывается ПОСЛЕ всех приёмников, иначе упавший приёмник терял бы
-        вакансию навсегда. Значит, повтор возможен всегда — при частичном
-        отказе приёмников и при аварии между `emit` и `mark_reported`, — и
-        снять его может только сам приёмник. Источник истины — файл, а не
-        поле объекта: между прогонами процесс перезапускается.
-        """
-        if not path.exists():
-            return set()
-        with path.open(encoding="utf-8-sig", newline="") as handle:
-            return {row["id"] for row in csv.DictReader(handle, delimiter=";") if row.get("id")}
 
     def _row(self, item: ScoredVacancy) -> dict[str, str]:
         discovered = item.discovered
@@ -104,13 +127,13 @@ class CsvSink:
         published_at = discovered.published_at
         return {
             "id": _cell(discovered.id),
-            "score": _cell(item.score.total),
+            "score": _score(item.score.total),
             "cluster": _cell(item.cluster),
             "title": _cell(discovered.title),
             "company": _cell(discovered.company),
             "area": _cell(discovered.area),
-            "salary_from": _cell(salary.amount_from),
-            "salary_to": _cell(salary.amount_to),
+            "salary_from": _amount(salary.amount_from),
+            "salary_to": _amount(salary.amount_to),
             "currency": _cell(salary.currency),
             # Пустая ячейка, а не «None»: дата публикации неизвестна, пока
             # вакансия не обогащена, и выдумывать её нечем (спека §5.3).
@@ -120,3 +143,44 @@ class CsvSink:
             "listing": _cell(discovered.found_by_query),
             "url": _cell(discovered.url),
         }
+
+
+def _read_day_file(path: Path) -> str:
+    """Содержимое файла текущего дня; пусто, если файла нет.
+
+    Чтение терпимое (`errors="replace"`) намеренно. Запись, оборванная
+    полным диском посреди кириллической буквы, оставляет в хвосте
+    невалидный UTF-8, а убрать его дозаписью нельзя — байт остаётся в
+    файле до конца суток. Строгий декодер превратил бы это в
+    UnicodeDecodeError на КАЖДОМ следующем прогоне: отчётов нет вовсе (csv
+    идёт первым и уносит с собой markdown), самовосстановления нет, а
+    сообщение указывает на чтение файла, а не на полный диск. Порча хвоста
+    не должна мешать ни дедупликации, ни дозаписи.
+    """
+    if not path.exists():
+        return ""
+    return path.read_bytes().decode("utf-8-sig", errors="replace")
+
+
+def _written_ids(existing: str) -> set[str]:
+    """id, уже лежащие в файле текущего дня.
+
+    Доставка в приёмник — at-least-once по построению: `mark_reported()`
+    вызывается ПОСЛЕ всех приёмников, иначе упавший приёмник терял бы
+    вакансию навсегда. Значит, повтор возможен всегда — при частичном
+    отказе приёмников и при аварии между `emit` и `mark_reported`, — и
+    снять его может только сам приёмник. Источник истины — файл, а не
+    поле объекта: между прогонами процесс перезапускается.
+
+    Колонка берётся по номеру, а не по заголовку: заголовка в файле может
+    не быть (его унесла авария прошлого прогона), и DictReader принял бы
+    за него первую вакансию — то есть ровно её и потерял бы.
+    """
+    rows = list(csv.reader(io.StringIO(existing, newline=""), delimiter=";"))
+    if rows and not existing.endswith(("\n", "\r")):
+        # Последняя строка не закончена: запись оборвалась на полуслове, и
+        # эта вакансия в отчёт по сути не попала. Пусть следующий прогон
+        # впишет её целиком — потерять вакансию хуже, чем оставить в файле
+        # видимый обрывок.
+        rows.pop()
+    return {row[0] for row in rows if row and row[0] and row[0] != COLUMNS[0]}
