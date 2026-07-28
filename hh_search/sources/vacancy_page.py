@@ -13,8 +13,14 @@ from hh_search.sources.salary import parse_salary
 
 logger = logging.getLogger(__name__)
 
+# Кавычки вокруг значения атрибута — любые: HTML разрешает и одинарные, и
+# двойные, а цена расхождения несимметрична. hh.ru сегодня пишет двойные,
+# но смена шаблонизатора на одинарные означала бы «блока JSON-LD нет» —
+# то есть громкий FetchFailed на КАЖДОЙ валидной странице, сжигающий
+# попытки обогащения всему бэклогу.
 _LD_JSON_RE = re.compile(
-    r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE
+    r"""<script[^>]*type=["']application/ld\+json["'][^>]*>(.*?)</script>""",
+    re.DOTALL | re.IGNORECASE,
 )
 # Единственный элемент страницы, который разбирается вручную: зарплата есть
 # только в разметке. Содержимое берётся до первого закрывающего </div> —
@@ -49,10 +55,27 @@ def iter_ld_json(html: str) -> Iterator[Any]:
             continue
 
 
+def _has_type(data: dict[str, Any], ld_type: str) -> bool:
+    """`@type` в JSON-LD законно бывает и строкой, и СПИСКОМ типов.
+
+    Форма `"@type": ["JobPosting", "Thing"]` разрешена спецификацией
+    JSON-LD, и сравнение на равенство строке её не узнаёт. Цена ошибки
+    односторонняя: страница валидна, а мы отвечаем `FetchFailed`, жжём
+    попытку обогащения и в конце концов отправляем вакансию в
+    `enrich_failed` — терминально. У hh.ru поле сегодня плоское
+    (проверено на двух живых фикстурах), поэтому это защита от дрейфа, а
+    не обход текущего формата.
+    """
+    raw = data.get("@type")
+    if isinstance(raw, list):
+        return ld_type in raw
+    return raw == ld_type
+
+
 def find_ld_json(html: str, ld_type: str) -> dict[str, Any] | None:
     """Первый блок JSON-LD с указанным `@type`, если он есть."""
     for data in iter_ld_json(html):
-        if isinstance(data, dict) and data.get("@type") == ld_type:
+        if isinstance(data, dict) and _has_type(data, ld_type):
             return data
     return None
 

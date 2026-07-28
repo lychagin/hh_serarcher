@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    # Не [main, master]: работа идёт в feat/*, и CI, который не запускается
+    # на рабочей ветке, узнаёт о поломке в момент слияния — то есть поздно.
+    branches: ["**"]
+  pull_request:
+
+# Пуш в ветку с открытым PR иначе запускает джобу дважды.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Версия Python задаётся явно. Без этого шага `ubuntu-latest` даёт
+      # ту, которая на образе раннера сегодня, — сейчас это 3.12 по
+      # совпадению, а не по договорённости.
+      - name: Python
+        run: uv python install 3.12
+
+      # `uv pip install --system` здесь не работает в принципе: системный
+      # интерпретатор Ubuntu помечен externally-managed (PEP 668), и uv
+      # отказывается в него ставить. `uv sync --frozen` вдобавок берёт
+      # ровно те версии, что в uv.lock, — включая версию ruff, от которой
+      # зависит шаг форматирования.
+      - name: Зависимости
+        run: uv sync --frozen --extra dev --python 3.12
+
+      - name: Линтер
+        run: uv run ruff check .
+
+      - name: Форматирование
+        run: uv run ruff format --check .
+
+      - name: Типы
+        run: uv run mypy hh_search tests
+
+      # Сеть не задействуется: контрактные тесты отсеиваются меткой
+      # `network` через `addopts` в pyproject.toml.
+      - name: Тесты
+        run: uv run pytest -q

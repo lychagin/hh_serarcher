@@ -361,9 +361,19 @@ class PoliteClient:
             logger.warning(
                 "robots.txt ответил %s, доступ запрещён по умолчанию", response.status_code
             )
+            # 403 именно здесь — почти наверняка не правило, а блокировка:
+            # robots.txt отдают анонимно все. Отказ остаётся RobotsDisallowed
+            # (мы действительно не знаем правил и поэтому не идём никуда), но
+            # читающий лог обязан понимать, что чинить надо не конфиг.
+            blocked = (
+                " Это похоже на блокировку источника, а не на правило: robots.txt "
+                "отдаётся анонимно. Обходные пути не применяются."
+                if response.status_code == 403
+                else ""
+            )
             raise RobotsDisallowed(
                 f"robots.txt вернул {response.status_code} для {robots_url}, "
-                "доступ запрещён по умолчанию"
+                f"доступ запрещён по умолчанию.{blocked}"
             )
         if not _looks_like_robots(response):
             logger.warning(

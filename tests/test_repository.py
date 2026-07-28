@@ -1937,3 +1937,32 @@ def test_kill_inside_the_requeue_leaves_no_torn_state(tmp_path: Path, journal_mo
         "остальные остались отбракованными — различить их в базе больше нечем"
     )
     Path(backup).unlink()
+
+
+# --- A-M1: порча счётчика попыток не имеет права прятать вакансию ---------
+
+
+def test_corrupt_enrich_attempts_does_not_hide_the_vacancy(tmp_path: Path) -> None:
+    """Единственный вид порчи, который карантин поймать не может в принципе.
+
+    `safe_rows` защищает РАЗБОР строки, а `enrich_attempts` участвует в
+    `WHERE`: строка не доходит до разбора. Типы в SQLite динамические, и
+    текст в этой колонке делает предикат `< max_attempts` ложным навсегда
+    (любое число меньше любого текста). Вакансия без описания при этом
+    невидима и `pending_scoring`, и `unreported` — то есть исчезает молча
+    и целиком, без единой строки в логе.
+    """
+    db_path = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.close()
+
+    corrupt(db_path, "UPDATE vacancy SET enrich_attempts = 'мусор' WHERE id = '1'")
+
+    repository = SqliteRepository(db_path)
+    assert [v.id for v in repository.pending_enrichment(max_attempts=3)] == ["1"]
+    # И счётчик снова становится числом с первой же попытки, поэтому
+    # возврат в очередь не превращается в вечный цикл.
+    assert repository.bump_enrich_attempt("1", max_attempts=3) == 1
+    repository.close()

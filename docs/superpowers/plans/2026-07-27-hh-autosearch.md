@@ -7373,7 +7373,7 @@ SignalMatcher: прежний queries.yaml не грузился вовсе, а 
 Плюс найденное самим переписанным контрактным тестом — см. Step 3: **discovery не
 работает против живого hh.ru ни на одном не-московском IP.**
 
-- [ ] **Step 1: Первый прогон `ruff format` — отдельным коммитом, ДО всего остального**
+- [x] **Step 1: Первый прогон `ruff format` — отдельным коммитом, ДО всего остального**
 
 Сначала исключить документы: форматтер понимает python-блоки внутри markdown, и без
 исключения зелёный CI зависел бы от вёрстки примеров — включая примеры в самом файле
@@ -7418,7 +7418,7 @@ Expected: `13 files reformatted`, затем `All checks passed!`,
 CI ставит зависимости через `uv sync --frozen` (Step 6). Иначе следующая минорная версия
 ruff перекрасит шаг сама.
 
-- [ ] **Step 2: Написать контрактный тест — по листингу и странице вакансии**
+- [x] **Step 2: Написать контрактный тест — по листингу и странице вакансии**
 
 Создать `tests/test_contract_network.py`:
 
@@ -7527,7 +7527,7 @@ def test_vacancy_page_still_exposes_job_posting(client: PoliteClient, listing_ht
 сторожа за дрейфом атрибута играет агрегатный `SalaryBlockStats` («ни на одной странице
 прогона»), а не тест на одной случайной вакансии.
 
-- [ ] **Step 3: Прогнать контрактный тест вручную**
+- [x] **Step 3: Прогнать контрактный тест вручную**
 
 Run: `uv run pytest tests/test_contract_network.py -m network -v`
 Expected: `3 passed`
@@ -7564,12 +7564,12 @@ hh.ru, отличаются только игнорируемые поля `Host
 три теста дают `3 skipped` с причиной
 `нет сети до hh.ru ([Errno -2] Name or service not known)`.
 
-- [ ] **Step 4: Убедиться, что контрактный тест пропускается по умолчанию**
+- [x] **Step 4: Убедиться, что контрактный тест пропускается по умолчанию**
 
 Run: `uv run pytest tests/test_contract_network.py -q`
 Expected: `3 deselected` (сработала настройка `addopts = "-m 'not network'"` из Task 1)
 
-- [ ] **Step 5: Добавить в `tests/test_config_example.py` сверку спеки с кодом**
+- [x] **Step 5: Добавить в `tests/test_config_example.py` сверку спеки с кодом**
 
 Спека уже приведена в соответствие с кодом; задача этого шага — сделать так, чтобы они
 не разошлись снова, и сделать это **автоматически**, а не абзацем в чеклисте.
@@ -7642,7 +7642,7 @@ profile.yaml: signals.title_roles — только в config.example
               signals.stack — ['llms']; signals.domain — ['iiot']
 ```
 
-- [ ] **Step 6: Догнать §7 спеки**
+- [x] **Step 6: Догнать §7 спеки**
 
 Перенести в §7 образцы из `config.example` целиком: пять проверенных slug'ов вместо трёх
 (два из которых не существуют — hh.ru отдаёт по ним общий индекс) и семь недостающих
@@ -7652,7 +7652,7 @@ Run: `uv run pytest tests/test_config_example.py -q`
 Expected: `34 passed` — обе сверки зелёные. Проверено: после подстановки
 `config.example/queries.yaml` и `config.example/profile.yaml` в §7 тест проходит.
 
-- [ ] **Step 7: Создать `.github/workflows/ci.yml`**
+- [x] **Step 7: Создать `.github/workflows/ci.yml`**
 
 ```yaml
 name: CI
@@ -7730,7 +7730,7 @@ uv run pytest -q         -> 281 passed
 Прежний рецепт (`uv pip install --system ".[dev]"`) в том же контейнере воспроизводит
 отказ PEP 668 дословно — то есть шаг был бы красным при любом состоянии кода.
 
-- [ ] **Step 8: Создать `README.md`**
+- [x] **Step 8: Создать `README.md`**
 
 ````markdown
 # hh-search
@@ -7875,7 +7875,7 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy hh_search tes
 POSIX. В `sh`/`dash` (то есть при копировании команды в скрипт) прежняя строка создаёт
 один каталог с буквальным именем `{config,state,reports,logs}` — проверено.
 
-- [ ] **Step 9: Триаж отложенных Minor**
+- [x] **Step 9: Триаж отложенных Minor**
 
 `HANDOFF.md` обещает, что отложенные Minor разберёт «финальное ревью ветки», но такой
 активности в плане не существует — то есть обещание не выполнялось бы никем. Разбор
@@ -7920,14 +7920,14 @@ fail-open на `robots.txt`, раунд 3 — три minor, раунд 4 уда�
 Записей в таблице обязано быть столько же, сколько `(deferred)` в тексте выше: строка без
 решения — это не «отложено», а «потеряно».
 
-- [ ] **Step 10: Прогнать полную проверку**
+- [x] **Step 10: Прогнать полную проверку**
 
 Run: `uv run pytest -q && uv run ruff check . && uv run ruff format --check . && uv run mypy hh_search tests`
 Expected: всё зелёное, контрактные тесты `deselected`.
 
 Отдельно, руками и с сетью: `uv run pytest -m network -q` → `3 passed`.
 
-- [ ] **Step 11: Коммит**
+- [x] **Step 11: Коммит**
 
 ```bash
 git add .github README.md tests docs/ hh_search/sources/listing.py
@@ -7957,18 +7957,27 @@ schema.sql, образцы §7 — с config.example."
 
 После Task 13 должно выполняться:
 
-- [ ] `docker compose build` собирается без ошибок, образ ~220 МБ, `schema.sql` внутри
+- [x] `docker compose build` собирается без ошибок, образ ~220 МБ, `schema.sql` внутри
       установленного пакета в `site-packages`
-- [ ] `docker compose run --rm hh-search init-db` создаёт **файл** `data/state/hh.db` на
+- [x] `docker compose run --rm hh-search init-db` создаёт **файл** `data/state/hh.db` на
       хосте, принадлежащий вашему uid (печать пути доказательством не является)
 - [ ] `docker compose run --rm hh-search run` с реальным конфигом создаёт
       `data/reports/<дата>-new.csv` и `.md`
 - [ ] Повторный `run` подряд не добавляет в отчёт ни одной вакансии — и не добавляет её
       повторно даже тогда, когда один из приёмников упал (дедупликация Task 9)
 - [ ] `docker compose run --rm hh-search healthcheck` возвращает 0 после успешного прогона
-- [ ] `docker compose up -d` поднимает контейнер, он переживает `docker restart`, а
-      `docker stop` укладывается в доли секунды с кодом 0 (не 137)
-- [ ] `pytest -m network` проходит — источник соответствует §3 спеки
-- [ ] `pytest`, `ruff check .`, `ruff format --check .`, `mypy hh_search tests` зелёные, и
+- [x] `docker compose up -d` поднимает контейнер, а `docker stop` укладывается в доли
+      секунды с кодом 0 (не 137); `docker restart` отдельно не проверялся
+- [x] `pytest -m network` проходит — источник соответствует §3 спеки
+- [x] `pytest`, `ruff check .`, `ruff format --check .`, `mypy hh_search tests` зелёные, и
       тот же набор проходит в CI
-- [ ] У каждой записи `(deferred)` в ledger есть строка в итоговой таблице триажа
+- [x] У каждой записи `(deferred)` в ledger есть строка в итоговой таблице триажа
+
+Три пункта оставлены НЕотмеченными сознательно: каждый требует прогона контейнера
+против живого hh.ru с реальным конфигом, то есть десятков запросов к источнику ради
+галочки. Task 12 проверила исполнением всё, что проверяется без сети (сборка,
+`init-db` с записью в том, `docker stop` за 129 мс с кодом 0, офлайновый прогон), а
+поведение самого прогона — дедупликацию отчёта, порядок «сохранить → отправить» и
+частичный отказ приёмника — сторожат тесты конвейера на живых фикстурах. Отметить их
+без прогона значило бы соврать в чеклисте; выполнить прогон — заплатить источнику за
+проверку, которую он не обязан оплачивать.

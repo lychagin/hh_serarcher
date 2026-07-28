@@ -245,3 +245,33 @@ def test_salary_not_stated_stays_a_legitimate_block() -> None:
     stats = SalaryBlockStats()
     parse_vacancy_page(html, stats)
     assert (stats.pages, stats.without_salary) == (1, 0), "блок есть, дрейфа нет"
+
+
+# --- дрейф разметки блока JSON-LD: валидная страница обязана разбираться ---
+#
+# Оба случая ниже — законная разметка, которую прежний разбор не узнавал, а
+# «не узнал» здесь означает `FetchFailed` на ВАЛИДНОЙ странице: попытка
+# обогащения сожжена, и после `max_attempts` вакансия уходит в
+# `enrich_failed` терминально. Стоимость односторонняя, поэтому оба
+# принимаются, хотя hh.ru сегодня пишет иначе.
+
+
+def test_single_quoted_type_attribute_is_still_a_json_ld_block() -> None:
+    """HTML разрешает одинарные кавычки вокруг значения атрибута."""
+    html = (
+        '<script type=\'application/ld+json\'>{"@type": "JobPosting", '
+        '"description": "<p>Опыт Yocto</p>"}</script>'
+    )
+    details = parse_vacancy_page(html)
+    assert details.description == "Опыт Yocto"
+
+
+def test_type_given_as_a_list_is_still_a_job_posting() -> None:
+    """`"@type": ["JobPosting", "Thing"]` — законная форма JSON-LD."""
+    html = (
+        '<script type="application/ld+json">'
+        '{"@type": ["JobPosting", "Thing"], "description": "<p>Опыт Buildroot</p>"}'
+        "</script>"
+    )
+    details = parse_vacancy_page(html)
+    assert details.description == "Опыт Buildroot"

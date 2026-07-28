@@ -144,6 +144,22 @@ def test_robots_5xx_means_disallowed_by_default() -> None:
 
 
 @respx.mock
+def test_robots_403_says_it_looks_like_a_block_not_a_rule() -> None:
+    """403 на сам `robots.txt` — почти наверняка блокировка, а не правило.
+
+    Отказ остаётся `RobotsDisallowed` (правил мы действительно не знаем и
+    поэтому не идём никуда), но сообщение обязано отличать эти два случая:
+    иначе оператор читает «доступ запрещён по умолчанию» и идёт править
+    конфиг вместо того, чтобы понять, что источник закрылся. Ровно тот
+    отложенный minor Task 4, где «поведение верное, вопрос в формулировке».
+    """
+    respx.get(ROBOTS).mock(return_value=httpx.Response(403))
+    client, _ = make_client(respect_robots=True)
+    with client, pytest.raises(RobotsDisallowed, match="блокировку источника"):
+        client.get(URL)
+
+
+@respx.mock
 def test_robots_network_error_means_disallowed_by_default() -> None:
     """Находка 3 (Important): сетевая ошибка при получении robots.txt — запрет."""
     respx.get(ROBOTS).mock(side_effect=httpx.ConnectError("boom"))

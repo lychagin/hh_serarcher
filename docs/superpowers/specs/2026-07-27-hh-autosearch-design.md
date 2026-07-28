@@ -778,22 +778,42 @@ score = 100 × (0.40·title + 0.30·stack + 0.20·responsibilities + 0.10·domai
 ```
 
 Все три образца ниже проверены исполнением: они проходят фактический
-`load_config`, и все 60 написаний из `profile.yaml` (47 групп-сигналов)
+`load_config`, и все 67 написаний из `profile.yaml` (47 групп-сигналов)
 компилируются `SignalMatcher` без исключений.
+
+Образцы здесь и файлы в `config.example/` — **один и тот же текст**, и это
+проверяется тестом (`tests/test_config_example.py`,
+`test_spec_config_samples_match_config_example`), а не обещанием: два разных
+«образца конфига» — это гарантированно один устаревший, причём устареет тот,
+который никто не запускает. Так и вышло в прошлой редакции — §7 отставала на
+семь написаний сигналов и предлагала два несуществующих slug'а.
 
 ```yaml
 # queries.yaml
+# Slug — это НЕ поисковый запрос: hh.ru отдаёт только курируемые листинги.
+# На несуществующий slug он отвечает 200 и общим индексом (спека §3.3), а
+# сторож canonical превращает это в громкий FetchFailed уже ПОСЛЕ запроса —
+# поэтому каждый свой slug подтверждайте одним GET заранее.
+# Проверено 2026-07-28: перечисленные ниже существуют.
 queries:
-  - slug: programmist            # slug проверен живой фикстурой
+  - slug: programmist
     cluster: backend
     weight: 8
     pages: 3
-  - slug: programmist-python     # slug НЕ проверен: подтвердить одним GET перед прогоном
+  - slug: razrabotchik
     cluster: backend
     weight: 8
-    pages: 2
-  - slug: sistemnyj-administrator  # slug НЕ проверен: подтвердить одним GET
-    cluster: embedded
+    pages: 3
+  - slug: lead-developer
+    cluster: lead
+    weight: 10
+    pages: 1
+  - slug: rukovoditel-komandy-razrabotki
+    cluster: lead
+    weight: 10
+    pages: 1
+  - slug: devops
+    cluster: infra
     weight: 5
     pages: 1
 ```
@@ -810,10 +830,14 @@ queries:
 в `sources/rss.py` (`RssQuery`), к самому RSS, чтобы конфиг не описывал возможностей,
 которых нет.
 
-О непроверенных slug'ах прямо: hh.ru на несуществующий slug отвечает 200 и общим
-индексом (§3.3), поэтому проверять их обязательно. Хорошая новость — цена ошибки
-теперь громкий `FetchFailed` со сторожа `canonical`, а не тихий мусор в базе. Плохая —
-прогон на этом листинге отказывает целиком.
+О проверке slug'ов прямо: hh.ru на несуществующий slug отвечает 200 и общим
+индексом (§3.3), поэтому проверять их обязательно — своим одним `GET`, до первого
+прогона. Пять образцовых проверены живьём 2026-07-28; вместе с ними проверены и
+существуют `senior-developer` и `glavnyj-programmist`, а вот `programmist-python` и
+`sistemnyj-administrator`, стоявшие здесь в прошлой редакции, **не существуют** —
+именно они и были примером цены такой ошибки. Хорошая новость: цена теперь громкий
+`FetchFailed` со сторожа `canonical`, а не тихий мусор в базе. Плохая — прогон на
+этом листинге отказывает целиком.
 
 ```yaml
 # profile.yaml
@@ -821,19 +845,24 @@ weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, domain: 0.10}
 saturation: {stack: 5, responsibilities: 3}
 penalty_per_signal: 15
 signals:
-  # Вложенный список — ГРУППА написаний одной сущности: она считается одним
-  # сигналом насыщения, сколько бы её написаний ни совпало (§6). Простая
-  # строка — группа из одного элемента.
-  title_roles: [[team lead, tech lead, teamlead], senior, ведущ, старш, руководител]
+  # Вложенный список — ГРУППА написаний одной сущности, считающаяся ОДНИМ
+  # сигналом насыщения (спека §6). Простая строка — группа из одного элемента,
+  # поэтому оба написания законны и старые профили не переписываются.
+  #
+  # Кириллический сигнал задаётся ОСНОВОЙ (`ведущ`, а не `ведущий`), латинский —
+  # точной формой, и ни тот ни другой не срабатывает, если сразу за паттерном
+  # стоит буква или цифра (спека §6.1). Отсюда `arm64` рядом с `arm`.
+  title_roles: [[team lead, tech lead, teamlead, team-lead, tech-lead, тимлид, техлид],
+                [senior, сеньор], ведущ, старш, руководител]
   title_tech:  [backend, embedded, linux, c++, python,
                 [node, node.js, nodejs], firmware]
   stack:       [yocto, buildroot, openwrt, bsp, kernel,
                 [arm, arm64, armv7, armv8],
                 c++, python, node.js, typescript, docker, kubernetes, kafka,
-                postgresql, clickhouse, llm, rag, mcp]
+                postgresql, clickhouse, [llm, llms], rag, mcp]
   responsibilities: [архитектур, менторинг, [код-ревью, code review],
                      проектирован, техдолг]
-  domain:      [телеком, встраиваем, embedded, iot, микросервис]
+  domain:      [телеком, встраиваем, embedded, [iot, iiot], микросервис]
 negative: [[junior, стажёр, intern], 1c, продаж, рекрутер, ручн тестиров,
            [оператор пк, оператор call, оператор колл, оператор станка], курьер]
 report_threshold: 60

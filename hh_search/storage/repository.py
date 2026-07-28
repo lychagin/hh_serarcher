@@ -206,9 +206,24 @@ class SqliteRepository:
     # --- 1: обогащение, единственная выборка, ходящая в сеть -------------
 
     def pending_enrichment(self, max_attempts: int) -> list[DiscoveredVacancy]:
+        """Очередь обогащения — единственная выборка, ходящая в сеть.
+
+        `CAST(COALESCE(enrich_attempts, 0) AS INTEGER)`, а не голая
+        колонка: у SQLite типы динамические, и текст в этой колонке
+        сравнивается с числом по правилу «любое число меньше любого
+        текста», то есть предикат становится ложным навсегда. Вакансия
+        при этом невидима ВСЕМ трём выборкам разом (`pending_scoring` и
+        `unreported` требуют описания, которого у неё нет) и пропадает
+        молча — единственный вид порчи, который `safe_rows` поймать не
+        может в принципе: он защищает разбор строк, а здесь строка не
+        доходит до разбора. `CAST` возвращает такую строку в очередь, а
+        первый же `bump_enrich_attempt` делает счётчик снова числом,
+        поэтому вечного цикла из этого не выходит.
+        """
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL} FROM vacancy "
-            "WHERE status = ? AND description IS NULL AND enrich_attempts < ? "
+            "WHERE status = ? AND description IS NULL "
+            "AND CAST(COALESCE(enrich_attempts, 0) AS INTEGER) < ? "
             "ORDER BY COALESCE(published_at, first_seen_at) DESC",
             (STATUS_NEW, max_attempts),
         ).fetchall()

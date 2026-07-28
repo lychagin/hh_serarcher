@@ -68,6 +68,24 @@ def test_user_agent_gets_contact_email_substituted(tmp_path: Path) -> None:
     assert cfg.app.user_agent == "hh-search/0.1 (personal job search; me@example.com)"
 
 
+@pytest.mark.parametrize("template", ['"hh-search/{version}"', '"hh-search/{0}"'])
+def test_unknown_placeholder_in_user_agent_is_a_config_error(tmp_path: Path, template: str) -> None:
+    """Чужой плейсхолдер обязан быть ошибкой КОНФИГА, а не KeyError.
+
+    `str.format` бросает `KeyError`/`IndexError`, pydantic их не
+    заворачивает, а CLI ловит только `(OSError, ValueError)` — то есть
+    пользователь получал голый traceback вместо строки с именем поля,
+    вопреки политике §7 «опечатка роняет процесс на старте с внятным
+    сообщением».
+    """
+    broken = APP_YAML.replace(
+        'user_agent: "hh-search/0.1 (personal job search; {contact_email})"',
+        f"user_agent: {template}",
+    )
+    with pytest.raises(ValidationError, match="плейсхолдер"):
+        load_config(write_config(tmp_path, **{"app.yaml": broken}))
+
+
 def test_unknown_key_is_rejected(tmp_path: Path) -> None:
     broken = PROFILE_YAML + "\nreport_treshold: 70\n"  # опечатка в слове threshold
     with pytest.raises(ValidationError):

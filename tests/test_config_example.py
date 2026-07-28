@@ -13,16 +13,21 @@
    этот класс не ловят — только прогон через фактический `SignalMatcher`.
 """
 
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
 from hh_search.filtering.matching import SignalMatcher
 from hh_search.sources.http import PoliteClient
 
-CONFIG_EXAMPLE = Path(__file__).resolve().parent.parent / "config.example"
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_EXAMPLE = ROOT / "config.example"
+SPEC = ROOT / "docs/superpowers/specs/2026-07-27-hh-autosearch-design.md"
+SCHEMA = ROOT / "hh_search/storage/schema.sql"
 
 # Слева — заголовок в живой по форме записи, справа — сигнал, который обязан
 # сработать. Каждая пара взята из находки: прежняя редакция образца молчала
@@ -151,3 +156,72 @@ def test_example_signal_actually_fires(example_config: Config, title: str, signa
 def test_example_stop_words_do_not_reject_the_target(example_config: Config, title: str) -> None:
     """«крупный оператор связи» — это целевой телеком, а не колл-центр."""
     assert _negative_matcher(example_config).find(title) == []
+
+
+# --- спека против кода: расхождение обязано ловиться автоматически ---------
+#
+# Абзац в чеклисте «сверить спеку с кодом» не работает: он выполняется
+# ровно один раз, а расходятся они на каждом следующем раунде правок.
+# Отсюда два теста ниже — они и есть та сверка.
+
+
+def _statements(sql: str) -> list[str]:
+    """Операторы SQL без комментариев и без разницы в отступах."""
+    stripped = re.sub(r"--[^\n]*", "", sql)
+    return [" ".join(part.split()) for part in stripped.split(";") if part.strip()]
+
+
+def _spec_section(start: str, end: str) -> str:
+    text = SPEC.read_text(encoding="utf-8")
+    return text[text.index(start) : text.index(end)]
+
+
+def test_spec_ddl_matches_schema_sql() -> None:
+    """§5.1 обещает «приведено дословно по schema.sql» — проверяем дословность.
+
+    Расхождение здесь дороже, чем кажется: спека — единственное описание
+    жизненного цикла строки, и колонка, которой в ней нет, при следующем
+    раунде правок «добавляется» второй раз миграцией.
+    """
+    block = re.search(r"```sql\n(.*?)\n```", _spec_section("### 5.1", "### 5.2"), re.S)
+    assert block is not None, "в §5.1 пропал блок ```sql```"
+    assert _statements(block.group(1)) == _statements(SCHEMA.read_text(encoding="utf-8"))
+
+
+def test_spec_config_samples_match_config_example() -> None:
+    """Образцы §7 обязаны совпадать с тем, что лежит в `config.example/`.
+
+    Два разных «образца конфига» — это гарантированно один устаревший, и
+    устареет именно тот, который никто не запускает. Проверено фактом:
+    §7 отставала от `config.example/` на семь написаний сигналов и
+    содержала два slug'а, которых у hh.ru нет вовсе.
+    """
+    section = _spec_section("## 7. Конфигурация", "## 8. Развёртывание")
+    blocks = {
+        match.group(1): yaml.safe_load(match.group(2))
+        for match in re.finditer(r"```yaml\n# (\w+\.yaml)\n(.*?)\n```", section, re.S)
+    }
+    assert sorted(blocks) == ["app.yaml", "profile.yaml", "queries.yaml"]
+    for name, spec_data in blocks.items():
+        example = yaml.safe_load((CONFIG_EXAMPLE / name).read_text(encoding="utf-8"))
+        if name == "app.yaml":
+            # Единственное осмысленное расхождение: в спеке настоящий адрес,
+            # в образце — плейсхолдер, который пользователь обязан заменить.
+            spec_data = {key: value for key, value in spec_data.items() if key != "contact_email"}
+            example = {key: value for key, value in example.items() if key != "contact_email"}
+        assert spec_data == example, f"§7 и config.example/{name} разошлись"
+
+
+def test_spec_config_samples_load_as_a_real_config(tmp_path: Path) -> None:
+    """И проходят фактический `load_config`, а не только выглядят похоже.
+
+    Совпадения с `config.example/` мало: оно доказывает, что образцы не
+    разошлись, но не то, что рабочий из них хоть один. Здесь §7
+    выкладывается на диск как настоящий каталог конфигурации и грузится
+    тем же кодом, что и в проде.
+    """
+    section = _spec_section("## 7. Конфигурация", "## 8. Развёртывание")
+    for match in re.finditer(r"```yaml\n# (\w+\.yaml)\n(.*?)\n```", section, re.S):
+        (tmp_path / match.group(1)).write_text(match.group(2), encoding="utf-8")
+    config = load_config(tmp_path)
+    SignalMatcher(_all_signals(config))

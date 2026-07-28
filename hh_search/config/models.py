@@ -137,7 +137,22 @@ class AppConfig(Base):
 
     @model_validator(mode="after")
     def substitute_contact_email(self) -> "AppConfig":
-        self.user_agent = self.user_agent.format(contact_email=self.contact_email)
+        """Подставляет адрес в `user_agent`; чужой плейсхолдер — ошибка конфига.
+
+        `str.format` на `hh-search/{version}` бросает `KeyError`, а он не
+        `ValueError`: pydantic его не заворачивает, CLI ловит только
+        `(OSError, ValueError)`, и пользователь получает голый traceback
+        вместо строки «в app.yaml опечатка». Политика проекта — опечатка
+        роняет процесс на старте С УКАЗАНИЕМ ПОЛЯ (§7), поэтому отказ
+        переводится в обычную ошибку валидации.
+        """
+        try:
+            self.user_agent = self.user_agent.format(contact_email=self.contact_email)
+        except (KeyError, IndexError) as error:
+            raise ValueError(
+                f"user_agent: неизвестный плейсхолдер {error} — поддерживается "
+                "только {contact_email}"
+            ) from error
         return self
 
 

@@ -449,6 +449,48 @@ def test_one_empty_page_among_several_is_not_a_failure(
     assert (stats.status, stats.discovered, stats.reported) == ("ok", 2, 1)
 
 
+@respx.mock
+def test_run_without_a_single_fetched_listing_is_a_failure(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Полная потеря сети обязана быть `failed`, а не `partial`.
+
+    Наблюдение Task 12, воспроизведённое в офлайн-контейнере: каждый
+    запрос падает, каждый отказ отдельно — законный `partial`, а `partial`
+    считается успехом для `last_successful_run()`. Итог — healthcheck
+    возвращает 0 вечно при сервисе, который не делает ничего: ровно тот
+    класс отказа, ради которого healthcheck и заведён. Сторож тишины висел
+    на страницах, ОТДАННЫХ источником, и при нуле отданных молчал.
+    """
+    respx.get(url__regex=r".*").mock(side_effect=httpx.ConnectError("Network is unreachable"))
+    with caplog.at_level(logging.ERROR):
+        stats = run(config, repo, [RecordingSink()])
+    assert (stats.status, stats.discovered) == ("failed", 0)
+    assert stats.exit_code() == 1
+    assert "ни одна из 1 запрошенных страниц листингов не получена" in caplog.text
+    # Вторая половина того же факта: журнал прогонов не считает этот
+    # прогон успешным, то есть healthcheck его не увидит.
+    assert repo.last_successful_run() is None
+
+
+@respx.mock
+def test_run_where_every_listing_is_unchanged_stays_successful(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Обратная сторона: `304` — это ОТВЕТ источника, а не тишина.
+
+    Прогон, в котором ничего не изменилось с прошлого раза, — штатный и
+    самый частый исход, и записывать его в `failed` значило бы держать
+    healthcheck красным между публикациями вакансий.
+    """
+    repo.save_cache_headers(LISTING_URL, '"v1"', None)
+    mock_robots()
+    respx.get(url__startswith=LISTING_URL).mock(return_value=httpx.Response(304))
+    stats = run(config, repo, [RecordingSink()])
+    assert (stats.status, stats.discovered) == ("ok", 0)
+    assert repo.last_successful_run() is not None
+
+
 # --- C4: авария источника не жжёт попытки ---------------------------------
 
 

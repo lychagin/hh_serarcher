@@ -141,6 +141,50 @@ def test_parse_salary_tail_after_currency_never_participates(tail: str) -> None:
     assert (salary.amount_from, salary.amount_to, salary.currency) == (100000, None, "₽")
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ".",
+        ",",
+        ",опыт от 3 лет",
+        "за месяц",
+        ".Оклад обсуждается",
+        ";на руки",
+        ")",
+    ],
+)
+def test_parse_salary_tail_glued_to_currency_never_participates(tail: str) -> None:
+    """Граница инварианта, а не его середина.
+
+    Прежний набор хвостов был весь отделён пробелом, то есть проверял ровно
+    тот случай, где хвост и так не участвует по построению. Приклеенный
+    вплотную попадал в слот валюты и уезжал в отчёт как есть: `₽.`,
+    `₽,опыт`. Класс достижим на живых данных — блок
+    `data-qa="vacancy-salary"` склеивается из `<span>`'ов, и пропавший
+    между ними пробел даёт `₽за`.
+    """
+    salary = parse_salary("от 100 000 ₽" + tail)
+    assert (salary.amount_from, salary.amount_to, salary.currency) == (100000, None, "₽")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_currency"),
+    [
+        # Точка у СЛОВА своя: `руб.` — законное написание валюты.
+        ("от 200 000 руб.", "руб."),
+        ("от 200 000 руб.,опыт от 3 лет", "руб."),
+        ("до 2000 USD.", "USD."),
+        # А токен из одной пунктуации валютой не является ни с какой стороны.
+        ("от 100 000 -", None),
+        ("от 100 000 ...", None),
+    ],
+)
+def test_parse_salary_keeps_the_dot_that_belongs_to_the_word(
+    raw: str, expected_currency: str | None
+) -> None:
+    assert parse_salary(raw).currency == expected_currency
+
+
 def test_parse_salary_ignores_keyword_inside_word() -> None:
     # «работ» содержит «от», но границей диапазона это слово не делает.
     salary = parse_salary("оплата за 5 работ 100 000 ₽")
