@@ -1,5 +1,6 @@
 """Логи одновременно в stdout (их забирает `docker logs`) и в файл с ротацией."""
 
+import contextlib
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
@@ -11,6 +12,57 @@ FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 # это несколько сотен строк, среди которых теряются наши ERROR — а именно
 # они здесь единственный способ узнать о потере данных.
 QUIET_LOGGERS = ("httpx", "httpcore")
+
+
+class ResilientFileHandler(RotatingFileHandler):
+    """Файловый обработчик, который умеет ОТКАЗАТЬ, а не сыпать трейсбеками.
+
+    `setup_logging` проверяет каталог логов один раз, при старте, и этого
+    достаточно ровно до первой смены прав на ходу. Дальше `doRollover`
+    бросает `PermissionError` на КАЖДОЙ записи, `logging` исключение
+    подавляет и печатает полный traceback в stderr: замер — 830 байт
+    мусора на запись, все записи в файл потеряны, процесс жив и выглядит
+    здоровым. В докере stderr уходит в `docker logs`, где нашей ротации
+    уже нет, то есть беда лечится обратной стороной той же беды.
+
+    Поэтому первый же отказ файла выключает обработчик насовсем и
+    объявляет об этом ОДИН раз. Насовсем — потому что причина у отказа
+    записи в файл всегда одна и та же (права, `:ro`, полный диск) и сама
+    не проходит, а сервис обязан продолжать искать вакансии: stdout
+    остаётся, и в нём остаётся всё, что было бы в файле.
+    """
+
+    def __init__(
+        self, filename: Path | str, *, max_bytes: int, backup_count: int, encoding: str
+    ) -> None:
+        super().__init__(
+            str(filename), maxBytes=max_bytes, backupCount=backup_count, encoding=encoding
+        )
+        self.disabled_by: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.disabled_by is not None:
+            return
+        super().emit(record)
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802 — имя из logging
+        """Вызывается самим `logging`, когда `emit` бросил исключение."""
+        error = sys.exc_info()[1]
+        if self.disabled_by is not None:
+            return
+        # Флаг взводится ДО жалобы: жалоба пойдёт через тот же корневой
+        # логгер, то есть в том числе сюда, и без флага получилась бы
+        # рекурсия на пустом месте.
+        self.disabled_by = str(error) or type(error).__name__
+        with contextlib.suppress(OSError):
+            self.close()
+        logging.getLogger(__name__).error(
+            "файловый лог %s отключён после первой же ошибки записи (%s); дальше пишем "
+            "только в stdout. Ротация не работает, и `docker logs` теперь единственный "
+            "след — проверьте права на каталог логов и место на диске",
+            self.baseFilename,
+            self.disabled_by,
+        )
 
 
 def setup_logging(logs_dir: Path, level: int = logging.INFO) -> None:
@@ -26,8 +78,8 @@ def setup_logging(logs_dir: Path, level: int = logging.INFO) -> None:
     try:
         logs_dir.mkdir(parents=True, exist_ok=True)
         handlers.append(
-            RotatingFileHandler(
-                logs_dir / "hh.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+            ResilientFileHandler(
+                logs_dir / "hh.log", max_bytes=5_000_000, backup_count=5, encoding="utf-8"
             )
         )
     except OSError as error:

@@ -15,14 +15,17 @@
   stdout, и человек об этом не узнаёт.
 """
 
+import io
 import logging
+import stat
 import sys
 from collections.abc import Iterator
+from contextlib import redirect_stderr
 from pathlib import Path
 
 import pytest
 
-from hh_search.logging_setup import setup_logging
+from hh_search.logging_setup import ResilientFileHandler, setup_logging
 
 
 @pytest.fixture(autouse=True)
@@ -113,3 +116,76 @@ def test_an_unusable_log_directory_is_reported_and_not_fatal(
     assert any(
         getattr(handler, "stream", None) is sys.stdout for handler in logging.getLogger().handlers
     )
+
+
+# --- каталог логов, ставший недоступным НА ХОДУ ---------------------------
+
+
+def _break_the_log_directory(logs: Path) -> None:
+    """Ротация на следующей же записи — и писать её некуда."""
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, ResilientFileHandler):
+            handler.maxBytes = 1
+    logs.chmod(stat.S_IRUSR | stat.S_IXUSR)
+
+
+def test_a_log_directory_that_breaks_later_disables_the_file_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`setup_logging` проверяет каталог один раз — при старте.
+
+    Дальше `doRollover` бросает `PermissionError` на КАЖДОЙ записи,
+    `logging` исключение подавляет и печатает полный traceback в stderr:
+    замер на FIX_BASE — 2855 байт мусора на пять записей (571 байт на
+    запись), все записи в файл потеряны, процесс жив и выглядит здоровым.
+    В докере stderr уходит в `docker logs`, то есть ротация лечится
+    обратной стороной той же беды.
+
+    Проверяется ровно это: мусора в stderr нет вовсе, жалоба одна, и
+    сервис продолжает писать в stdout — то есть наблюдаемость не пропадает
+    вместе с файлом.
+    """
+    logs = tmp_path / "logs"
+    setup_logging(logs)
+    logging.getLogger("hh_search.test").info("до аварии")
+    _break_the_log_directory(logs)
+
+    noise = io.StringIO()
+    with redirect_stderr(noise):
+        for number in range(5):
+            logging.getLogger("hh_search.test").info("после аварии %d", number)
+    logs.chmod(0o755)
+
+    assert noise.getvalue() == ""
+    captured = capsys.readouterr().out
+    assert captured.count("файловый лог") == 1
+    assert "отключён после первой же ошибки записи" in captured
+    # Записи, шедшие после отказа, никуда не делись: stdout остался.
+    assert captured.count("после аварии") == 5
+
+
+def test_the_broken_file_handler_stops_trying(tmp_path: Path) -> None:
+    """Отключён — значит отключён: обработчик больше не трогает файл.
+
+    Без флага каждая следующая запись снова шла бы в `doRollover`, снова
+    получала `PermissionError` и снова стоила бы полного traceback: беда
+    здесь не в одной потерянной записи, а в том, что цена платится
+    вечно и растёт вместе с трафиком лога.
+    """
+    logs = tmp_path / "logs"
+    setup_logging(logs)
+    handler = next(
+        item for item in logging.getLogger().handlers if isinstance(item, ResilientFileHandler)
+    )
+    _break_the_log_directory(logs)
+    with redirect_stderr(io.StringIO()):
+        logging.getLogger("hh_search.test").info("первая после аварии")
+    logs.chmod(0o755)
+
+    assert handler.disabled_by is not None
+    assert "Permission denied" in handler.disabled_by
+    # Дальнейшие записи в файл не идут вовсе — даже когда права вернулись:
+    # причина отказа записи сама не проходит, а проверять её на каждой
+    # строке значит платить за неё на каждой строке.
+    logging.getLogger("hh_search.test").info("после возврата прав")
+    assert "после возврата прав" not in (logs / "hh.log").read_text(encoding="utf-8")

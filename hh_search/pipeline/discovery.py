@@ -18,6 +18,7 @@ import httpx
 from hh_search.config.models import Config, QuerySpec
 from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
 from hh_search.filtering.prefilter import Prefilter
+from hh_search.pipeline.failures import FailureDigest
 from hh_search.pipeline.forbidden import ForbiddenStreak
 from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.sources.http import PoliteClient
@@ -39,6 +40,9 @@ def discover(
     """Обойти все листинги и все их страницы; каждая страница — один запрос."""
     fetched = 0
     unchanged = 0
+    # Отказы копятся и печатаются сводкой: при недоступном источнике они
+    # отличаются только URL, а причина у всех одна (см. pipeline/failures.py).
+    skipped = FailureDigest()
     for query in config.queries.queries:
         for page in range(query.pages):
             url = build_listing_url(query, page)
@@ -53,7 +57,7 @@ def discover(
                 # Состояние СЕРВЕРА, а не листинга: следующий прогон
                 # повторит запрос, терять нечего. Спека §9 — WARNING+partial.
                 stats.degrade(PARTIAL, f"листинг {url} не получен: {error}")
-                logger.warning("листинг %s пропущен: %s", url, error)
+                skipped.add(str(error), url)
                 continue
             forbidden.survived()
             if response.status_code == NOT_MODIFIED:
@@ -62,7 +66,7 @@ def discover(
                 continue
             if response.status_code != 200:
                 stats.degrade(PARTIAL, f"листинг {url}: код {response.status_code}")
-                logger.warning("листинг %s ответил %s", url, response.status_code)
+                skipped.add(f"код ответа {response.status_code}", url)
                 continue
             # Считается ОТДАННАЯ источником страница, а не успешно
             # разобранная: дрейф формата, при котором не разбирается ни
@@ -71,6 +75,7 @@ def discover(
             # `partial`, то есть успехом для healthcheck.
             fetched += 1
             _store_page(repo, query, url, response, stats)
+    skipped.log_summary("страниц листингов не получено")
     _check_not_silent(config, stats, fetched, unchanged)
 
 

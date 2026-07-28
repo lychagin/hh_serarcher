@@ -14,7 +14,7 @@ from hh_search.domain.models import (
 from hh_search.storage.mappers import to_discovered, to_id_and_title, to_scored, to_scoring_task
 from hh_search.storage.migrations import apply_schema
 from hh_search.storage.quarantine import Quarantine, safe_rows
-from hh_search.storage.run_log import RunLog
+from hh_search.storage.run_log import RunLog, RunSummary
 from hh_search.storage.time_utils import now_iso, to_utc_iso, to_utc_iso_optional
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
@@ -214,12 +214,30 @@ class SqliteRepository:
         `reject_code='prefilter'`, и следующий `mark X rejected`
         возвращался в очередь ближайшим прогоном — вопреки спеке §5.2,
         где ручной отказ кода не имеет вовсе и не возвращается.
+
+        `reported_at` при переводе в `reported` проставляется тем же
+        UPDATE — по той же причине и тем же приёмом. Без него `mark X
+        reported` создавал ещё одно невидимое состояние:
+        `status='reported'` уводит строку из `unreported()` (там
+        `status='new'`), а пустой `reported_at` — из `reported_since()`
+        (там `reported_at >= ?`). Вакансия пропадала из ОБОИХ путей
+        отчёта, а команда отвечала «1 → reported» и кодом 0. Ставится
+        только если его ещё нет: время первой отправки — история, и
+        затирать её ручной командой незачем.
         """
         cursor = self._connection.execute(
             "UPDATE vacancy SET status = :status, reject_reason = NULL, reject_code = NULL, "
-            "enrich_attempts = CASE WHEN :status = :new THEN 0 ELSE enrich_attempts END "
+            "enrich_attempts = CASE WHEN :status = :new THEN 0 ELSE enrich_attempts END, "
+            "reported_at = CASE WHEN :status = :reported THEN COALESCE(reported_at, :now) "
+            "ELSE reported_at END "
             "WHERE id = :id",
-            {"status": status, "new": STATUS_NEW, "id": vacancy_id},
+            {
+                "status": status,
+                "new": STATUS_NEW,
+                "reported": STATUS_REPORTED,
+                "now": now_iso(),
+                "id": vacancy_id,
+            },
         )
         self._connection.commit()
         return cursor.rowcount > 0
@@ -524,7 +542,27 @@ class SqliteRepository:
     # --- 3: отчёт --------------------------------------------------------
 
     def unreported(self) -> list[ScoredVacancy]:
-        self._warn_about_unscored()
+        """Готовое к отправке. Сторожа очереди пересчёта здесь БОЛЬШЕ НЕТ.
+
+        Он тут был (`_warn_about_unscored`) и делал ровно две вещи, обе
+        вредные. Во-первых, дублировал счётчик `stuck` из
+        `pipeline/reporting.py`: тот считает то же самое через
+        `pending_scoring()`, но добавляет id, понижает статус прогона и
+        уезжает в журнал — то есть покрывает этот случай полностью и
+        строго лучше. Во-вторых, `unreported()` вызывается конвейером
+        дважды за прогон, поэтому один факт печатался тремя `ERROR`, и два
+        из трёх ставили НЕВЕРНЫЙ диагноз: «конвейер не вызвал
+        pending_scoring() перед unreported()». Трассировка SQL показывает
+        обратное — за тот же прогон конвейер зовёт `pending_scoring()`
+        трижды. Очередь не сходится не потому, что её не разобрали, а
+        потому, что отказал скорер, и об этом строкой выше кричит сам
+        `rescore`.
+
+        Лог — единственный канал наблюдаемости у этого сервиса, и вся его
+        диагностика построена на том, что сообщение называет причину.
+        Сторож, называющий выдуманную причину, обесценивает остальные.
+        Спека §5.2 описывает прежнее поведение и правится отдельно.
+        """
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
             "CAST(valid_through AS BLOB) AS valid_through, "
@@ -558,31 +596,6 @@ class SqliteRepository:
         ).fetchall()
         return safe_rows(rows, to_scored, self._quarantine)
 
-    def _warn_about_unscored(self) -> None:
-        """Сторож очереди пересчёта: молчаливого пропуска быть не должно.
-
-        Хранилище не может заставить конвейер вызвать `pending_scoring()`
-        перед отчётом, но может не дать пропуску пройти незамеченным.
-        Каждая такая строка — вакансия, которая уже стоила запроса к
-        hh.ru и всё равно не попадёт ни в один отчёт, пока очередь
-        пересчёта не будет обработана. COUNT(*) по трём предикатам не
-        декодирует ни одного значения, поэтому сторож не падает даже на
-        полностью испорченной таблице.
-        """
-        row = self._connection.execute(
-            "SELECT COUNT(*) AS stuck FROM vacancy WHERE status = ? "
-            "AND description IS NOT NULL AND score_detail IS NULL",
-            (STATUS_NEW,),
-        ).fetchone()
-        stuck = int(row["stuck"]) if row else 0
-        if stuck:
-            logger.error(
-                "%d вакансий с готовым описанием и без оценки не попадут в отчёт: "
-                "конвейер не вызвал pending_scoring() перед unreported(). Описание "
-                "у них есть, перекачка не нужна — нужен локальный пересчёт оценки",
-                stuck,
-            )
-
     def mark_reported(self, ids: Sequence[str]) -> None:
         if not ids:
             return
@@ -612,6 +625,9 @@ class SqliteRepository:
 
     def last_successful_run(self) -> datetime | None:
         return self._run_log.last_successful_run()
+
+    def last_run(self) -> RunSummary | None:
+        return self._run_log.last_run()
 
     def cache_headers(self, url: str) -> dict[str, str]:
         return self._run_log.cache_headers(url)

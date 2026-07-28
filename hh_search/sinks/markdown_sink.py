@@ -69,9 +69,9 @@ class MarkdownSink:
         self._reports_dir = reports_dir
         self._threshold = threshold
 
-    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> None:
+    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
         if not vacancies:
-            return
+            return 0
         self._reports_dir.mkdir(parents=True, exist_ok=True)
         path = self._reports_dir / f"{now:%Y-%m-%d}-new.md"
         # Дедупликация по уже вписанным ссылкам: доставка сюда at-least-once
@@ -88,7 +88,7 @@ class MarkdownSink:
         if not ordered:
             # Иначе к отчёту дописывался бы «# Новые вакансии» с пустыми
             # разделами — шум в файле, который читают глазами.
-            return
+            return 0
         top = [item for item in ordered if item.score.total >= self._threshold]
         rest = [item for item in ordered if item.score.total < self._threshold]
 
@@ -119,6 +119,7 @@ class MarkdownSink:
                 # заголовком — как и весь следующий за ней разбор.
                 handle.write("\n")
             handle.write("\n".join(lines).rstrip() + "\n\n")
+        return len(ordered)
 
     def _read_day_file(self, path: Path) -> str:
         """Содержимое отчёта текущего дня; пусто, если файла нет.

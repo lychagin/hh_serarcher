@@ -1068,13 +1068,25 @@ def test_save_description_stores_the_page_without_a_score(repo: SqliteRepository
     assert [v.discovered.id for v in repo.unreported()] == ["1"]
 
 
-def test_unreported_shouts_when_the_scoring_queue_was_skipped(
+def test_unreported_does_not_accuse_the_pipeline(
     tmp_path: object, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Сторож очереди: хранилище не может заставить конвейер вызвать
-    pending_scoring(), но обязано не дать пропуску пройти незамеченным.
-    Каждая такая строка — вакансия, которая уже стоила запроса к hh.ru и
-    всё равно не попадёт ни в один отчёт."""
+    """I1: сторож застрявшей очереди убран из `unreported()` — и это не потеря.
+
+    Он говорил неправду и дублировал соседа. Неправду — потому что
+    печатал «конвейер не вызвал pending_scoring() перед unreported()»
+    ровно в том сценарии, где конвейер зовёт `pending_scoring()` по три
+    раза за прогон, а очередь не сходится из-за отказа скорера. Дублировал
+    — потому что тот же факт считает `stats.stuck` в
+    `pipeline/reporting.py`, и считает лучше: с id, с понижением статуса и
+    с записью в журнал прогона (это проверяет
+    `test_stuck_scoring_queue_is_reported_once_and_without_a_false_cause`).
+    А `unreported()` вызывается дважды за прогон, поэтому один факт
+    печатался трижды.
+
+    Выборка при этом не изменилась ни на строку: вакансия без оценки в
+    отчёт по-прежнему не попадает.
+    """
     db_path = str(tmp_path) + "/test.db"
     repository = SqliteRepository(db_path)
     repository.init_schema()
@@ -1091,16 +1103,10 @@ def test_unreported_shouts_when_the_scoring_queue_was_skipped(
         result = repository.unreported()
 
     assert [v.discovered.id for v in result] == ["1"]
-    assert "1 вакансий" in caplog.text
-    assert "pending_scoring()" in caplog.text
-
-    # очередь разобрана — сторож молчит
-    for vacancy, _ in repository.pending_scoring():
-        repository.save_score(vacancy.id, make_score(total=50.0))
-    caplog.clear()
-    with caplog.at_level(logging.ERROR):
-        assert len(repository.unreported()) == 2
-    assert caplog.text == ""
+    assert "pending_scoring()" not in caplog.text
+    assert "конвейер не вызвал" not in caplog.text
+    # Строка не пропала и не потерялась: её видит очередь пересчёта.
+    assert [vacancy.id for vacancy, _ in repository.pending_scoring()] == ["2"]
     repository.close()
 
 
@@ -1148,6 +1154,67 @@ def test_last_successful_run_survives_a_corrupt_journal(tmp_path: object) -> Non
 
     repository = SqliteRepository(db_path)
     assert repository.last_successful_run() == datetime(2026, 7, 27, 10, 0, tzinfo=UTC)
+    repository.close()
+
+
+def test_a_run_finished_in_the_future_is_not_counted_as_successful(
+    tmp_path: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M1: часы, ушедшие ВПЕРЁД, делали healthcheck зелёным навсегда.
+
+    `healthcheck` сравнивает `last < deadline`, а дата из будущего меньше
+    порога не бывает никогда — значит одна строка журнала с `finished_at`
+    на 400 дней вперёд гасит индикатор до самой этой даты. Тот же след
+    ломает предохранитель повторного прогона (`_too_soon`): возраст
+    прогона отрицательный, то есть «прошлый был только что» — вечно.
+    Строка обязана пропускаться, как и нечитаемая, и обязана быть
+    объявлена: молча игнорировать след скачка часов — значит скрыть
+    единственную улику.
+    """
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    real = repository.start_run()
+    repository.finish_run(real, "ok", finished_at=datetime.now(UTC) - timedelta(hours=1))
+    skewed = repository.start_run()
+    repository.finish_run(skewed, "ok", finished_at=datetime.now(UTC) + timedelta(days=400))
+    repository.close()
+
+    repository = SqliteRepository(db_path)
+    with caplog.at_level(logging.ERROR):
+        last = repository.last_successful_run()
+    assert last is not None
+    assert last < datetime.now(UTC)
+    assert "часы уходили вперёд" in caplog.text
+    repository.close()
+
+
+def test_the_last_run_summary_is_readable_even_when_the_journal_is_corrupt(
+    tmp_path: object,
+) -> None:
+    """Счётчики прогона писались всегда, а читать их было некому.
+
+    Единственная выборка из `run` брала `finished_at` успешных прогонов,
+    то есть наблюдаемость существовала только на запись. Сводка нужна
+    `healthcheck`: человек смотрит именно её, когда индикатор покраснел.
+    Падать на порче она не имеет права — за ней приходят как раз тогда,
+    когда с данными что-то не так.
+    """
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    run_id = repository.start_run()
+    repository.finish_run(run_id, "failed", discovered=20, enriched=0, reported=0, error="дрейф")
+    repository.close()
+
+    corrupt(db_path, "UPDATE run SET discovered = x'FFFE' WHERE id = ?", run_id)
+
+    repository = SqliteRepository(db_path)
+    summary = repository.last_run()
+    assert summary is not None
+    assert summary.status == "failed"
+    assert "дрейф" in summary.describe()
+    assert "обогащено 0" in summary.describe()
     repository.close()
 
 
@@ -2037,4 +2104,65 @@ def test_manual_status_other_than_new_keeps_the_attempt_counter(tmp_path: Path) 
     repository.set_status("1", "archived")
 
     assert read_column(db_path, "enrich_attempts", "1") == 2
+    repository.close()
+
+
+def test_manual_reported_sets_the_time_and_stays_findable(tmp_path: Path) -> None:
+    """I2: `mark <id> reported` не имеет права прятать вакансию из ОБОИХ путей.
+
+    `status='reported'` уводит строку из `unreported()` (там
+    `status='new'`), а пустой `reported_at` — из `reported_since()` (там
+    `reported_at >= ?`). Ручная команда отвечала «1 → reported» и кодом 0,
+    а вакансия исчезала из отчёта навсегда: ровно тот остаток, который
+    коммит c7d4b4d закрыл для `mark X new` и не закрыл здесь.
+    """
+    db_path = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+
+    assert repository.set_status("1", "reported") is True
+
+    assert read_column(db_path, "reported_at", "1") is not None
+    found = repository.reported_since(datetime.now(UTC) - timedelta(days=1))
+    assert [item.discovered.id for item in found] == ["1"]
+    repository.close()
+
+
+def test_manual_reported_does_not_overwrite_the_original_time(tmp_path: Path) -> None:
+    """Время первой отправки — история, и ручная команда её не переписывает.
+
+    Иначе `mark X reported` на уже отправленной вакансии двигал бы её
+    вперёд по времени, и `report --since 7d` показывал бы вчерашнюю
+    находку сегодняшней.
+    """
+    db_path = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repository.mark_reported(["1"])
+    first = read_column(db_path, "reported_at", "1")
+
+    repository.set_status("1", "reported")
+
+    assert read_column(db_path, "reported_at", "1") == first
+    repository.close()
+
+
+def test_manual_status_that_is_not_reported_does_not_invent_a_time(tmp_path: Path) -> None:
+    """Обратная охрана: `mark X archived` отправкой не является.
+
+    Проставь `reported_at` любому ручному статусу — и `report --since`
+    начал бы печатать то, чего никто не отправлял.
+    """
+    db_path = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+
+    repository.set_status("1", "archived")
+
+    assert read_column(db_path, "reported_at", "1") is None
     repository.close()

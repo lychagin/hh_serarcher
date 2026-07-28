@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -163,6 +164,53 @@ def test_failed_run_does_not_make_healthcheck_green(tmp_path: Path) -> None:
     assert invoke(config_dir, "healthcheck").exit_code == 1
 
 
+def test_healthcheck_shows_what_the_last_run_did(tmp_path: Path) -> None:
+    """Счётчики прогона писались всегда, а читать их было некому.
+
+    Единственная выборка из `run` брала `finished_at`, поэтому человек,
+    увидевший красный индикатор, узнавал только «свежего успешного
+    прогона нет». Причина при этом лежит в той же строке журнала —
+    достаточно её прочитать.
+    """
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.finish_run(
+            repo.start_run(),
+            "failed",
+            discovered=20,
+            enriched=0,
+            reported=0,
+            error="источник отдал 18 страниц вакансий, не разобрана ни одна",
+        )
+
+    result = invoke(config_dir, "healthcheck")
+
+    assert result.exit_code == 1
+    assert "последний прогон: failed" in result.output
+    assert "найдено 20, обогащено 0, отправлено 0" in result.output
+    assert "не разобрана ни одна" in result.output
+
+
+def test_a_clock_jump_forward_does_not_make_healthcheck_green_forever(tmp_path: Path) -> None:
+    """M1: строка журнала с датой в будущем гасила индикатор насовсем.
+
+    Порог считается как «сейчас минус два интервала», и дата из будущего
+    меньше его не бывает никогда. Достаточно одного скачка часов на
+    хосте, чтобы healthcheck отвечал `ok` до самой этой даты — при
+    сервисе, который к тому времени может не работать месяцами.
+    """
+    config_dir = prepare(tmp_path)
+    invoke(config_dir, "init-db")
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.finish_run(repo.start_run(), "ok", finished_at=datetime.now(UTC) + timedelta(days=400))
+
+    result = invoke(config_dir, "healthcheck")
+
+    assert result.exit_code == 1
+    assert "последний успешный прогон: никогда" in result.output
+
+
 # --- конфиг читается лениво ------------------------------------------------
 
 
@@ -292,6 +340,14 @@ def test_run_exits_one_on_forbidden(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert "закрыл доступ" in result.output
     assert "Traceback" not in result.output
+    # M2: текст исключения уже кончается словами «Прогон остановлен,
+    # обходные пути не применяются», и CLI приклеивал их второй раз —
+    # «…не применяются.. Обходные пути не применяются». Считается ровно
+    # строка ответа команды, а не весь вывод: в логе то же правило
+    # называется другими словами и по делу.
+    answer = next(line for line in result.output.splitlines() if "закрыл доступ" in line)
+    assert answer.lower().count("обходные пути не применяются") == 1
+    assert ".." not in answer
 
 
 # --- mark: id и статус вводит человек -------------------------------------
@@ -321,6 +377,32 @@ def test_mark_fails_on_an_unknown_id(tmp_path: Path) -> None:
     assert "нет в базе" in result.output
 
 
+@respx.mock
+def test_mark_reported_keeps_the_vacancy_in_the_report(tmp_path: Path) -> None:
+    """I2: `mark <id> reported` прятал вакансию из ОБОИХ путей отчёта.
+
+    `unreported()` её больше не видит (там `status='new'`), а
+    `reported_since()` не видел никогда: `reported_at` оставался `NULL`, а
+    условие выборки — `reported_at >= ?`. Команда при этом отвечала
+    «111 → reported» и кодом 0. Это тот же остаток, который коммит
+    c7d4b4d закрыл для `mark X new`.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.set_status("111", "new")
+    for report in (tmp_path / "reports").iterdir():
+        report.unlink()
+
+    assert invoke(config_dir, "mark", "111", "reported").exit_code == 0
+
+    result = invoke(config_dir, "report", "--since", "7d")
+    assert result.exit_code == 0
+    assert "отдано приёмникам вакансий: 1" in result.output
+    assert "111" in (tmp_path / "reports" / f"{TODAY}-new.csv").read_text(encoding="utf-8-sig")
+
+
 def test_mark_rejects_an_unknown_status(tmp_path: Path) -> None:
     """`set_status` статус не валидирует, а вводит его человек: опечатка
     (`aplied`) увела бы вакансию в состояние, невидимое всем трём выборкам."""
@@ -344,7 +426,8 @@ def test_report_regenerates_the_files_from_the_database(tmp_path: Path) -> None:
 
     result = invoke(config_dir, "report", "--since", "7d")
     assert result.exit_code == 0
-    assert "перегенерировано вакансий: 1" in result.output
+    assert "отдано приёмникам вакансий: 1" in result.output
+    assert "записано новых строк — csv: 1, markdown: 1" in result.output
     assert "111" in (tmp_path / "reports" / f"{TODAY}-new.csv").read_text(encoding="utf-8-sig")
 
 
@@ -381,9 +464,33 @@ def test_report_survives_a_corrupted_row(tmp_path: Path) -> None:
 
     result = invoke(config_dir, "report", "--since", "7")
     assert result.exit_code == 0
-    assert "перегенерировано вакансий: 1" in result.output
+    assert "отдано приёмникам вакансий: 1" in result.output
     body = (tmp_path / "reports" / f"{TODAY}-new.csv").read_text(encoding="utf-8-sig")
     assert "333" in body
+
+
+@respx.mock
+def test_report_says_zero_when_the_day_file_already_has_everything(tmp_path: Path) -> None:
+    """M3: «перегенерировано вакансий: 143», не записав ни байта.
+
+    Приёмники дедуплицируют по содержимому файла дня, поэтому повторный
+    `report` за тот же день — законный ноль записей. Сообщение об этом
+    молчало и называло число ОТДАННЫХ вакансий, отправляя человека искать
+    изменения, которых нет: замер — размеры обоих файлов до и после
+    совпадают до байта.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    reports = sorted((tmp_path / "reports").iterdir())
+    before = [report.read_bytes() for report in reports]
+
+    result = invoke(config_dir, "report", "--since", "7d")
+
+    assert result.exit_code == 0
+    assert "отдано приёмникам вакансий: 1" in result.output
+    assert "записано новых строк — csv: 0, markdown: 0" in result.output
+    assert [report.read_bytes() for report in reports] == before
 
 
 def test_report_rejects_an_unparsable_period(tmp_path: Path) -> None:
@@ -843,3 +950,111 @@ def backdate_last_run(db: Path, hours: int) -> None:
     )
     raw.commit()
     raw.close()
+
+
+# --- I3: отказ тома обязан называть причину, а не показывать traceback -----
+#
+# Самая вероятная ошибка первого дня на VPS: uid контейнера не совпадает с
+# владельцем тома, либо том смонтирован `:ro`. Замер на FIX_BASE: `init-db`
+# от чужого uid — 22 строки rich-трейсбека, `run` на созданной базе — 52,
+# том `:ro` — 52. Контраст с недоступным каталогом ОТЧЁТОВ, обработанным
+# образцово (статус `failed`, понятная причина, вакансии сохранены), и
+# делал эту ветку заметной.
+
+
+def deny_writes(path: Path) -> None:
+    path.chmod(stat.S_IRUSR | stat.S_IXUSR)
+
+
+def allow_writes(path: Path) -> None:
+    path.chmod(0o755)
+
+
+def test_init_db_without_write_access_explains_the_uid(tmp_path: Path) -> None:
+    """`init-db` в каталог, куда процессу не пишут: одна строка, не traceback."""
+    config_dir = prepare(tmp_path)
+    deny_writes(tmp_path)
+    try:
+        result = invoke(config_dir, "init-db")
+    finally:
+        allow_writes(tmp_path)
+
+    assert result.exit_code == 1
+    assert "нет доступа к каталогу данных" in result.output
+    assert "uid" in result.output
+    assert "Traceback" not in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+@respx.mock
+def test_run_on_a_read_only_volume_explains_the_uid(tmp_path: Path) -> None:
+    """База создана, том стал только на чтение: падал замок прогона."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "init-db")
+    state = tmp_path / "state"
+    deny_writes(state)
+    try:
+        result = invoke(config_dir, "run")
+    finally:
+        allow_writes(state)
+
+    assert result.exit_code == 1
+    assert "нет доступа к каталогу данных" in result.output
+    assert ".env" in result.output or "chmod" in result.output
+    assert "Traceback" not in result.output
+
+
+@respx.mock
+def test_mark_on_a_read_only_volume_explains_the_uid(tmp_path: Path) -> None:
+    """Та же беда из любой команды: разные ответы на один отказ — не мелочь.
+
+    Вакансия обязана существовать: `UPDATE`, не задевший ни одной строки,
+    sqlite выполняет, не тронув файл, и такой `mark` отвечает «нет в базе»
+    даже на томе `:ro` — то есть проверял бы не тот отказ.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    state = tmp_path / "state"
+    deny_writes(state)
+    try:
+        result = invoke(config_dir, "mark", "111", "applied")
+    finally:
+        allow_writes(state)
+
+    assert result.exit_code == 1
+    assert "нет доступа к каталогу данных" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="от root чужого владельца не бывает")
+def test_a_foreign_owner_is_named_and_hh_uid_is_suggested(tmp_path: Path) -> None:
+    """Чужой владелец каталога — тот самый случай из `.env.example`.
+
+    Совет обязан отличаться от совета при СВОЁМ uid: правка `HH_UID` при
+    совпадающем владельце не лечит ничего, а человек уже поверил, что дело
+    в ней.
+    """
+    config_dir = prepare(tmp_path, **{"app.yaml": read_only_root_config(tmp_path)})
+    result = invoke(config_dir, "init-db")
+
+    assert result.exit_code == 1
+    assert "HH_UID" in result.output
+    assert "принадлежит uid=0" in result.output
+    assert "Traceback" not in result.output
+
+
+def read_only_root_config(tmp_path: Path) -> str:
+    """Конфиг, чей каталог состояния лежит под каталогом чужого владельца.
+
+    `/usr` принадлежит root и обычному пользователю не пишется, поэтому
+    чужой владелец здесь настоящий, а не сымитированный chmod'ом: ветка
+    сообщения про `HH_UID` проверяется ровно тем, ради чего написана.
+    """
+    return (
+        APP_YAML.replace("delay_between_requests_sec: 1.0", "delay_between_requests_sec: 0.1")
+        .replace("/data/state", "/usr/hh-search-state")
+        .replace("/data/reports", str(tmp_path / "reports"))
+        .replace("/data/logs", str(tmp_path / "logs"))
+    )

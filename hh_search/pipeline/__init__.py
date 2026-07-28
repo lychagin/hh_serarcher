@@ -68,7 +68,10 @@ def run_once(
         report(repo, scorer, sinks, stats, moment)
     except AccessForbidden as error:
         stats.degrade(FAILED, f"hh.ru закрыл доступ: {error}")
-        logger.error("прогон остановлен: %s. Обходные пути не применяются", error)
+        # Без «прогон остановлен» и без «обходные пути» — то и другое
+        # уже сказано самим текстом исключения, и склейка давала
+        # «…не применяются.. Обходные пути не применяются».
+        logger.error("доступ к hh.ru закрыт: %s", error)
         _finish(repo, run_id, stats)
         raise
     except Exception as error:

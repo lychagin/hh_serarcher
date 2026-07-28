@@ -189,7 +189,13 @@ def test_retry_after_accepts_http_date() -> None:
         response = client.get(URL)
     assert response.status_code == 200
     assert route.call_count == 2
-    assert any(abs(delay - 5.0) < 1.0 for delay in slept)
+    # Полуинтервал, а не «около пяти»: `format_datetime` округляет дату
+    # ВНИЗ до целой секунды, поэтому ожидание — это (4.0, 5.0], причём
+    # ровно 4.0 достижимо и наблюдалось (прогон 2026-07-28 упал на
+    # `abs(4.0 - 5.0) < 1.0`). Различающая сила от этого не страдает:
+    # запасной путь (Retry-After не разобран) дал бы 1.0 — паузу между
+    # запросами, умноженную на 2**0.
+    assert any(4.0 <= delay <= 5.0 for delay in slept)
 
 
 @respx.mock

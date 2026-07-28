@@ -31,8 +31,9 @@ import logging
 from hh_search.config.models import Config
 from hh_search.domain.models import DiscoveredVacancy, VacancyDetails
 from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
+from hh_search.pipeline.failures import FailureDigest
 from hh_search.pipeline.forbidden import ForbiddenStreak
-from hh_search.pipeline.stats import PARTIAL, RunStats
+from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
 from hh_search.sources.http import PoliteClient
 from hh_search.sources.vacancy_page import SalaryBlockStats, parse_vacancy_page, vacancy_url
@@ -52,8 +53,18 @@ def enrich(
     """Скачать страницы очереди обогащения, оценить и сохранить."""
     pending = repo.pending_enrichment(config.app.enrich.max_attempts)
     salary_stats = SalaryBlockStats()
+    # Отказы копятся, а не печатаются по одному: при аварии источника они
+    # отличаются только URL (см. pipeline/failures.py).
+    skipped = FailureDigest()
+    retried = FailureDigest()
+    exhausted = FailureDigest()
     unavailable = 0
-    unreadable = 0
+    # Страницы, ОТДАННЫЕ источником (200), и страницы, которые удалось
+    # разобрать. Пара нужна сторожу ниже: только она отличает дрейф
+    # вёрстки от недоступности источника, а «не разобрана ни одна» —
+    # от «разобрано меньше половины».
+    answered = 0
+    parsed = 0
     for vacancy in pending:
         # URL собирается заново, а не берётся из базы: канонический
         # `https://hh.ru/vacancy/{id}` без query-строки — единственная
@@ -73,31 +84,46 @@ def enrich(
             # Источник, а не вакансия: попытку НЕ жжём.
             unavailable += 1
             stats.degrade(PARTIAL, f"страница {url} не получена: {error}")
-            logger.warning("страница %s недоступна, попытка не израсходована: %s", url, error)
+            skipped.add(str(error), url)
             continue
         forbidden.survived()
         if response.status_code != 200:
-            _burn_attempt(config, repo, stats, vacancy.id, f"код {response.status_code}")
-            unreadable += 1
+            _burn_attempt(
+                config, repo, stats, vacancy.id, f"код {response.status_code}", retried, exhausted
+            )
             continue
+        answered += 1
         try:
             details = parse_vacancy_page(response.text, salary_stats)
         except FetchFailed as error:
-            _burn_attempt(config, repo, stats, vacancy.id, str(error))
-            unreadable += 1
+            _burn_attempt(config, repo, stats, vacancy.id, str(error), retried, exhausted)
             continue
+        parsed += 1
         if _save(repo, scorer, vacancy, details, stats):
             # Накапливаем по ходу, а не присваиваем в конце: падение на
             # шестнадцатой из двадцати обязано оставить в журнале
             # пятнадцать, а не ноль.
             stats.enriched += 1
     salary_stats.log_summary()
-    _canary(len(pending), unavailable, unreadable)
+    skipped.log_summary("страниц вакансий не получено, попытки не израсходованы")
+    retried.log_summary(
+        f"вакансий не обогащено, попытка израсходована (лимит {config.app.enrich.max_attempts})"
+    )
+    # Терминальные потери — со ВСЕМИ id: эти вакансии больше не увидит ни
+    # одна выборка, и чинить их придётся поимённо.
+    exhausted.log_summary("вакансий закрыты как enrich_failed, лимит попыток исчерпан", limit=None)
+    _canary(stats, len(pending), answered, parsed, unavailable, retried.count + exhausted.count)
     _check_not_stalled(config, repo, stats)
 
 
 def _burn_attempt(
-    config: Config, repo: SqliteRepository, stats: RunStats, vacancy_id: str, reason: str
+    config: Config,
+    repo: SqliteRepository,
+    stats: RunStats,
+    vacancy_id: str,
+    reason: str,
+    retried: FailureDigest,
+    exhausted: FailureDigest,
 ) -> None:
     """Отказ про саму вакансию: инкремент попытки и, при исчерпании, отказ.
 
@@ -105,25 +131,16 @@ def _burn_attempt(
     отдельного `mark_rejected` здесь нет сознательно: пара вызовов
     оставляла между собой состояние, невидимое всем трём выборкам
     (спека §5.2).
+
+    Печатается отказ не здесь, а сводкой в конце шага: при дрейфе вёрстки
+    причина у всех вакансий одна, и восемнадцать одинаковых строк её не
+    уточняют. Терминальные и непотраченные разведены по разным копилкам,
+    потому что означают разное: первое — потеря вакансии навсегда.
     """
     attempts = repo.bump_enrich_attempt(vacancy_id, config.app.enrich.max_attempts)
     stats.degrade(PARTIAL, f"вакансия {vacancy_id} не обогащена: {reason}")
-    if attempts >= config.app.enrich.max_attempts:
-        logger.warning(
-            "вакансия %s: попытка %d из %d, лимит исчерпан, отказ enrich_failed: %s",
-            vacancy_id,
-            attempts,
-            config.app.enrich.max_attempts,
-            reason,
-        )
-    else:
-        logger.warning(
-            "вакансия %s: попытка %d из %d не удалась: %s",
-            vacancy_id,
-            attempts,
-            config.app.enrich.max_attempts,
-            reason,
-        )
+    digest = exhausted if attempts >= config.app.enrich.max_attempts else retried
+    digest.add(reason, vacancy_id)
 
 
 def _save(
@@ -191,16 +208,55 @@ def _check_not_stalled(config: Config, repo: SqliteRepository, stats: RunStats) 
     )
 
 
-def _canary(pending: int, unavailable: int, unreadable: int) -> None:
+def _canary(
+    stats: RunStats, pending: int, answered: int, parsed: int, unavailable: int, unreadable: int
+) -> None:
     """Тревога на смену вёрстки и на аварию источника — спека §9.
 
     Порог «больше половины» ловит проблему в тот же день, а не через месяц
     по пустым отчётам. Две причины разведены, потому что лечатся они
     по-разному: вёрстку правит разработчик, аварию — время.
+
+    Крайний случай «источник страницы ОТДАЛ, разобрать не удалось ни одну»
+    вынесен из порога отдельной ветвью и понижает статус до `failed` —
+    симметрично `discovery._check_not_silent`, где та же тишина уровнем
+    выше решена именно так. Причина та же: `partial` считается успехом для
+    `last_successful_run()`, то есть для healthcheck, а прогон, не
+    разобравший ни одной страницы, работы не сделал вовсе. Замер на
+    FIX_BASE (живой листинг, страница вакансии без JSON-LD): три прогона
+    `partial`, четвёртый — `ok` с нулём обогащённых, `healthcheck` зелен,
+    отчётов нет, весь бэклог терминально в `enrich_failed`. Обе ветви
+    плохи, и лечит их одна: пока вакансии в очереди есть, дрейф вёрстки
+    красит индикатор в красный.
+
+    `answered`, а не `pending`, в условии — это не деталь. Считать надо
+    страницы, которые источник ОТДАЛ (код 200): недоступность источника и
+    ответ 404 на снятой вакансии — не дрейф формата, и делать из них
+    `failed` значило бы красить индикатор при живом сервисе. Ровно так же
+    в `discovery` считаются отданные страницы листингов, а не запрошенные.
+
+    Цена названа честно: если в очереди была ровно одна вакансия и её
+    страница не разобралась, прогон тоже станет `failed`, хотя беда
+    частная. Красным индикатор при этом побудет не дольше
+    `enrich.max_attempts` прогонов — дальше строка терминальна и в
+    очередь не попадает. Обратный размен (требовать «хотя бы N страниц»)
+    означал бы, что дрейф вёрстки на маленькой очереди проходит молча, а
+    молчание здесь и есть чинимая беда. Тот же выбор сделан уровнем выше:
+    одна страница листинга с пустым `ItemList` тоже даёт `failed`.
     """
     if not pending:
         return
-    if unreadable * 2 > pending:
+    if answered and not parsed:
+        stats.degrade(FAILED, f"источник отдал {answered} страниц вакансий, не разобрана ни одна")
+        logger.error(
+            "источник отдал %d страниц вакансий, и не разобрана НИ ОДНА — вероятно, hh.ru "
+            "сменил вёрстку страницы вакансии или разметку JSON-LD. Прогон помечен %s: "
+            "иначе сервис молча перестал бы обогащать вакансии, оставаясь зелёным для "
+            "healthcheck, пока очередь уходит в enrich_failed безвозвратно",
+            answered,
+            FAILED,
+        )
+    elif unreadable * 2 > pending:
         logger.error(
             "не разобрано %d страниц вакансий из %d — вероятно, hh.ru сменил вёрстку "
             "страницы вакансии или разметку JSON-LD",

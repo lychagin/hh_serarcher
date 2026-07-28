@@ -8,7 +8,7 @@ import pytest
 
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
-from hh_search.errors import AccessForbidden
+from hh_search.errors import AccessForbidden, StorageUnavailable
 from hh_search.pipeline.stats import FAILED, RunStats
 from hh_search.scheduler import EXIT_FORBIDDEN, EXIT_OK, StopSignal, serve
 from tests.test_config import write_config
@@ -107,6 +107,27 @@ def test_failing_run_does_not_stop_the_daemon(
     assert serve(config, failing, stop=clock, monotonic=clock.monotonic, iterations=2) == 0
     assert attempts["n"] == 2
     assert "продолжаем по расписанию" in caplog.text
+
+
+def test_an_unavailable_volume_is_named_without_a_traceback(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    """I3: `serve` — главный вход, и именно он встречает чужой uid тома.
+
+    Причина такого отказа названа целиком в самом сообщении (свой uid,
+    владелец каталога, что править), а стек к ней не добавляет ничего:
+    чинится это правами на том, а не в коде. Демон при этом продолжает по
+    расписанию — том могут перемонтировать, не трогая контейнер.
+    """
+    clock = FakeClock()
+
+    def denied() -> None:
+        raise StorageUnavailable("нет доступа к каталогу данных /data/state: uid не тот")
+
+    assert serve(config, denied, stop=clock, monotonic=clock.monotonic, iterations=2) == 0
+    assert "нет доступа к каталогу данных" in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "продолжаем по расписанию" not in caplog.text
 
 
 # --- устойчивый 403: спека §9 требует остановки ----------------------------

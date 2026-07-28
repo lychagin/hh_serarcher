@@ -8,7 +8,7 @@ from collections.abc import Callable
 from types import FrameType
 
 from hh_search.config.models import Config
-from hh_search.errors import AccessForbidden
+from hh_search.errors import AccessForbidden, StorageUnavailable
 from hh_search.pipeline.stats import FAILED, RunStats
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,13 @@ def serve(
                 )
                 if forbidden >= MAX_FORBIDDEN_IN_A_ROW:
                     return _give_up(forbidden)
+            except StorageUnavailable as error:
+                # Без traceback: причина названа целиком в самом
+                # сообщении, а стек тут ничего не добавляет — чинится это
+                # правами на том, а не в коде. Демон продолжает по
+                # расписанию: том могут перемонтировать, не трогая
+                # контейнер.
+                logger.error("%s", error)
             except Exception:
                 logger.exception("прогон завершился с ошибкой, продолжаем по расписанию")
             else:

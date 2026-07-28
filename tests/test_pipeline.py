@@ -76,6 +76,12 @@ def page_html(description: str = "Опыт Yocto и Buildroot.") -> str:
 TWO_VACANCIES = listing_html(
     ("111", "Senior Embedded Engineer"), ("222", "Junior Python Developer")
 )
+# Тот же листинг, но БЕЗ стоп-слова во втором заголовке: там, где предмет
+# теста — очередь обогащения, «junior» отсеял бы половину выборки ещё
+# префильтром, и проверка считала бы не то, что проверяет.
+TWO_ENRICHABLE = listing_html(
+    ("111", "Senior Embedded Engineer"), ("222", "Middle Python Developer")
+)
 
 
 class RecordingSink:
@@ -90,11 +96,14 @@ class RecordingSink:
         self.items: list[ScoredVacancy] = []
         self._fail = fail
 
-    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> None:
+    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
         if self._fail:
             raise RuntimeError(f"приёмник {self.name} недоступен")
         self.batches.append([item.discovered.id for item in vacancies])
         self.items.extend(vacancies)
+        # Приёмник записывает всё, что ему отдали: дедупликации файла дня
+        # у него нет, и притворяться ею он не должен.
+        return len(vacancies)
 
     @property
     def seen(self) -> list[str]:
@@ -581,6 +590,39 @@ def test_scoring_failure_keeps_the_page_and_is_loud(
 
 
 @respx.mock
+def test_stuck_scoring_queue_is_reported_once_and_without_a_false_cause(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """I1: один факт — одно сообщение, и причина в нём не выдумана.
+
+    Сторож жил в `unreported()`, а конвейер зовёт её дважды за прогон,
+    поэтому одна застрявшая вакансия давала ТРИ `ERROR` (два из
+    хранилища, один из конвейера), и два из трёх утверждали: «конвейер не
+    вызвал pending_scoring() перед unreported()». Утверждение ложно
+    именно там, где сторож и срабатывает: за этот же прогон конвейер
+    зовёт `pending_scoring()` трижды, а очередь не сходится потому, что
+    отказал скорер — о чём строкой выше кричит сам `rescore`.
+
+    Проверяется поэтому не только число сообщений, но и отсутствие
+    выдуманной причины: диагностика этого сервиса держится на том, что
+    сообщение называет причину верно.
+    """
+    mock_source()
+    with caplog.at_level(logging.ERROR):
+        stats = run(config, repo, [RecordingSink()], BrokenScorer(config))
+    assert stats.stuck == 1
+    about_stuck = [
+        record.getMessage()
+        for record in caplog.records
+        if "не попадут в отчёт" in record.getMessage()
+    ]
+    assert len(about_stuck) == 1
+    assert "111" in about_stuck[0]
+    assert "pending_scoring()" not in caplog.text
+    assert "конвейер не вызвал" not in caplog.text
+
+
+@respx.mock
 def test_score_is_recomputed_and_sent_within_one_run(config: Config, db_path: str) -> None:
     """Порча оценки лечится за ОДИН прогон, а не за два.
 
@@ -812,19 +854,144 @@ def test_salary_drift_guard_is_wired_into_enrichment(
 
 
 @respx.mock
-def test_more_than_half_failed_pages_raise_the_canary(
+def test_vacancy_page_drift_makes_the_run_failed(
     config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Канарейка на смену вёрстки (спека §9): страница без JSON-LD.
 
-    Причина отказа здесь — сама страница, поэтому в логе обязана быть
-    вёрстка, а не недоступность источника: лечит их разный человек.
+    Прежняя редакция этого теста фиксировала `partial`, и это было
+    закреплением дыры, а не поведения. `partial` считается успехом для
+    `last_successful_run()`, то есть для healthcheck: сервис, который
+    перестал понимать страницу вакансии, оставался зелёным. Замер на
+    FIX_BASE (живой листинг из 20 вакансий, страница без JSON-LD): три
+    прогона `partial`, четвёртый `ok` — вся очередь ушла в терминальный
+    `enrich_failed`, отчётов не было ни одного, `healthcheck` отвечал
+    кодом 0 «ok, последний успешный прогон».
+
+    Ослаблением это не является: та же тишина уровнем ВЫШЕ уже решена
+    именно так (`discovery._check_not_silent` — «источник отдал страницы,
+    вакансий не найдено ни одной» → `failed`). Здесь тот же класс отказа
+    и тот же ответ; расходились они только потому, что до страницы
+    вакансии сторож не доехал.
+
+    Причина отказа — сама страница, поэтому в логе обязана быть вёрстка,
+    а не недоступность источника: лечит их разный человек.
     """
     mock_source(page="<html>без всякого JSON-LD</html>")
     with caplog.at_level(logging.ERROR):
         stats = run(config, repo, [RecordingSink()])
-    assert stats.status == "partial"
+    assert (stats.status, stats.exit_code()) == ("failed", 1)
+    assert "не разобрана НИ ОДНА" in caplog.text
     assert "сменил вёрстку" in caplog.text
+    # Вторая половина того же факта: журнал прогонов не считает такой
+    # прогон успешным, то есть healthcheck его не увидит.
+    assert repo.last_successful_run() is None
+
+
+@respx.mock
+def test_four_runs_of_page_drift_never_look_successful(
+    config: Config, db_path: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Сценарий целиком, тот самый, что был воспроизведён на FIX_BASE.
+
+    Ключевое здесь — не статус одного прогона, а то, что ни один из
+    прогонов, в которых очередь была и не обогатилась, не считается
+    успешным. Четвёртый прогон разбирать уже нечего (вся очередь
+    терминальна), и он снова `ok` — это честно: работы в нём нет, а
+    красный индикатор к этому моменту горит уже три прогона подряд.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    mock_source(
+        listing=load("listing_programmist.html.gz"), page="<html>без всякого JSON-LD</html>"
+    )
+    scorer = KeywordScorer(config.profile)
+    with caplog.at_level(logging.ERROR):
+        statuses = [run(config, disk, [RecordingSink()], scorer).status for _ in range(4)]
+    assert statuses == ["failed", "failed", "failed", "ok"]
+    assert [row[0] for row in journal(db_path)] == ["failed", "failed", "failed", "ok"]
+    disk.close()
+
+
+@respx.mock
+def test_unreachable_pages_are_not_layout_drift(config: Config, repo: SqliteRepository) -> None:
+    """Обратная сторона: источник, который страницу НЕ отдал, — не дрейф.
+
+    Сторож считает страницы, отданные с кодом 200, а не запрошенные.
+    Иначе авария источника (спека §9 — `WARNING` и `partial`, попытки не
+    жжём) красила бы индикатор в красный, а решение C4 «отказ источника
+    не жжёт очередь» превратилось бы в «отказ источника роняет прогон».
+    """
+    mock_source(page=httpx.Response(503))
+    stats = run(config, repo, [RecordingSink()])
+    assert (stats.status, stats.enriched) == ("partial", 0)
+
+
+@respx.mock
+def test_pages_answering_404_are_not_layout_drift(config: Config, repo: SqliteRepository) -> None:
+    """404 — состояние ВАКАНСИИ (снята), и очередь при нём честно тает.
+
+    Прогон делает работу: тратит попытку и в конце концов закрывает
+    вакансию. Это `partial`, а не `failed`, — иначе снятая вакансия
+    красила бы индикатор.
+    """
+    mock_source(page=httpx.Response(404))
+    stats = run(config, repo, [RecordingSink()])
+    assert (stats.status, stats.enriched) == ("partial", 0)
+
+
+@respx.mock
+def test_a_single_broken_page_does_not_fail_the_run(config: Config, repo: SqliteRepository) -> None:
+    """Разобралась хотя бы одна — значит формат жив, а беда частная."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        broken = request.url.path.endswith("/111")
+        return httpx.Response(200, text="<html>пусто</html>" if broken else page_html())
+
+    mock_robots()
+    respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(200, text=TWO_ENRICHABLE)
+    )
+    respx.get(url__regex=PAGE_PATTERN).mock(side_effect=answer)
+    stats = run(config, repo, [RecordingSink()])
+    assert (stats.status, stats.enriched) == ("partial", 1)
+
+
+# --- I4: однотипные отказы — одной строкой ---------------------------------
+
+
+@respx.mock
+def test_source_outage_does_not_flood_the_log(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Стена почти одинаковых WARNING — это потеря наблюдаемости.
+
+    Замер на FIX_BASE (накопленный бэклог из 18 вакансий, источник лежит):
+    20 строк `WARNING` и 3839 байт, отличающихся только URL, с полным
+    текстом про robots.txt в каждой. Причина у всех одна, и названа она
+    обязана быть один раз — иначе единственная строка, объясняющая, что
+    случилось, тонет среди своих копий.
+    """
+    # Первый прогон копит очередь: страницы недоступны, попытки целы.
+    mock_robots()
+    respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(200, text=TWO_ENRICHABLE)
+    )
+    respx.get(url__regex=PAGE_PATTERN).mock(
+        side_effect=httpx.ConnectError("Network is unreachable")
+    )
+    run(config, repo, [RecordingSink()])
+    assert len(repo.pending_enrichment(3)) == 2
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="hh_search.pipeline.failures"):
+        run(config, repo, [RecordingSink()])
+    lines = [record for record in caplog.records if record.name == "hh_search.pipeline.failures"]
+    # Одна строка на страницы вакансий (их две, причина одна) — не две.
+    assert len(lines) == 1
+    message = lines[0].getMessage()
+    assert "2, причина у всех одна" in message
+    assert message.count("Network is unreachable") == 1
 
 
 # --- отказ префильтра перестаёт быть вечным -------------------------------

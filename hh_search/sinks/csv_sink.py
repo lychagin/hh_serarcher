@@ -86,9 +86,9 @@ class CsvSink:
     def __init__(self, reports_dir: Path) -> None:
         self._reports_dir = reports_dir
 
-    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> None:
+    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
         if not vacancies:
-            return
+            return 0
         self._reports_dir.mkdir(parents=True, exist_ok=True)
         path = self._reports_dir / f"{now:%Y-%m-%d}-new.csv"
         existing = _read_day_file(path)
@@ -101,7 +101,7 @@ class CsvSink:
             written.add(item.discovered.id)
             fresh.append(item)
         if not fresh:
-            return
+            return 0
         # BOM пишет сам кодек и ровно один раз за файл: при открытии на
         # дозапись TextIOWrapper сбрасывает состояние кодировщика, если
         # позиция ненулевая, и второй прогон дня BOM уже не вставляет
@@ -120,6 +120,7 @@ class CsvSink:
                 writer.writeheader()
             for item in fresh:
                 writer.writerow(self._row(item))
+        return len(fresh)
 
     def _row(self, item: ScoredVacancy) -> dict[str, str]:
         discovered = item.discovered

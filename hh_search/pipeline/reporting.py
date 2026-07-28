@@ -48,13 +48,17 @@ def report(
         stats.degrade(FAILED, "приёмников нет, отправлять некуда")
         logger.error("приёмников нет: %d вакансий остаются в очереди отправки", len(ready))
         return
-    delivered, failed = emit_to_sinks(sinks, ready, moment)
+    written, failed = emit_to_sinks(sinks, ready, moment)
     if failed:
-        _complain(ready, delivered, failed, stats)
+        _complain(ready, list(written), failed, stats)
         return
     repo.mark_reported([item.discovered.id for item in ready])
     stats.reported = len(ready)
-    logger.info("отправлено вакансий: %d, приёмники: %s", len(ready), ", ".join(delivered))
+    logger.info(
+        "отправлено вакансий: %d, приёмники: %s",
+        len(ready),
+        ", ".join(f"{name} (записано {count})" for name, count in written.items()),
+    )
 
 
 def _collect(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> list[ScoredVacancy]:
@@ -73,7 +77,8 @@ def _collect(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> list[Sc
         stats.degrade(PARTIAL, f"оценка не досчитана у {len(stuck)} вакансий")
         logger.error(
             "%d вакансий с готовым описанием остались без оценки и не попадут в отчёт: %s. "
-            "Описание у них есть, перекачка не нужна — нужен локальный пересчёт",
+            "Описание у них есть, перекачка не нужна — нужен локальный пересчёт; почему "
+            "он не удался, сказано записями выше",
             len(stuck),
             ", ".join(vacancy.id for vacancy, _ in stuck),
         )
@@ -82,8 +87,13 @@ def _collect(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> list[Sc
 
 def emit_to_sinks(
     sinks: Sequence[Sink], ready: Sequence[ScoredVacancy], moment: datetime
-) -> tuple[list[str], list[str]]:
-    """Отдать вакансии всем приёмникам. Возвращает `(доставившие, отказавшие)`.
+) -> tuple[dict[str, int], list[str]]:
+    """Отдать вакансии всем приёмникам.
+
+    Возвращает `({доставивший: сколько записал}, [отказавшие])`. Не просто
+    список доставивших: приёмники дедуплицируют по файлу дня, и «отдали
+    143» с «записали 143» совпадает далеко не всегда — а тот, кто читает
+    вывод, решает по нему, искать ли ему отчёт на диске.
 
     Публична, потому что `report` в CLI обязан вести себя ровно так же:
     там та же самая недоступность каталога отчётов давала голый traceback,
@@ -91,11 +101,11 @@ def emit_to_sinks(
     код. Разное поведение двух команд на одном отказе — это не мелочь: по
     выводу `report` человек решает, чинить ему конфиг или том.
     """
-    delivered: list[str] = []
+    written: dict[str, int] = {}
     failed: list[str] = []
     for sink in sinks:
         try:
-            sink.emit(ready, moment)
+            count = sink.emit(ready, moment)
         except Exception as error:  # noqa: BLE001 — падение приёмника не теряет вакансии
             failed.append(sink.name)
             logger.error(
@@ -106,8 +116,8 @@ def emit_to_sinks(
                 exc_info=True,
             )
         else:
-            delivered.append(sink.name)
-    return delivered, failed
+            written[sink.name] = count
+    return written, failed
 
 
 def _complain(
