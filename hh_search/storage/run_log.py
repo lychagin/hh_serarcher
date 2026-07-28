@@ -22,6 +22,7 @@ ALLOWED_RUN_COUNTERS = {
     "reported",
     "rescored",
     "stuck",
+    "requeued",
     "error",
 }
 

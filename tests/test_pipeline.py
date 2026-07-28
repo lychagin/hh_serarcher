@@ -15,6 +15,7 @@ from hh_search.config.models import Config
 from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, ScoredVacancy, VacancyDetails
 from hh_search.errors import AccessForbidden
 from hh_search.pipeline import RunStats, run_once
+from hh_search.pipeline.discovery import prefilter
 from hh_search.pipeline.stats import RunCounters
 from hh_search.scoring.base import Scorer
 from hh_search.scoring.keyword import KeywordScorer
@@ -22,7 +23,7 @@ from hh_search.sinks.base import Sink
 from hh_search.sources.http import PoliteClient
 from hh_search.storage.repository import SqliteRepository
 from hh_search.storage.run_log import ALLOWED_RUN_COUNTERS
-from tests.test_config import write_config
+from tests.test_config import PROFILE_YAML, write_config
 
 FIXTURES = Path(__file__).parent / "fixtures"
 NOW = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
@@ -715,3 +716,189 @@ def test_more_than_half_failed_pages_raise_the_canary(
         stats = run(config, repo, [RecordingSink()])
     assert stats.status == "partial"
     assert "сменил вёрстку" in caplog.text
+
+
+# --- отказ префильтра перестаёт быть вечным -------------------------------
+#
+# Один список `negative` обслуживал два механизма с несопоставимой ценой
+# ошибки: в скоринге совпадение стоит штраф и вакансия остаётся в отчёте,
+# а в префильтре то же слово означало `status='rejected'` НАВСЕГДА. Слова
+# образцового профиля писались как штрафные признаки, и в отсеве убивали
+# целевые вакансии: «Backend-разработчик курьерской доставки» гибла от
+# слова «курьер».
+
+COURIER_TITLE = "Backend-разработчик курьерской доставки"
+COURIER_LISTING = listing_html(("111", COURIER_TITLE))
+
+
+def profile_with(negative: str) -> str:
+    """Профиль образца, у которого различается только список стоп-слов."""
+    return PROFILE_YAML.replace("negative: [junior]", f"negative: [{negative}]")
+
+
+def config_with(root: Path, negative: str) -> Config:
+    root.mkdir(parents=True, exist_ok=True)
+    return load_config(
+        write_config(root, **{"queries.yaml": ONE_PAGE, "profile.yaml": profile_with(negative)})
+    )
+
+
+def vacancy_table(db: str) -> list[tuple[object, ...]]:
+    """Снимок таблицы вакансий целиком — сырым SQL, мимо любых выборок."""
+    raw = sqlite3.connect(db)
+    rows = raw.execute("SELECT * FROM vacancy ORDER BY id").fetchall()
+    raw.close()
+    return [tuple(row) for row in rows]
+
+
+@respx.mock
+def test_stop_word_removed_from_config_takes_the_vacancy_back_without_extra_requests(
+    tmp_path: Path,
+) -> None:
+    """Сценарий целиком: опечатка в стоп-словах больше не стоит вакансии.
+
+    Прогон 1 отбраковывает «Backend-разработчик курьерской доставки» по
+    слову «курьер» — страница не скачивается вовсе, это и есть смысл
+    префильтра. Пользователь убирает слово; прогон 2 обязан вернуть
+    вакансию в очередь и довести до отчёта в ТОТ ЖЕ прогон.
+
+    Считаются фактические HTTP-запросы, а не результат: на саму
+    переоценку не тратится ни одного. Единственный новый запрос — та
+    самая страница вакансии, за которой префильтр не пустил; он и есть
+    работа, ради которой возврат делается.
+    """
+    db = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db)
+    repository.init_schema()
+    _, listing_route, page_route = mock_source(listing=COURIER_LISTING)
+
+    with_word = config_with(tmp_path / "before", "курьер")
+    first = run(with_word, repository, [RecordingSink()])
+    assert (first.rejected, first.requeued, first.reported) == (1, 0, 0)
+    assert page_route.call_count == 0, "отбракованная вакансия не имеет права стоить запроса"
+    assert repo_status(db, "111")[0] == "rejected"
+
+    without_word = config_with(tmp_path / "after", "junior")
+    sink = RecordingSink()
+    second = run(without_word, repository, [sink], KeywordScorer(without_word.profile))
+
+    assert second.requeued == 1
+    assert (second.rejected, second.enriched, second.reported) == (0, 1, 1)
+    assert sink.seen == ["111"]
+    assert repo_status(db, "111")[0] == "reported"
+    # переоценка бесплатна: два листинга за два прогона и РОВНО одна
+    # страница вакансии — та, которую префильтр раньше не пустил
+    assert (listing_route.call_count, page_route.call_count) == (2, 1)
+    repository.close()
+
+
+@respx.mock
+def test_prefilter_step_never_touches_the_network(tmp_path: Path) -> None:
+    """Шаг 3 целиком, вместе с переоценкой, — ноль HTTP-вызовов.
+
+    Проверка отдельная от сквозного сценария, потому что там запрос
+    страницы вакансии законен и прячет собой любой лишний. Здесь их
+    просто не может быть ни одного: заголовок лежит в базе с discovery.
+    """
+    db = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db)
+    repository.init_schema()
+    with_word = config_with(tmp_path / "before", "курьер")
+    repository.add_discovered(
+        DiscoveredVacancy(
+            id="111",
+            url="https://hh.ru/vacancy/111",
+            title=COURIER_TITLE,
+            found_by_query="programmist",
+        ),
+        "embedded",
+        9,
+    )
+    prefilter(with_word, repository, RunStats())
+    assert repo_status(db, "111")[0] == "rejected"
+
+    without_word = config_with(tmp_path / "after", "junior")
+    stats = RunStats()
+    prefilter(without_word, repository, stats)
+
+    assert stats.requeued == 1
+    assert [v.id for v in repository.pending_enrichment(3)] == ["111"]
+    assert respx.calls.call_count == 0, "переоценка отказа не имеет права ходить в сеть"
+    repository.close()
+
+
+@respx.mock
+def test_unchanged_config_returns_nothing_and_does_not_touch_the_database(
+    tmp_path: Path,
+) -> None:
+    """Дешевизна повторного прогона: ни возврата, ни единой записи.
+
+    Сверяется вся таблица вакансий целиком, а не только статусы: возврат,
+    гоняющий одни и те же строки прогон за прогоном, переписывал бы
+    `enrich_attempts` и `reject_reason` незаметно для статусной проверки.
+    """
+    db = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db)
+    repository.init_schema()
+    mock_source(listing=COURIER_LISTING)
+    config = config_with(tmp_path / "cfg", "курьер")
+    scorer = KeywordScorer(config.profile)
+    run(config, repository, [RecordingSink()], scorer)
+    before = vacancy_table(db)
+
+    second = run(config, repository, [RecordingSink()], scorer)
+
+    assert (second.requeued, second.rejected, second.reported) == (0, 0, 0)
+    assert vacancy_table(db) == before
+    repository.close()
+
+
+@respx.mock
+def test_enrich_failure_is_not_taken_back_by_the_prefilter(config: Config, db_path: str) -> None:
+    """`enrich_failed` переоценке заголовком не подлежит.
+
+    Смысл у него другой: страница не разбирается (404, нет `JobPosting`),
+    и заголовок про это не знает ничего. Возврат по коду, а не по тексту
+    причины, — единственное, что удерживает эти два отказа врозь: текст
+    префильтра меняется, и разъехавшийся префикс вернул бы в очередь
+    несуществующие страницы, которые перепрашивались бы вечно.
+    """
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    _, _, page_route = mock_source(page=httpx.Response(404))
+    scorer = KeywordScorer(config.profile)
+    for _ in range(config.app.enrich.max_attempts):
+        run(config, disk, [RecordingSink()], scorer)
+    assert repo_status(db_path, "111") == ("rejected", "enrich_failed", 3)
+    spent = page_route.call_count
+
+    stats = run(config, disk, [RecordingSink()], scorer)
+
+    assert stats.requeued == 0
+    assert repo_status(db_path, "111") == ("rejected", "enrich_failed", 3)
+    assert page_route.call_count == spent, "несуществующая страница не перепрашивается"
+    assert "111" not in {key for key, _ in disk.rejected_by_prefilter()}
+    disk.close()
+
+
+@respx.mock
+def test_requeued_count_reaches_the_run_journal(tmp_path: Path) -> None:
+    """Возврат бэклога — метрика прогона, а не тихое событие.
+
+    Без счётчика правка списка стоп-слов, достающая десятки вакансий,
+    выглядела бы в журнале ровно как прогон, не сделавший ничего.
+    """
+    db = str(tmp_path / "hh.db")
+    repository = SqliteRepository(db)
+    repository.init_schema()
+    mock_source(listing=COURIER_LISTING)
+    with_word = config_with(tmp_path / "before", "курьер")
+    run(with_word, repository, [RecordingSink()], KeywordScorer(with_word.profile))
+    without_word = config_with(tmp_path / "after", "junior")
+    run(without_word, repository, [RecordingSink()], KeywordScorer(without_word.profile))
+    repository.close()
+
+    raw = sqlite3.connect(db)
+    requeued = [row[0] for row in raw.execute("SELECT requeued FROM run ORDER BY id")]
+    raw.close()
+    assert requeued == [0, 1]

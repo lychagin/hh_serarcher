@@ -11,7 +11,7 @@ from hh_search.domain.models import (
     ScoredVacancy,
     VacancyDetails,
 )
-from hh_search.storage.mappers import to_discovered, to_scored, to_scoring_task
+from hh_search.storage.mappers import to_discovered, to_id_and_title, to_scored, to_scoring_task
 from hh_search.storage.migrations import apply_schema
 from hh_search.storage.quarantine import Quarantine, safe_rows
 from hh_search.storage.run_log import RunLog
@@ -23,9 +23,22 @@ STATUS_NEW = "new"
 STATUS_REJECTED = "rejected"
 STATUS_REPORTED = "reported"
 
-# Причина отказа при исчерпании попыток скачивания (спека §5.2).
-# Ставится внутри `bump_enrich_attempt`, тем же UPDATE, что и счётчик.
-REJECT_ENRICH_FAILED = "enrich_failed"
+# Машинные коды причины отказа — колонка `reject_code`, отдельная от
+# человекочитаемого `reject_reason`. Разведены они не ради красоты:
+# отказ префильтра обратим (решение о нём локальное, и правка конфига
+# обязана его отменять), а исчерпание попыток скачивания — нет. Выбирать
+# обратимые строки разбором текста причины нельзя: текст префильтра
+# перечисляет совпавшие стоп-слова и будет меняться, а разъехавшийся
+# префикс молча изменил бы множество возвращаемых вакансий — ровно тот
+# класс тихого отказа, против которого написан весь остальной модуль.
+REJECT_CODE_PREFILTER = "prefilter"
+REJECT_CODE_ENRICH_FAILED = "enrich_failed"
+
+# Текст причины при исчерпании попыток скачивания (спека §5.2). Ставится
+# внутри `bump_enrich_attempt`, тем же UPDATE, что и счётчик, и совпадает
+# с кодом: этому отказу нечего добавить к коду, тогда как причина
+# префильтра перечисляет слова и потому от кода отличается.
+REJECT_ENRICH_FAILED = REJECT_CODE_ENRICH_FAILED
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +76,16 @@ class SqliteRepository:
     создаёт четвёртого, невидимого состояния: лимит применяется внутри
     `bump_enrich_attempt` тем же оператором, что и инкремент, и строка
     сразу становится терминальной (`rejected` / `enrich_failed`).
+
+    Отказ ПРЕФИЛЬТРА при этом терминальным больше не является. Решение о
+    нём чисто локальное — заголовок уже лежит в базе, сеть не нужна, —
+    поэтому опечатка в списке стоп-слов не имеет права стоить вакансий
+    навсегда. `rejected_by_prefilter()` + `requeue_prefiltered()`
+    возвращают такие строки в `new` с обнулённым счётчиком попыток, то
+    есть прямо в `pending_enrichment`; три выборки от этого не
+    пересекаются (см. `requeue_prefiltered`). Отличается обратимый отказ
+    от необратимого машинным кодом `reject_code`, а не разбором текста
+    причины.
 
     Журнал прогонов и HTTP-кэш вынесены в `run_log.RunLog` (тот же
     `sqlite3.Connection`) ради размера файла; инвариант «весь SQL — в
@@ -154,10 +177,16 @@ class SqliteRepository:
         self._connection.commit()
         return is_new
 
-    def mark_rejected(self, vacancy_id: str, reason: str) -> None:
+    def mark_rejected(self, vacancy_id: str, reason: str, code: str) -> None:
+        """Отказ: человекочитаемая причина и машинный код — одним UPDATE.
+
+        `code` обязателен и без умолчания: отказ без кода необратим по
+        построению (вернуть его нечему), и молча выбирать такой исход за
+        вызывающего этот метод права не имеет.
+        """
         self._connection.execute(
-            "UPDATE vacancy SET status = ?, reject_reason = ? WHERE id = ?",
-            (STATUS_REJECTED, reason, vacancy_id),
+            "UPDATE vacancy SET status = ?, reject_reason = ?, reject_code = ? WHERE id = ?",
+            (STATUS_REJECTED, reason, code, vacancy_id),
         )
         self._connection.commit()
 
@@ -298,13 +327,16 @@ class SqliteRepository:
             "status = CASE WHEN enrich_attempts + 1 >= :limit AND status = :new "
             "THEN :rejected ELSE status END, "
             "reject_reason = CASE WHEN enrich_attempts + 1 >= :limit AND status = :new "
-            "THEN :reason ELSE reject_reason END "
+            "THEN :reason ELSE reject_reason END, "
+            "reject_code = CASE WHEN enrich_attempts + 1 >= :limit AND status = :new "
+            "THEN :code ELSE reject_code END "
             "WHERE id = :id",
             {
                 "limit": max_attempts,
                 "new": STATUS_NEW,
                 "rejected": STATUS_REJECTED,
                 "reason": REJECT_ENRICH_FAILED,
+                "code": REJECT_CODE_ENRICH_FAILED,
                 "id": vacancy_id,
             },
         )
@@ -313,6 +345,74 @@ class SqliteRepository:
             "SELECT enrich_attempts FROM vacancy WHERE id = ?", (vacancy_id,)
         ).fetchone()
         return int(row["enrich_attempts"]) if row else 0
+
+    # --- возврат из отказа префильтра, сеть не задействуется -------------
+
+    def rejected_by_prefilter(self) -> list[tuple[str, str]]:
+        """`(id, заголовок)` строк, отбракованных ПРЕФИЛЬТРОМ.
+
+        Отбор идёт по машинному коду `reject_code`, а не по тексту
+        `reject_reason`: текст причины принадлежит человеку и будет
+        меняться, и молчаливо разъехавшийся префикс изменил бы множество
+        возвращаемых вакансий без единого признака. `enrich_failed`
+        сюда не попадает по построению — у него другой код, и другого
+        смысла отказ: страница не разбирается, и заголовок об этом
+        ничего не знает.
+
+        Читается ровно то, чем располагает решение префильтра, — id и
+        заголовок. Компания, зарплата и описание не выбираются вовсе: их
+        порча не имеет права трогать вакансию, судьба которой решается
+        одним заголовком.
+        """
+        rows = self._connection.execute(
+            "SELECT CAST(id AS BLOB) AS id, CAST(title AS BLOB) AS title FROM vacancy "
+            "WHERE status = ? AND reject_code = ?",
+            (STATUS_REJECTED, REJECT_CODE_PREFILTER),
+        ).fetchall()
+        return safe_rows(rows, to_id_and_title, self._quarantine)
+
+    def requeue_prefiltered(self, ids: Sequence[str]) -> int:
+        """Вернуть отбракованные префильтром вакансии в очередь. Одна транзакция.
+
+        `executemany` + один `commit()` — это ОДНА транзакция sqlite3:
+        смерть процесса посреди возврата не оставляет половины строк
+        возвращёнными. Рваного состояния нет и внутри строки: статус,
+        причина, код и счётчик попыток меняются одним оператором.
+
+        `enrich_attempts = 0` здесь обязателен, а не косметичен. Вакансия
+        могла израсходовать попытки скачивания ДО того, как правка
+        конфига её отбраковала, и возврат в `new` с исчерпанным счётчиком
+        воспроизвёл бы Critical спеки §5.2: `status = 'new'`,
+        `description IS NULL`, `enrich_attempts >= max` — состояние,
+        невидимое ВСЕМ трём выборкам. Плата названа честно: возврат даёт
+        странице заново полный бюджет попыток, то есть при живом 404
+        стоит до `max_attempts` запросов. Платится она только за
+        осознанную правку конфига и ровно один раз: строка возвращается,
+        пока совпадает условие, а после возврата условия больше нет.
+
+        WHERE-охрана повторяет предикат выборки, поэтому метод
+        идемпотентен и не воскрешает ничего чужого: ни `enrich_failed`,
+        ни `corrupt`, ни `reported`, ни отказ, поставленный человеком
+        через CLI (у него `reject_code IS NULL`).
+        """
+        if not ids:
+            return 0
+        cursor = self._connection.executemany(
+            "UPDATE vacancy SET status = :new, reject_reason = NULL, reject_code = NULL, "
+            "enrich_attempts = 0 "
+            "WHERE id = :id AND status = :rejected AND reject_code = :code",
+            [
+                {
+                    "new": STATUS_NEW,
+                    "rejected": STATUS_REJECTED,
+                    "code": REJECT_CODE_PREFILTER,
+                    "id": vacancy_id,
+                }
+                for vacancy_id in ids
+            ],
+        )
+        self._connection.commit()
+        return int(cursor.rowcount)
 
     # --- 2: пересчёт оценки, сеть не задействуется -----------------------
 

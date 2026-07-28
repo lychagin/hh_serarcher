@@ -1403,7 +1403,9 @@ git commit -m "feat: извлечение JSON-LD со страницы вака
   - `close() -> None`, поддержка контекстного менеджера
   - `known_ids(ids: Iterable[str]) -> set[str]`
   - `add_discovered(vacancy: DiscoveredVacancy, cluster: str, weight: int) -> bool` — возвращает `True`, если вакансия новая; при повторном обнаружении другим запросом только дописывает связь в `vacancy_query` и, если новый запрос весомее, переписывает кластер
-  - `mark_rejected(vacancy_id: str, reason: str) -> None`
+  - `mark_rejected(vacancy_id: str, reason: str, code: str) -> None` — `code` (`prefilter` /
+  `enrich_failed`) обязателен и без умолчания: отказ без машинного кода необратим, и молча
+  выбирать такой исход за вызывающего метод права не имеет (см. Task 10, шаг 3)
   - `pending_enrichment(max_attempts: int) -> list[DiscoveredVacancy]`
   - `save_details(vacancy_id: str, details: VacancyDetails) -> None`
   - `bump_enrich_attempt(vacancy_id: str) -> int` — возвращает новое значение счётчика
@@ -1482,7 +1484,7 @@ def test_heavier_query_wins_the_cluster(repo: SqliteRepository) -> None:
 
 def test_rejected_vacancy_is_not_offered_for_enrichment(repo: SqliteRepository) -> None:
     repo.add_discovered(make_vacancy(), "embedded", 9)
-    repo.mark_rejected("1", "stop-word in title")
+    repo.mark_rejected("1", "stop-word in title", REJECT_CODE_PREFILTER)
     assert repo.pending_enrichment(max_attempts=3) == []
 
 
@@ -1698,10 +1700,13 @@ class SqliteRepository:
         self._connection.commit()
         return is_new
 
-    def mark_rejected(self, vacancy_id: str, reason: str) -> None:
+    def mark_rejected(self, vacancy_id: str, reason: str, code: str) -> None:
+        # `code` добавлен Task 10: машинный код причины (`prefilter` /
+        # `enrich_failed`) отделяет обратимый отказ от необратимого, и
+        # разбирать ради этого человекочитаемый `reason` нельзя.
         self._connection.execute(
-            "UPDATE vacancy SET status = ?, reject_reason = ? WHERE id = ?",
-            (STATUS_REJECTED, reason, vacancy_id),
+            "UPDATE vacancy SET status = ?, reject_reason = ?, reject_code = ? WHERE id = ?",
+            (STATUS_REJECTED, reason, code, vacancy_id),
         )
         self._connection.commit()
 
@@ -3388,7 +3393,8 @@ csv или авария между emit и mark_reported задваивали о
 **Interfaces:**
 - Consumes: всё из задач 1–9
 - Produces: `class RunStats` (pydantic: `discovered`, `new_count`, `rejected`, `enriched`,
-  `rescored`, `stuck`, `reported`, `status`, `error`; методы `degrade`, `counters`, `exit_code`);
+  `rescored`, `stuck`, `requeued`, `reported`, `status`, `error`; методы `degrade`, `counters`,
+  `exit_code`);
   `RunCounters` (TypedDict полей таблицы `run`); константы `OK`/`PARTIAL`/`FAILED`, `EXIT_CODES`;
   `run_once(config, client, repo, scorer, sinks, now=None) -> RunStats`
 
@@ -3424,7 +3430,9 @@ end-to-end: она вызывала три несуществующих мето
 
 Появившиеся методы, которых прежняя редакция не знала и которые конвейер обязан использовать:
 `save_description(id, details)` (страница без оценки), `pending_scoring()`, `reset_cache(url)`,
-счётчики прогона `rescored`/`stuck`.
+`rejected_by_prefilter()` + `requeue_prefiltered(ids)` (возврат из отказа префильтра, шаг 3),
+`mark_rejected(id, reason, code)` (машинный код причины обязателен), счётчики прогона
+`rescored`/`stuck`/`requeued`.
 
 **3. Четыре пути потери данных, закрытые здесь.**
 
@@ -3462,8 +3470,36 @@ end-to-end: она вызывала три несуществующих мето
    страницы: `WARNING`, `partial`, остальные продолжаются.
 3. Шаг 2 (дедупликация) — внутри `add_discovered`: новыми считаются те, для которых он вернул
    `True`.
-4. Шаг 3: `Prefilter.reason_to_reject` по всей очереди `pending_enrichment`, а не только по
-   найденному сейчас — отсев локальный, и правка `negative` обязана достать бэклог.
+4. Шаг 3 работает в ОБЕ стороны, и обе — по всей базе, а не только по найденному сейчас.
+   Сначала `repo.rejected_by_prefilter()` → `Prefilter.reason_for_title` → тех, кого текущий
+   конфиг больше не подтверждает, возвращает `repo.requeue_prefiltered(ids)`; потом
+   `Prefilter.reason_to_reject` по всей очереди `pending_enrichment` с
+   `mark_rejected(id, reason, REJECT_CODE_PREFILTER)`. Отсев локальный, и правка `negative`
+   обязана достать бэклог — в том числе достать ОБРАТНО уже отбракованное.
+
+   **Отказ префильтра перестал быть терминальным.** Прежняя редакция этого шага умела только
+   отказывать, и `status='rejected'` был навсегда: `add_discovered` даёт `False`, а все три
+   выборки требуют `status='new'`. Между тем один список `negative` обслуживает два механизма
+   с несопоставимой ценой ошибки — в скоринге совпадение стоит −15 очков и вакансия остаётся
+   в отчёте, здесь оно означало смерть. Слова образцового профиля писались как штрафные
+   признаки и в отсеве убивали целевые вакансии («Backend-разработчик курьерской доставки» —
+   от слова `курьер`, «Разработчик CRM для отдела продаж» — от `продаж`). Решение владельца —
+   снять саму необратимость, а не разводить списки: решение отсева чисто локальное, заголовок
+   лежит в базе с шага discovery, и переоценка не стоит ни одного запроса.
+
+   Обратимый отказ отличается от необратимого машинным кодом `vacancy.reject_code`
+   (`prefilter` / `enrich_failed`), а НЕ разбором человекочитаемого `reject_reason` по
+   префиксу: текст причины перечисляет совпавшие стоп-слова и будет меняться, а
+   разъехавшийся префикс молча изменил бы множество возвращаемых вакансий. `enrich_failed`
+   переоценке заголовком не подлежит — «страница не разбирается» заголовок не отменяет.
+
+   Возврат обнуляет `enrich_attempts`. Это не косметика: вакансия могла израсходовать попытки
+   ДО того, как правка конфига её отбраковала, и возврат в `new` с исчерпанным счётчиком
+   воспроизвёл бы Critical §5.2 — `status='new'`, `description IS NULL`,
+   `enrich_attempts >= max`, состояние, невидимое всем трём выборкам. Цена названа честно: за
+   осознанную правку конфига платится до `max_attempts` запросов на страницу, и платится один
+   раз. Возврат идёт ПЕРЕД отсевом, чтобы правка отрабатывала за один прогон, а не за два.
+   Число вернувшихся уезжает в `run.requeued` и в лог: возврат бэклога — работа прогона.
 5. Шаг 4–5: `pending_enrichment(max_attempts)` → `client.get(vacancy_url(id))` →
    `parse_vacancy_page(text, salary_stats)` → `scorer.score` → `save_enriched`. Транспортный
    отказ и отказ страницы разведены (см. выше). Отказ оценки → `save_description`. Больше
@@ -4490,13 +4526,50 @@ def prefilter(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
     Идёт по всей очереди обогащения, а не только по найденному сейчас:
     отсев локальный и бесплатный, а правка `negative` в конфиге обязана
     доставать накопленный бэклог, а не только следующую находку.
+
+    По той же причине шаг работает в ОБЕ стороны. Раньше он умел только
+    отказывать, и отказ был вечным: слово, попавшее в `negative` по
+    ошибке, убивало целевые вакансии навсегда — притом что решение о них
+    чисто локальное, заголовок лежит в базе, и сеть для пересмотра не
+    нужна вовсе. Возврат идёт ПЕРЕД отсевом, чтобы правка конфига
+    отрабатывала за один прогон: возвращённая вакансия сразу попадает в
+    `pending_enrichment` этого же прогона и доходит до отчёта, а не ждёт
+    следующего.
     """
     barrier = Prefilter(config.profile)
+    stats.requeued = _take_back(barrier, repo)
     for vacancy in repo.pending_enrichment(config.app.enrich.max_attempts):
         reason = barrier.reason_to_reject(vacancy)
         if reason is not None:
-            repo.mark_rejected(vacancy.id, reason)
+            repo.mark_rejected(vacancy.id, reason, REJECT_CODE_PREFILTER)
             stats.rejected += 1
+
+
+def _take_back(barrier: Prefilter, repo: SqliteRepository) -> int:
+    """Вернуть в очередь отказы префильтра, которые текущий конфиг не подтвердил.
+
+    Ни одного обращения к сети: решение принимается по заголовку, а он
+    лежит в базе с шага discovery. Ни одной записи, когда конфиг не
+    менялся: список возвращаемых пуст, и `requeue_prefiltered` выходит
+    до `UPDATE`. Выбираются только отказы с кодом `prefilter` —
+    `enrich_failed` значит «страница не разбирается», и заголовок про это
+    ничего сказать не может.
+    """
+    returning = [
+        vacancy_id
+        for vacancy_id, title in repo.rejected_by_prefilter()
+        if barrier.reason_for_title(title) is None
+    ]
+    requeued = repo.requeue_prefiltered(returning)
+    if requeued:
+        logger.info(
+            "стоп-слова больше не совпадают с %d ранее отбракованными вакансиями: %s. "
+            "Они возвращены в очередь обогащения — переоценка локальная, в сеть за ней "
+            "не ходили",
+            requeued,
+            ", ".join(returning),
+        )
+    return requeued
 ```
 
 - [x] **Step 6: Реализовать `hh_search/pipeline/enrichment.py`**

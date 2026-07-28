@@ -50,6 +50,7 @@ class RunCounters(TypedDict):
     enriched: int
     rescored: int
     stuck: int
+    requeued: int
     reported: int
     error: str | None
 
@@ -63,6 +64,10 @@ class RunStats(BaseModel):
     enriched: int = 0
     rescored: int = 0
     stuck: int = 0
+    # Сколько вакансий вернулось из отказа префильтра: правка списка
+    # стоп-слов достаёт накопленный бэклог, и это работа прогона, а не
+    # тихое событие.
+    requeued: int = 0
     reported: int = 0
     status: str = OK
     error: str | None = None
@@ -94,6 +99,7 @@ class RunStats(BaseModel):
             "enriched": self.enriched,
             "rescored": self.rescored,
             "stuck": self.stuck,
+            "requeued": self.requeued,
             "reported": self.reported,
             "error": self.error,
         }

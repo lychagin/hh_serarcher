@@ -1,7 +1,12 @@
 import contextlib
 import logging
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -9,7 +14,12 @@ from pydantic import ValidationError
 from hh_search.domain.models import DiscoveredVacancy, Salary, ScoreBreakdown, VacancyDetails
 from hh_search.storage.migrations import ADDED_COLUMNS
 from hh_search.storage.quarantine import STATUS_CORRUPT
-from hh_search.storage.repository import SCHEMA_PATH, SqliteRepository
+from hh_search.storage.repository import (
+    REJECT_CODE_ENRICH_FAILED,
+    REJECT_CODE_PREFILTER,
+    SCHEMA_PATH,
+    SqliteRepository,
+)
 
 
 @pytest.fixture()
@@ -104,7 +114,7 @@ def test_heavier_query_wins_the_cluster(repo: SqliteRepository) -> None:
 
 def test_rejected_vacancy_is_not_offered_for_enrichment(repo: SqliteRepository) -> None:
     repo.add_discovered(make_vacancy(), "embedded", 9)
-    repo.mark_rejected("1", "stop-word in title")
+    repo.mark_rejected("1", "stop-word in title", REJECT_CODE_PREFILTER)
     assert repo.pending_enrichment(max_attempts=3) == []
 
 
@@ -849,7 +859,7 @@ def test_three_selections_partition_the_new_vacancies(tmp_path: object) -> None:
     for vacancy_id in ("2", "3", "4", "5"):
         repository.save_enriched(vacancy_id, VacancyDetails(description="Yocto"), make_score())
     corrupt(db_path, "UPDATE vacancy SET score = NULL, score_detail = NULL WHERE id = ?", "2")
-    repository.mark_rejected("4", "стоп-слово")
+    repository.mark_rejected("4", "стоп-слово", REJECT_CODE_PREFILTER)
     repository.mark_reported(["5"])
 
     enrichment = {v.id for v in repository.pending_enrichment(max_attempts=3)}
@@ -932,7 +942,7 @@ def test_every_new_vacancy_is_visible_to_exactly_one_selection(tmp_path: object)
         repository.bump_enrich_attempt("попытки-исчерпаны", max_attempts=limit)
     repository.save_description("описание-без-оценки", VacancyDetails(description="Yocto"))
     repository.save_enriched("описание-и-оценка", VacancyDetails(description="Yocto"), make_score())
-    repository.mark_rejected("отсеяна-префильтром", "стоп-слово")
+    repository.mark_rejected("отсеяна-префильтром", "стоп-слово", REJECT_CODE_PREFILTER)
     repository.save_enriched("уже-отправлена", VacancyDetails(description="Yocto"), make_score())
     repository.mark_reported(["уже-отправлена"])
 
@@ -1597,3 +1607,333 @@ def test_reported_since_takes_only_reported_rows_inside_the_window(tmp_path: obj
     window = datetime.now(UTC) - timedelta(days=7)
     assert [item.discovered.id for item in repository.reported_since(window)] == ["1"]
     repository.close()
+
+
+# --- Раунд исправлений 7: отказ префильтра перестаёт быть вечным ----------
+#
+# Один список `negative` обслуживал два механизма с несопоставимой ценой
+# ошибки: в скоринге совпадение стоит штраф и вакансия остаётся в отчёте,
+# а в префильтре то же слово означало `status='rejected'` НАВСЕГДА. Решение
+# о префильтре при этом чисто локальное и бесплатное — заголовок лежит в
+# базе, сеть не нужна вовсе, — поэтому необратимость снята.
+
+
+def test_prefilter_rejection_is_told_apart_from_enrich_failure_by_a_code(
+    tmp_path: object,
+) -> None:
+    """Различие машинное, а не по тексту причины.
+
+    Разбор `reject_reason` по префиксу вернул бы ровно тот класс тихого
+    отказа, против которого написан весь модуль: текст причины
+    перечисляет совпавшие стоп-слова и будет меняться, а разъехавшийся
+    префикс молча изменил бы множество возвращаемых вакансий.
+    """
+    db_path = str(tmp_path) + "/codes.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    for vacancy_id in ("отсеяна", "не-скачалась"):
+        repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+    repository.mark_rejected("отсеяна", "стоп-слово в заголовке: курьер", REJECT_CODE_PREFILTER)
+    for _ in range(3):
+        repository.bump_enrich_attempt("не-скачалась", max_attempts=3)
+
+    assert read_column(db_path, "reject_code", "отсеяна") == REJECT_CODE_PREFILTER
+    assert read_column(db_path, "reject_code", "не-скачалась") == REJECT_CODE_ENRICH_FAILED
+    # и текст причины остаётся человеческим, не подменяя собой код
+    assert read_column(db_path, "reject_reason", "отсеяна") == "стоп-слово в заголовке: курьер"
+    assert [key for key, _ in repository.rejected_by_prefilter()] == ["отсеяна"]
+    repository.close()
+
+
+def test_requeue_returns_the_vacancy_into_the_enrichment_queue(tmp_path: object) -> None:
+    """Возврат стирает след отказа и делает вакансию видимой очереди."""
+    db_path = str(tmp_path) + "/back.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.mark_rejected("1", "стоп-слово в заголовке: курьер", REJECT_CODE_PREFILTER)
+    assert repository.pending_enrichment(max_attempts=3) == []
+
+    assert repository.requeue_prefiltered(["1"]) == 1
+
+    assert [v.id for v in repository.pending_enrichment(max_attempts=3)] == ["1"]
+    assert read_column(db_path, "status", "1") == "new"
+    assert read_column(db_path, "reject_reason", "1") is None
+    assert read_column(db_path, "reject_code", "1") is None
+    # повторный возврат уже ничего не находит: охрана WHERE совпадает с выборкой
+    assert repository.requeue_prefiltered(["1"]) == 0
+    assert repository.rejected_by_prefilter() == []
+    repository.close()
+
+
+def test_requeue_restores_the_attempt_budget(tmp_path: object) -> None:
+    """Возврат с исчерпанным счётчиком воспроизвёл бы Critical спеки §5.2.
+
+    Вакансия может израсходовать попытки скачивания ДО того, как правка
+    конфига её отбракует. Возврат в `new` без обнуления счётчика дал бы
+    `status='new'`, `description IS NULL`, `enrich_attempts >= max` —
+    состояние, невидимое ВСЕМ трём выборкам, то есть вакансия исчезла бы
+    ещё тише, чем отказом префильтра.
+    """
+    db_path = str(tmp_path) + "/budget.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    limit = 3
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    for _ in range(limit - 1):
+        repository.bump_enrich_attempt("1", max_attempts=limit)
+    repository.mark_rejected("1", "стоп-слово в заголовке: курьер", REJECT_CODE_PREFILTER)
+
+    assert repository.requeue_prefiltered(["1"]) == 1
+
+    assert read_column(db_path, "enrich_attempts", "1") == 0
+    assert [v.id for v in repository.pending_enrichment(max_attempts=limit)] == ["1"]
+    assert ids_with_status(db_path, "new") == {"1"}
+    repository.close()
+
+
+def test_requeue_resurrects_nothing_but_a_prefilter_rejection(tmp_path: object) -> None:
+    """Охрана WHERE, а не доверие вызывающему.
+
+    Возврат по списку id обязан быть безопасен даже при неверном списке:
+    `enrich_failed` имеет другой смысл (страница не разбирается, и
+    заголовок про это ничего не знает), ручной отказ — чужое решение,
+    `corrupt` и `reported` терминальны.
+    """
+    db_path = str(tmp_path) + "/guard.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    everything = ("не-скачалась", "отказ-человека", "испорчена", "отправлена")
+    for vacancy_id in everything:
+        repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+    for _ in range(3):
+        repository.bump_enrich_attempt("не-скачалась", max_attempts=3)
+    repository.set_status("отказ-человека", "rejected")
+    repository.save_enriched("отправлена", VacancyDetails(description="Yocto"), make_score())
+    repository.mark_reported(["отправлена"])
+    repository.close()
+    corrupt(db_path, "UPDATE vacancy SET status = ? WHERE id = ?", STATUS_CORRUPT, "испорчена")
+
+    repository = SqliteRepository(db_path)
+    assert repository.rejected_by_prefilter() == []
+    assert repository.requeue_prefiltered(list(everything)) == 0
+
+    assert read_column(db_path, "status", "не-скачалась") == "rejected"
+    assert read_column(db_path, "reject_reason", "не-скачалась") == "enrich_failed"
+    assert read_column(db_path, "status", "отказ-человека") == "rejected"
+    assert read_column(db_path, "status", "испорчена") == STATUS_CORRUPT
+    assert read_column(db_path, "status", "отправлена") == "reported"
+    repository.close()
+
+
+def test_three_selections_still_partition_the_new_vacancies_after_a_requeue(
+    tmp_path: object,
+) -> None:
+    """Инвариант трёх выборок переживает возврат — перебором состояний.
+
+    Возвращаются строки в двух разных состояниях сразу: без описания
+    (обычный случай — отсев стоит ДО скачивания) и с описанием, которое
+    было записано раньше. Первая обязана оказаться в `pending_enrichment`,
+    вторая — в `pending_scoring`; ни одна не имеет права выпасть мимо
+    всех трёх.
+    """
+    db_path = str(tmp_path) + "/partition.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    limit = 3
+    everything = (
+        "нетронутая",
+        "попытки-остались",
+        "попытки-исчерпаны",
+        "описание-без-оценки",
+        "описание-и-оценка",
+        "уже-отправлена",
+        "вернётся-без-описания",
+        "вернётся-с-описанием",
+        "останется-отсеянной",
+    )
+    for vacancy_id in everything:
+        repository.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+    repository.bump_enrich_attempt("попытки-остались", max_attempts=limit)
+    for _ in range(limit):
+        repository.bump_enrich_attempt("попытки-исчерпаны", max_attempts=limit)
+    repository.save_description("описание-без-оценки", VacancyDetails(description="Yocto"))
+    repository.save_enriched("описание-и-оценка", VacancyDetails(description="Yocto"), make_score())
+    repository.save_enriched("уже-отправлена", VacancyDetails(description="Yocto"), make_score())
+    repository.mark_reported(["уже-отправлена"])
+    repository.save_description("вернётся-с-описанием", VacancyDetails(description="Yocto"))
+    for vacancy_id in ("вернётся-без-описания", "вернётся-с-описанием", "останется-отсеянной"):
+        repository.mark_rejected(vacancy_id, "стоп-слово", REJECT_CODE_PREFILTER)
+
+    returning = ["вернётся-без-описания", "вернётся-с-описанием"]
+    assert repository.requeue_prefiltered(returning) == 2
+
+    enrichment = {v.id for v in repository.pending_enrichment(max_attempts=limit)}
+    scoring = {v.id for v, _ in repository.pending_scoring()}
+    reportable = {v.discovered.id for v in repository.unreported()}
+
+    assert enrichment == {"нетронутая", "попытки-остались", "вернётся-без-описания"}
+    assert scoring == {"описание-без-оценки", "вернётся-с-описанием"}
+    assert reportable == {"описание-и-оценка"}
+    assert enrichment & scoring == set()
+    assert scoring & reportable == set()
+    assert enrichment & reportable == set()
+    # ключевое: ни одной 'new' строки за пределами трёх выборок
+    assert enrichment | scoring | reportable == ids_with_status(db_path, "new")
+    assert ids_with_status(db_path, "rejected") == {"попытки-исчерпаны", "останется-отсеянной"}
+    repository.close()
+
+
+def test_migration_makes_the_accumulated_prefilter_rejections_reversible(
+    tmp_path: object,
+) -> None:
+    """База прошлого поколения: кода нет ни у одного отказа.
+
+    Решение — считать накопленные отказы с причиной отказами ПРЕФИЛЬТРА,
+    то есть обратимыми: бэклог как раз и состоит из вакансий, убитых
+    опечаткой в списке стоп-слов, и оставить его недостижимым значит
+    сделать правку конфига бесполезной там, где она нужнее всего.
+    `enrich_failed` отделяется полным равенством машинной константы, а
+    отказ человека через CLI — тем, что причины у него нет вовсе.
+    """
+    db_path = str(tmp_path) + "/old.db"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(FIRST_GENERATION_SCHEMA)
+    rejections = {
+        "отсеяна-опечаткой": "стоп-слово в заголовке: курьер",
+        "не-скачалась": "enrich_failed",
+        "отказ-человека": None,
+    }
+    for vacancy_id, reason in rejections.items():
+        raw.execute(
+            "INSERT INTO vacancy (id, url, title, published_at, status, first_seen_at, "
+            "reject_reason) VALUES (?, ?, ?, '2026-07-27T09:00:00+00:00', 'rejected', "
+            "'2026-07-20T09:00:00+00:00', ?)",
+            (vacancy_id, f"https://hh.ru/vacancy/{vacancy_id}", "Курьерский backend", reason),
+        )
+    raw.commit()
+    raw.close()
+
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+
+    assert [key for key, _ in repository.rejected_by_prefilter()] == ["отсеяна-опечаткой"]
+    assert read_column(db_path, "reject_code", "не-скачалась") == REJECT_CODE_ENRICH_FAILED
+    assert read_column(db_path, "reject_code", "отказ-человека") is None
+    # идемпотентно: повторный старт не переписывает уже проставленные коды
+    repository.init_schema()
+    assert [key for key, _ in repository.rejected_by_prefilter()] == ["отсеяна-опечаткой"]
+    assert repository.requeue_prefiltered(["отсеяна-опечаткой"]) == 1
+    assert [v.id for v in repository.pending_enrichment(max_attempts=3)] == ["отсеяна-опечаткой"]
+    repository.close()
+
+
+# Возврат из отказа обязан быть атомарным так же, как всё остальное в
+# хранилище: процесс на VPS умирает от OOM-kill и `docker stop`, и
+# половина возвращённых строк — это база, в которой часть бэклога
+# осталась отбракованной, а часть уже в очереди, причём различить их
+# нечем. Убиваем процесс ВНУТРИ оператора обработчиком прогресса SQLite:
+# `os._exit(1)` не разматывает стек, не закрывает соединение и не
+# коммитит ничего — ровно то, что делает SIGKILL.
+_KILL_INSIDE_REQUEUE = """
+import os
+import sys
+
+from hh_search.storage.repository import SqliteRepository
+
+db_path, action, budget = sys.argv[1], sys.argv[2], int(sys.argv[3])
+repository = SqliteRepository(db_path)
+ids = [str(number) for number in range(1, 201)]
+steps = 0
+
+
+def handler() -> int:
+    global steps
+    steps += 1
+    if action == "die" and steps >= budget:
+        os._exit(1)
+    return 0
+
+
+repository._connection.set_progress_handler(handler, 1)
+repository.requeue_prefiltered(ids)
+repository._connection.set_progress_handler(None, 1)
+print(steps)
+"""
+
+_REQUEUE_ROWS = 200
+
+
+def _rejected_backlog(db_path: str, journal_mode: str) -> None:
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    for number in range(1, _REQUEUE_ROWS + 1):
+        repository.add_discovered(make_vacancy(str(number)), "embedded", 9)
+        # Одна израсходованная попытка на каждую строку: без неё
+        # `enrich_attempts` одинаков до и после возврата, и проверка на
+        # разъехавшиеся поля не смотрела бы на счётчик вовсе.
+        repository.bump_enrich_attempt(str(number), max_attempts=3)
+        repository.mark_rejected(str(number), "стоп-слово: курьер", REJECT_CODE_PREFILTER)
+    repository.close()
+    raw = sqlite3.connect(db_path)
+    raw.execute(f"PRAGMA journal_mode={journal_mode}")
+    raw.commit()
+    raw.close()
+
+
+def _run_child(
+    script: str, db_path: str, action: str, budget: int
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, script, db_path, action, str(budget)],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+
+@pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+def test_kill_inside_the_requeue_leaves_no_torn_state(tmp_path: Path, journal_mode: str) -> None:
+    """Оба режима журнала SQLite: смерть посреди возврата — всё или ничего.
+
+    `executemany` + один `commit()` — это ОДНА транзакция, поэтому либо
+    возвращены все строки, либо ни одной, и внутри строки статус, причина,
+    код и счётчик попыток не могут разъехаться. Проверяется именно факт
+    смерти ВНУТРИ оператора: дочерний процесс печатает число шагов только
+    если досчитал до конца, а здесь он обязан умереть молча с кодом 1.
+    """
+    script = str(tmp_path / "kill.py")
+    Path(script).write_text(_KILL_INSIDE_REQUEUE, encoding="utf-8")
+    db_path = str(tmp_path / f"{journal_mode}.db")
+    _rejected_backlog(db_path, journal_mode)
+    backup = str(tmp_path / f"{journal_mode}.bak")
+
+    measured = _run_child(script, db_path, "measure", 0)
+    assert measured.returncode == 0, measured.stderr
+    steps = int(measured.stdout)
+    assert steps > 0
+    shutil.copy(db_path, backup)
+    _rejected_backlog(db_path, journal_mode)
+
+    killed = _run_child(script, db_path, "die", steps // 2)
+    assert killed.returncode == 1 and killed.stdout == "", (
+        f"процесс обязан умереть ВНУТРИ оператора: {killed.stdout!r} {killed.stderr!r}"
+    )
+
+    raw = sqlite3.connect(db_path)
+    assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    torn = raw.execute(
+        "SELECT COUNT(*) FROM vacancy WHERE (status = 'new') IS NOT (reject_code IS NULL) "
+        "OR (status = 'new') IS NOT (reject_reason IS NULL) "
+        "OR (status = 'new') IS NOT (enrich_attempts = 0)"
+    ).fetchone()[0]
+    returned = raw.execute("SELECT COUNT(*) FROM vacancy WHERE status = 'new'").fetchone()[0]
+    raw.close()
+    assert torn == 0, f"{torn} строк с разъехавшимися статусом, причиной, кодом и счётчиком"
+    assert returned in (0, _REQUEUE_ROWS), (
+        f"возврат порвался на середине: {returned} из {_REQUEUE_ROWS} строк вернулись, "
+        "остальные остались отбракованными — различить их в базе больше нечем"
+    )
+    Path(backup).unlink()

@@ -73,12 +73,13 @@ def run_once(
         raise
     repo.finish_run(run_id, stats.status, **stats.counters())
     logger.info(
-        "прогон %s: найдено %d, новых %d, отсеяно %d, обогащено %d, пересчитано %d, "
-        "без оценки %d, отправлено %d%s",
+        "прогон %s: найдено %d, новых %d, отсеяно %d, возвращено %d, обогащено %d, "
+        "пересчитано %d, без оценки %d, отправлено %d%s",
         stats.status,
         stats.discovered,
         stats.new_count,
         stats.rejected,
+        stats.requeued,
         stats.enriched,
         stats.rescored,
         stats.stuck,

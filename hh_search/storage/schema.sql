@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS vacancy (
     primary_query   TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL,
     reject_reason   TEXT,
+    -- Машинный код причины отказа: 'prefilter' обратим, 'enrich_failed'
+    -- нет. Отдельная колонка, а не префикс в reject_reason: текст
+    -- причины принадлежит человеку и меняется, и разъехавшийся префикс
+    -- молча изменил бы множество возвращаемых вакансий. NULL — отказ,
+    -- поставленный человеком через CLI: он не возвращается.
+    reject_code     TEXT,
     first_seen_at   TEXT NOT NULL,
     reported_at     TEXT,
     -- Улики: исходное значение score_detail, которое не удалось
@@ -73,6 +79,10 @@ CREATE TABLE IF NOT EXISTS run (
     -- а не состояние на вакансии, поэтому живёт здесь.
     rescored    INTEGER DEFAULT 0,
     stuck       INTEGER DEFAULT 0,
+    -- Сколько вакансий вернулось из отказа префильтра за прогон. Правка
+    -- списка стоп-слов обязана быть видимой: возврат бэклога — это
+    -- работа прогона, а не тихое событие.
+    requeued    INTEGER DEFAULT 0,
     error       TEXT
 );
 

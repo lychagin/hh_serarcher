@@ -182,3 +182,42 @@ def test_no_good_title_is_lost_on_the_live_listing() -> None:
         "Программист на ПО Fansy (SPECTRE, DEPO)",
         "Программист SQL/Delphi",
     ]
+
+
+def test_verdict_by_title_alone_matches_the_verdict_by_vacancy() -> None:
+    """Переоценка отбракованного получает от базы только id и заголовок.
+
+    Строить ради решения `DiscoveredVacancy` из десяти колонок значило бы
+    дать порче зарплаты или даты право повлиять на отказ, к которому они
+    непричастны, — при том что решение принимает один заголовок. Вход
+    отдельный, вердикт обязан быть тот же самый.
+    """
+    prefilter = Prefilter(make_profile(SPEC_NEGATIVE))
+    for title in (
+        "Backend Team Lead",
+        "Junior Python Developer",
+        "Программист 1С (стажер/junior)",
+        "Backend-разработчик курьерской доставки",
+    ):
+        assert prefilter.reason_for_title(title) == prefilter.reason_to_reject(make_vacancy(title))
+
+
+def test_stop_word_of_the_sample_profile_kills_a_target_vacancy() -> None:
+    """Ровно тот отказ, ради которого снята необратимость.
+
+    Слова образцового профиля писались как ШТРАФНЫЕ признаки скоринга,
+    где совпадение стоит −15 очков и вакансия остаётся в отчёте. Тот же
+    список обслуживает отсев, где совпадение означало
+    `status='rejected'` навсегда, — и «курьер» убивал целевые backend-
+    вакансии. Тест фиксирует сам факт: отсев по этому списку промахивается
+    по построению, поэтому его отказ обязан быть обратимым.
+    """
+    prefilter = Prefilter(make_profile(SPEC_NEGATIVE))
+    for title in (
+        "Backend-разработчик курьерской доставки",
+        "Ведущий Go-разработчик (курьерская логистика)",
+        "Team Lead курьерской платформы",
+        "Разработчик CRM для отдела продаж",
+        "Python-разработчик HR-tech платформы для рекрутеров",
+    ):
+        assert prefilter.reason_for_title(title) is not None, title

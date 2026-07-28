@@ -21,7 +21,7 @@ from hh_search.filtering.prefilter import Prefilter
 from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.sources.http import PoliteClient
 from hh_search.sources.listing import build_listing_url, parse_listing
-from hh_search.storage.repository import SqliteRepository
+from hh_search.storage.repository import REJECT_CODE_PREFILTER, SqliteRepository
 
 logger = logging.getLogger(__name__)
 
@@ -129,10 +129,47 @@ def prefilter(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
     Идёт по всей очереди обогащения, а не только по найденному сейчас:
     отсев локальный и бесплатный, а правка `negative` в конфиге обязана
     доставать накопленный бэклог, а не только следующую находку.
+
+    По той же причине шаг работает в ОБЕ стороны. Раньше он умел только
+    отказывать, и отказ был вечным: слово, попавшее в `negative` по
+    ошибке, убивало целевые вакансии навсегда — притом что решение о них
+    чисто локальное, заголовок лежит в базе, и сеть для пересмотра не
+    нужна вовсе. Возврат идёт ПЕРЕД отсевом, чтобы правка конфига
+    отрабатывала за один прогон: возвращённая вакансия сразу попадает в
+    `pending_enrichment` этого же прогона и доходит до отчёта, а не ждёт
+    следующего.
     """
     barrier = Prefilter(config.profile)
+    stats.requeued = _take_back(barrier, repo)
     for vacancy in repo.pending_enrichment(config.app.enrich.max_attempts):
         reason = barrier.reason_to_reject(vacancy)
         if reason is not None:
-            repo.mark_rejected(vacancy.id, reason)
+            repo.mark_rejected(vacancy.id, reason, REJECT_CODE_PREFILTER)
             stats.rejected += 1
+
+
+def _take_back(barrier: Prefilter, repo: SqliteRepository) -> int:
+    """Вернуть в очередь отказы префильтра, которые текущий конфиг не подтвердил.
+
+    Ни одного обращения к сети: решение принимается по заголовку, а он
+    лежит в базе с шага discovery. Ни одной записи, когда конфиг не
+    менялся: список возвращаемых пуст, и `requeue_prefiltered` выходит
+    до `UPDATE`. Выбираются только отказы с кодом `prefilter` —
+    `enrich_failed` значит «страница не разбирается», и заголовок про это
+    ничего сказать не может.
+    """
+    returning = [
+        vacancy_id
+        for vacancy_id, title in repo.rejected_by_prefilter()
+        if barrier.reason_for_title(title) is None
+    ]
+    requeued = repo.requeue_prefiltered(returning)
+    if requeued:
+        logger.info(
+            "стоп-слова больше не совпадают с %d ранее отбракованными вакансиями: %s. "
+            "Они возвращены в очередь обогащения — переоценка локальная, в сеть за ней "
+            "не ходили",
+            requeued,
+            ", ".join(returning),
+        )
+    return requeued

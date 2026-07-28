@@ -47,7 +47,34 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("vacancy_query", "weight", "INTEGER NOT NULL DEFAULT 0"),
     ("run", "rescored", "INTEGER DEFAULT 0"),
     ("run", "stuck", "INTEGER DEFAULT 0"),
+    ("vacancy", "reject_code", "TEXT"),
+    ("run", "requeued", "INTEGER DEFAULT 0"),
 )
+
+# У отказов, накопленных базой прошлого поколения, машинного кода нет:
+# колонки не существовало. Решение сознательное — считать их отказами
+# ПРЕФИЛЬТРА, то есть обратимыми. Причина в том, ради чего обратимость
+# вводится: накопленный бэклог как раз и состоит из вакансий, убитых
+# опечаткой в списке стоп-слов, и оставить его недостижимым значит
+# сделать правку конфига наполовину бесполезной именно там, где она
+# нужнее всего.
+#
+# Разбора человекочитаемого текста здесь нет: `enrich_failed` — машинная
+# константа, которую пишет `bump_enrich_attempt` целиком, и сравнение
+# идёт на полное равенство, а не по префиксу. Отказ, поставленный
+# человеком через CLI (`mark <id> rejected`), отличается тем, что
+# причины у него нет вовсе, и код ему не проставляется: возвращать чужое
+# решение переоценкой заголовка нельзя.
+#
+# Идемпотентно и переживает прерывание: WHERE отбирает только строки без
+# кода, повторный прогон их не находит, а сам UPDATE атомарен.
+_BACKFILL_REJECT_CODE = """
+UPDATE vacancy SET reject_code = CASE
+        WHEN reject_reason = 'enrich_failed' THEN 'enrich_failed'
+        ELSE 'prefilter'
+    END
+WHERE status = 'rejected' AND reject_code IS NULL AND reject_reason IS NOT NULL
+"""
 
 # ALTER TABLE ставит всем существующим строкам DEFAULT, то есть у всей
 # мигрированной базы primary_query = ''. А `found_by_query` в отчёте
@@ -91,10 +118,11 @@ def apply_schema(connection: sqlite3.Connection, schema_sql: str) -> None:
     for table, column, definition in ADDED_COLUMNS:
         if column not in _columns(connection, table):
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-    # Идемпотентно: заполняет только пустые значения, повторный прогон не
-    # находит их и не делает ничего. Выполняется после ALTER — на этот
-    # момент обе участвующие колонки заведомо существуют.
+    # Идемпотентно: заполняют только пустые значения, повторный прогон не
+    # находит их и не делает ничего. Выполняются после ALTER — на этот
+    # момент все участвующие колонки заведомо существуют.
     connection.execute(_BACKFILL_PRIMARY_QUERY)
+    connection.execute(_BACKFILL_REJECT_CODE)
     connection.commit()
 
 
