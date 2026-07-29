@@ -370,6 +370,7 @@ hh_search/
     csv_sink.py         CSV-отчёт с дедупликацией по файлу дня
     html_report.py      рендер HTML-отчёта: экранирование, «Топ» и «Остальное», кликабельные ссылки
     markdown_sink.py    Markdown-отчёт: «Топ» по порогу и «Остальное»
+    telegram_sink.py    транспорт Bot API: sendMessage/sendDocument, токен не течёт в ошибки
   sources/
     http.py             вежливый клиент плюс матчер robots.txt по RFC 9309
     listing.py          шаг 1: URL листинга, разбор ld+json ItemList, сторож canonical
