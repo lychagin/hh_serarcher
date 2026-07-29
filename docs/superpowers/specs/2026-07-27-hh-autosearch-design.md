@@ -368,6 +368,7 @@ hh_search/
     __init__.py         build_sinks: опечатка в имени приёмника роняет процесс на старте
     base.py             протокол Sink
     csv_sink.py         CSV-отчёт с дедупликацией по файлу дня
+    html_report.py      рендер HTML-отчёта: экранирование, «Топ» и «Остальное», кликабельные ссылки
     markdown_sink.py    Markdown-отчёт: «Топ» по порогу и «Остальное»
   sources/
     http.py             вежливый клиент плюс матчер robots.txt по RFC 9309
