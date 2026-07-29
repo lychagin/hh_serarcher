@@ -23,7 +23,7 @@ from hh_search.pipeline.forbidden import ForbiddenStreak
 from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.sources.http import PoliteClient
 from hh_search.sources.listing import build_listing_url, parse_listing
-from hh_search.storage.repository import REJECT_CODE_PREFILTER, SqliteRepository
+from hh_search.storage.base import REJECT_CODE_PREFILTER, Repository
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ NOT_MODIFIED = 304
 def discover(
     config: Config,
     client: PoliteClient,
-    repo: SqliteRepository,
+    repo: Repository,
     stats: RunStats,
     forbidden: ForbiddenStreak,
 ) -> None:
@@ -44,6 +44,17 @@ def discover(
     # отличаются только URL, а причина у всех одна (см. pipeline/failures.py).
     skipped = FailureDigest()
     for query in config.queries.queries:
+        # Дедупликация на весь ЛИСТИНГ, а не на страницу. Пагинация hh.ru
+        # сдвигается между запросами (выдача живая, вакансии добавляются и
+        # снимаются), поэтому повтор на границе страниц — обычное дело, а
+        # не авария. `parse_listing` умеет отсеивать повтор только внутри
+        # одной страницы, и `stats.discovered` из-за этого считал одну
+        # вакансию дважды; `new_count` при этом всегда был верен —
+        # `add_discovered` отвечает False на уже известный id.
+        # Между РАЗНЫМИ листингами дедупликации нет сознательно: одна и та
+        # же вакансия, найденная двумя запросами, — это две находки, и
+        # именно они определяют кластер (побеждает больший weight).
+        seen: set[str] = set()
         for page in range(query.pages):
             url = build_listing_url(query, page)
             try:
@@ -74,17 +85,18 @@ def discover(
             # ниже. Считай мы разобранные, отказ разбора остался бы
             # `partial`, то есть успехом для healthcheck.
             fetched += 1
-            _store_page(repo, query, url, response, stats)
+            _store_page(repo, query, url, response, stats, seen)
     skipped.log_summary("страниц листингов не получено")
     _check_not_silent(config, stats, fetched, unchanged)
 
 
 def _store_page(
-    repo: SqliteRepository,
+    repo: Repository,
     query: QuerySpec,
     url: str,
     response: httpx.Response,
     stats: RunStats,
+    seen: set[str],
 ) -> None:
     """Разобрать страницу, записать вакансии и только потом — валидатор."""
     try:
@@ -98,9 +110,16 @@ def _store_page(
         logger.error("листинг %s не разобран, кэш условного запроса сброшен: %s", url, error)
         return
     for vacancy in vacancies:
-        stats.discovered += 1
+        # Запись идёт в любом случае, а счёт — только на первой встрече.
+        # Пропускать повтор целиком нельзя: `add_discovered` идемпотентен и
+        # именно он решает судьбу кластера (охрана `cluster_weight <`), а
+        # `new_count` уже верен — на известный id метод отвечает False.
+        # Врал только `discovered`, и правится ровно он.
         if repo.add_discovered(vacancy, query.cluster, query.weight):
             stats.new_count += 1
+        if vacancy.id not in seen:
+            seen.add(vacancy.id)
+            stats.discovered += 1
     repo.save_cache_headers(
         url, response.headers.get("ETag"), response.headers.get("Last-Modified")
     )
@@ -133,6 +152,16 @@ def _check_not_silent(config: Config, stats: RunStats, fetched: int, unchanged: 
     Ноль отданных страниц при ненулевом числе запрошенных — это не
     частичная потеря, а отсутствие работы целиком. Ответ `304` при этом
     остаётся успехом: источник ответил, и ответил «не изменилось».
+
+    Из второй ветви по той же причине вычтен случай «есть хотя бы один
+    `304`». Он и есть улика исправности: источник страницу узнал и
+    сказал, что она не менялась, — значит единственная СВЕЖАЯ страница без
+    вакансий это пустой хвост пагинации (`pages: 2`, на втором листе
+    вакансии кончились), а не отказ. Прежний код красил такой прогон в
+    `failed`, то есть красил healthcheck при исправном сервисе.
+    Достижимо это только если hh.ru отдаёт валидаторы условного запроса на
+    HTML листинга — на живом источнике не подтверждено, поэтому цена
+    ошибки в обе стороны мала, а `failed` дороже.
     """
     requested = sum(query.pages for query in config.queries.queries)
     if requested and not fetched and not unchanged:
@@ -147,7 +176,7 @@ def _check_not_silent(config: Config, stats: RunStats, fetched: int, unchanged: 
             requested,
             FAILED,
         )
-    elif fetched and not stats.discovered:
+    elif fetched and not stats.discovered and not unchanged:
         stats.degrade(
             FAILED, f"источник отдал {fetched} страниц листингов, вакансий не найдено ни одной"
         )
@@ -159,6 +188,24 @@ def _check_not_silent(config: Config, stats: RunStats, fetched: int, unchanged: 
             len(config.queries.queries),
             FAILED,
         )
+    elif fetched and not stats.discovered:
+        # Та же тишина, но с уликой обратного: хотя бы одна страница
+        # ответила `304`, то есть источник жив, разбирался и не изменился.
+        # Единственная СВЕЖАЯ страница при этом — пустой хвост пагинации
+        # (`pages: 2`, на втором листе кончились вакансии), и объявлять
+        # прогон `failed` из-за него значит красить индикатор в красный
+        # на исправном сервисе. Дрейф формата этой веткой не прячется:
+        # он отказывает разбором, а `_store_page` при отказе разбора
+        # сбрасывает валидатор, поэтому уже следующий прогон получит на
+        # эту страницу полный ответ, `unchanged` станет нулём — и сторож
+        # выше сработает.
+        logger.warning(
+            "источник отдал %d свежих страниц листингов без единой вакансии, ещё %d "
+            "не изменились (304): похоже на пустой хвост пагинации, а не на отказ. "
+            "Статус прогона не понижен",
+            fetched,
+            unchanged,
+        )
     elif unchanged and not fetched:
         logger.warning(
             "ни одна из %d страниц листингов не изменилась с прошлого прогона (304); "
@@ -167,7 +214,7 @@ def _check_not_silent(config: Config, stats: RunStats, fetched: int, unchanged: 
         )
 
 
-def prefilter(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
+def prefilter(config: Config, repo: Repository, stats: RunStats) -> None:
     """Шаг 3: отсев по заголовку — единственный барьер перед сетью.
 
     Идёт по всей очереди обогащения, а не только по найденному сейчас:
@@ -185,14 +232,21 @@ def prefilter(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
     """
     barrier = Prefilter(config.profile)
     stats.requeued = _take_back(barrier, repo)
-    for vacancy in repo.pending_enrichment(config.app.enrich.max_attempts):
-        reason = barrier.reason_to_reject(vacancy)
+    # `pending_titles`, а не `pending_enrichment`: решение принимается по
+    # одному заголовку, и лимита у него нет — отсев обязан накрывать
+    # очередь ЦЕЛИКОМ. Читай он ограниченную выборку, вакансия, вытесненная
+    # за границу окна отсева, но попавшая в окно обогащения после чужих
+    # отказов, ушла бы в сеть, ни разу не пройдя единственный барьер перед
+    # ней. Заодно шаг перестал строить `DiscoveredVacancy` из одиннадцати
+    # колонок ради одного поля.
+    for vacancy_id, title in repo.pending_titles(config.app.enrich.max_attempts):
+        reason = barrier.reason_for_title(title)
         if reason is not None:
-            repo.mark_rejected(vacancy.id, reason, REJECT_CODE_PREFILTER)
+            repo.mark_rejected(vacancy_id, reason, REJECT_CODE_PREFILTER)
             stats.rejected += 1
 
 
-def _take_back(barrier: Prefilter, repo: SqliteRepository) -> int:
+def _take_back(barrier: Prefilter, repo: Repository) -> int:
     """Вернуть в очередь отказы префильтра, которые текущий конфиг не подтвердил.
 
     Ни одного обращения к сети: решение принимается по заголовку, а он

@@ -18,7 +18,7 @@
 строятся, а `QuerySpec.slug` сужен регуляркой `^[a-z0-9][a-z0-9-]*$` и
 отвергает всё остальное на старте, до первого запроса (см.
 `config/models.py`). Второй половиной той же гарантии служит
-`http.normalize()`: robots проверяется по НОРМАЛИЗОВАННОМУ URL, поэтому
+`http.normalize_url()`: robots проверяется по НОРМАЛИЗОВАННОМУ URL, поэтому
 построить здесь строку, которая проверится как одна, а уйдёт в сеть как
 другая, нельзя даже случайно.
 
@@ -35,7 +35,7 @@ from urllib.parse import SplitResult, urlsplit
 from hh_search.config.models import QuerySpec
 from hh_search.domain.models import DiscoveredVacancy
 from hh_search.errors import FetchFailed
-from hh_search.sources.vacancy_page import find_ld_json, vacancy_url
+from hh_search.sources.vacancy_page import find_ld_json, vacancy_id_from_path, vacancy_url
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +48,6 @@ LISTING_HOST = urlsplit(LISTING_BASE_URL).netloc
 # элементов, и однотипных причин там обычно одна-две.
 _MAX_LOGGED_REASONS = 5
 
-# Ведущий нуль запрещён, длина ограничена: `000123` — это отдельная строка
-# в базе для той же самой вакансии (первичный ключ у нас текстовый),
-# а `\d+` принимал и четырёхсотзначное число. Верхняя граница взята с
-# запасом к живым id (9 знаков) и всё ещё влезает в INTEGER SQLite.
-_ID_RE = re.compile(r"^/vacancy/([1-9][0-9]{0,14})$")
 _CANONICAL_RE = re.compile(r"<link[^>]+rel=[\"']canonical[\"'][^>]*>", re.IGNORECASE)
 _HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']")
 _HEAD_RE = re.compile(r"<head\b[^>]*>(.*?)</head>", re.DOTALL | re.IGNORECASE)
@@ -192,16 +187,15 @@ def _parse_item(raw: Any, query_text: str) -> tuple[DiscoveredVacancy | None, st
     # https://hh.ru/vacancy/{id} и уходила в базу как настоящая вакансия.
     if not _is_own_host(parts):
         return None, f"ссылка ведёт на чужой хост {parts.netloc!r}: {url!r}"
-    match = _ID_RE.match(parts.path)
-    if match is None:
+    vacancy_id = vacancy_id_from_path(parts.path)
+    if vacancy_id is None:
         return None, f"url не похож на ссылку на вакансию: {url!r}"
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
         # Заголовок идёт в скоринг с самым большим весом: пустая строка не
         # «вакансия без названия», а разобранный наполовину элемент, и
         # записывать её значит навсегда зафиксировать нулевой вклад title.
-        return None, f"нет непустого заголовка у вакансии {match.group(1)}: {name!r}"
-    vacancy_id = match.group(1)
+        return None, f"нет непустого заголовка у вакансии {vacancy_id}: {name!r}"
     return (
         DiscoveredVacancy(
             id=vacancy_id,

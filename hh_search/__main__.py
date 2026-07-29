@@ -34,7 +34,16 @@ from hh_search.sources.http import PoliteClient
 from hh_search.storage.repository import SqliteRepository
 
 logger = logging.getLogger(__name__)
-app = typer.Typer(help="Автопоиск вакансий на hh.ru", no_args_is_help=True)
+# `pretty_exceptions_enable=False` — это про читаемость логов сервиса, а не
+# про вкус. Цветной трейсбек rich раскладывает одну ошибку на 20–50 строк с
+# рамками и подсветкой; в журнале контейнера, который читают через
+# `docker logs` и grep, это ровно та форма, в которой причину найти труднее
+# всего. Зависимость от rich так не снимается (её тянет сам typer, ~13 МБ
+# образа), и снять её нечем, кроме отказа от typer, — но 13 МБ образа стоят
+# дешевле нечитаемого журнала, а вот обратный размен неверен.
+app = typer.Typer(
+    help="Автопоиск вакансий на hh.ru", no_args_is_help=True, pretty_exceptions_enable=False
+)
 
 DEFAULT_CONFIG_DIR = Path("/data/config")
 # 2 — код click'а для ошибки в аргументах; ошибка конфига по смыслу та же.
@@ -413,14 +422,29 @@ def report_command(ctx: typer.Context, since: Since = "7d") -> None:
         _die(f"--since ожидает число дней (7 или 7d), получено {since!r}", EXIT_CONFIG)
     sinks = _sinks(config)
     cutoff = datetime.now(UTC) - timedelta(days=int(match.group(1)))
+    limit = config.app.limits.rows_per_batch
     try:
         with _storage_errors(config), _open(config) as repo:
-            vacancies = repo.reported_since(cutoff)
+            vacancies = repo.reported_since(cutoff, limit)
     except StorageUnavailable as error:
         _die(str(error), EXIT_FAILED)
     if not vacancies:
         typer.echo(f"с {cutoff:%Y-%m-%d} отправленных вакансий не найдено")
         return
+    if len(vacancies) == limit:
+        # Усечение обязано быть сказано вслух: здесь его последствия видит
+        # человек, а не следующий прогон. `report --since 60` на базе с
+        # 22 000 вакансий стоил 351 МБ RSS, то есть OOM по команде
+        # человека на VPS с 512 МБ; потолок это лечит, но неполный отчёт,
+        # выданный за полный, — это ровно та тихая потеря, ради которой
+        # потолок и вводился. Отбор идёт по убыванию оценки, поэтому
+        # усечён всегда хвост.
+        typer.echo(
+            f"отчёт усечён потолком app.limits.rows_per_batch = {limit}: взяты "
+            f"{limit} вакансий с самой высокой оценкой, за границей могли остаться "
+            "другие. Сузьте --since или поднимите потолок",
+            err=True,
+        )
     # Тот же замок, что у прогона: `report` пишет в ТОТ ЖЕ файл дня, а
     # дедупликация приёмника — чтение-правка-запись, и гонится она с
     # прогоном ровно так же, как два прогона гонятся между собой.

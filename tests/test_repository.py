@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from hh_search.domain.models import DiscoveredVacancy, Salary, ScoreBreakdown, VacancyDetails
+from hh_search.storage.base import DEFAULT_BATCH_LIMIT
 from hh_search.storage.migrations import ADDED_COLUMNS
 from hh_search.storage.quarantine import STATUS_CORRUPT
 from hh_search.storage.repository import (
@@ -98,11 +99,6 @@ def _indexes_of_vacancy(db_path: str) -> set[str]:
 def test_add_discovered_reports_new_only_once(repo: SqliteRepository) -> None:
     assert repo.add_discovered(make_vacancy(), "embedded", 9) is True
     assert repo.add_discovered(make_vacancy(), "embedded", 9) is False
-
-
-def test_known_ids_returns_only_stored(repo: SqliteRepository) -> None:
-    repo.add_discovered(make_vacancy("1"), "embedded", 9)
-    assert repo.known_ids(["1", "2"]) == {"1"}
 
 
 def test_heavier_query_wins_the_cluster(repo: SqliteRepository) -> None:
@@ -698,8 +694,10 @@ def test_corrupted_id_does_not_kill_the_queue_and_the_report(tmp_path: object) -
     assert [v.discovered.id for v in repository.unreported()] == ["1"]
     assert [v.id for v in repository.pending_enrichment(max_attempts=3)] == ["3"]
     # дедупликация тоже переживает нечитаемый ключ: сравнение идёт в
-    # SQLite побайтово, до какого-либо декодирования
-    assert repository.known_ids(["1", "2", "3", "4"]) == {"1", "3"}
+    # SQLite побайтово, до какого-либо декодирования — `add_discovered`
+    # отвечает False на уже известный id, не декодируя его
+    assert repository.add_discovered(make_vacancy("1"), "embedded", 9) is False
+    assert repository.add_discovered(make_vacancy("3"), "embedded", 9) is False
     repository.close()
 
     raw = sqlite3.connect(db_path)
@@ -2166,3 +2164,235 @@ def test_manual_status_that_is_not_reported_does_not_invent_a_time(tmp_path: Pat
 
     assert read_column(db_path, "reported_at", "1") is None
     repository.close()
+
+
+# --- I2: ни одна выборка не поднимает в память всё подходящее --------------
+
+
+def _fill_ready(repository: SqliteRepository, count: int) -> None:
+    for index in range(count):
+        repository.add_discovered(make_vacancy(str(index)), "embedded", 9)
+        repository.save_enriched(
+            str(index), VacancyDetails(description="Yocto"), make_score(total=float(index))
+        )
+
+
+def test_unreported_never_returns_more_than_the_limit(repo: SqliteRepository) -> None:
+    """Потолок и порядок вместе: усечён обязан быть ХВОСТ, а не голова.
+
+    Выборка идёт по убыванию оценки, поэтому отложенное потолком — самое
+    низко оценённое, а не случайное. Без этого потолок означал бы, что
+    отчёт теряет непредсказуемую часть вакансий.
+    """
+    _fill_ready(repo, 10)
+    ready = repo.unreported(limit=3)
+    assert [item.discovered.id for item in ready] == ["9", "8", "7"]
+
+
+def test_pending_enrichment_limit_caps_requests_to_hh(repo: SqliteRepository) -> None:
+    """Длина этой выборки И ЕСТЬ число запросов к hh.ru за прогон."""
+    for index in range(10):
+        repo.add_discovered(make_vacancy(str(index)), "embedded", 9)
+    assert len(repo.pending_enrichment(max_attempts=3, limit=4)) == 4
+
+
+def test_pending_scoring_is_capped_but_the_stuck_counter_is_not(repo: SqliteRepository) -> None:
+    """Счётчик застрявших обязан расти и ЗА потолком выборки.
+
+    Иначе `stuck` в журнале упирался бы ровно в `limit` и переставал
+    расти именно там, где беда становится большой, — то есть метрика
+    молчала бы про масштаб той самой аварии, ради которой заведена.
+    """
+    for index in range(10):
+        repo.add_discovered(make_vacancy(str(index)), "embedded", 9)
+        repo.save_description(str(index), VacancyDetails(description="Yocto"))
+    assert len(repo.pending_scoring(limit=4)) == 4
+    assert repo.count_pending_scoring() == 10
+
+
+def test_reported_since_is_capped(repo: SqliteRepository) -> None:
+    _fill_ready(repo, 10)
+    repo.mark_reported([str(index) for index in range(10)])
+    cutoff = datetime.now(UTC) - timedelta(days=7)
+    assert len(repo.reported_since(cutoff, limit=3)) == 3
+
+
+def test_no_selection_is_unbounded_by_default(repo: SqliteRepository) -> None:
+    """Умолчание — тоже потолок, а не «сколько найдётся».
+
+    Вызывающий, забывший про лимит (тест, будущий код, ручная отладка),
+    обязан получить ограниченную выборку: неограниченная существует
+    ровно в том сценарии, где отказ уже случился, и добавляет к нему OOM.
+    """
+    _fill_ready(repo, DEFAULT_BATCH_LIMIT + 1)
+    assert len(repo.unreported()) == DEFAULT_BATCH_LIMIT
+
+
+def test_pending_titles_covers_the_whole_queue_without_a_limit(repo: SqliteRepository) -> None:
+    """Отсев обязан видеть очередь ЦЕЛИКОМ, а не первые `limit` строк.
+
+    Иначе вакансия, вытесненная за границу окна отсева, но попавшая в
+    окно обогащения после чужих отказов, ушла бы в сеть, ни разу не
+    пройдя единственный барьер перед ней. Читаются при этом ровно две
+    колонки — всё, чем живёт решение префильтра.
+    """
+    for index in range(600):
+        repo.add_discovered(make_vacancy(str(index)), "embedded", 9)
+    titles = repo.pending_titles(max_attempts=3)
+    assert len(titles) == 600
+    assert titles[0][1] == "Embedded Linux Engineer"
+
+
+# --- I3: индексы -----------------------------------------------------------
+
+
+@pytest.fixture()
+def db_path(tmp_path: Path) -> str:
+    """Файловая база: индексы и миграция проверяются сырым соединением."""
+    return str(tmp_path / "hh.db")
+
+
+def _indexes(db_path: str) -> set[str]:
+    raw = sqlite3.connect(db_path)
+    rows = raw.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+    ).fetchall()
+    raw.close()
+    return {str(row[0]) for row in rows}
+
+
+REQUIRED_INDEXES = {
+    "idx_vacancy_status",
+    "idx_vacancy_reject",
+    "idx_vacancy_reported",
+    "idx_run_status_finished",
+}
+
+
+def test_fresh_database_gets_every_index(db_path: str) -> None:
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+    assert REQUIRED_INDEXES <= _indexes(db_path)
+
+
+def test_migration_adds_indexes_to_a_base_without_them(db_path: str) -> None:
+    """Механизм миграции обязан уметь добавлять ИНДЕКСЫ, а не только колонки.
+
+    База прошлого поколения индексов не имеет — и не получит их ни от
+    `ALTER TABLE`, ни от `CREATE TABLE IF NOT EXISTS`. Проверяется ровно
+    это: индексы сносятся сырым SQL, и следующий `init_schema()` их
+    возвращает.
+    """
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+    raw = sqlite3.connect(db_path)
+    for name in REQUIRED_INDEXES:
+        raw.execute(f"DROP INDEX {name}")
+    raw.commit()
+    raw.close()
+    assert not (REQUIRED_INDEXES & _indexes(db_path))
+
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+    assert REQUIRED_INDEXES <= _indexes(db_path)
+
+
+def test_index_over_a_migrated_column_does_not_break_the_schema(db_path: str) -> None:
+    """`idx_vacancy_reject` стоит на колонке, которой у старой базы нет.
+
+    Порядок «сначала schema.sql, потом ALTER» ронял бы весь
+    `executescript` на «no such column: reject_code» — и база оставалась
+    бы вообще без таблиц `run` и `http_cache`, идущих в файле ниже.
+    Здесь воспроизведена именно такая база: колонка удалена, индекс — нет.
+    """
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+    raw = sqlite3.connect(db_path)
+    raw.execute("DROP INDEX idx_vacancy_reject")
+    raw.execute("ALTER TABLE vacancy DROP COLUMN reject_code")
+    raw.commit()
+    raw.close()
+
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+        repository.add_discovered(make_vacancy("1"), "embedded", 9)
+        repository.mark_rejected("1", "стоп-слово", REJECT_CODE_PREFILTER)
+        assert repository.rejected_by_prefilter() == [("1", "Embedded Linux Engineer")]
+    assert REQUIRED_INDEXES <= _indexes(db_path)
+
+
+def test_applying_the_schema_twice_changes_nothing(db_path: str) -> None:
+    """Идемпотентность: миграция запускается КАЖДЫМ стартом сервиса."""
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+        first = _indexes(db_path)
+        repository.init_schema()
+        repository.init_schema()
+    assert _indexes(db_path) == first
+
+
+@pytest.mark.parametrize(
+    ("sql", "params", "index"),
+    [
+        (
+            "SELECT finished_at FROM run WHERE status IN ('ok', 'partial') "
+            "AND finished_at IS NOT NULL ORDER BY finished_at DESC",
+            (),
+            "idx_run_status_finished",
+        ),
+        (
+            "UPDATE run SET status = 'interrupted' WHERE status = 'running'",
+            (),
+            "idx_run_status_finished",
+        ),
+        (
+            "SELECT id FROM vacancy WHERE status = 'rejected' AND reject_code = 'prefilter'",
+            (),
+            "idx_vacancy_reject",
+        ),
+        (
+            "SELECT id FROM vacancy WHERE status = 'reported' AND reported_at >= '2026-01-01'",
+            (),
+            "idx_vacancy_reported",
+        ),
+    ],
+)
+def test_the_hot_queries_stop_scanning_the_table(
+    db_path: str, sql: str, params: tuple[object, ...], index: str
+) -> None:
+    """План запроса, а не время: время шумит, план — факт.
+
+    `SCAN` в плане означает полный обход таблицы, которая растёт вечно
+    (журнал — шесть строк в сутки, отправленные — без границы вовсе).
+    """
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+    raw = sqlite3.connect(db_path)
+    plan = " ".join(str(row[3]) for row in raw.execute(f"EXPLAIN QUERY PLAN {sql}", params))
+    raw.close()
+    assert index in plan, plan
+    assert "SCAN" not in plan, plan
+
+
+# --- M10: перестроение таблицы не оставляет за собой удвоенный файл --------
+
+
+def test_rebuild_returns_the_freed_pages_to_the_file(tmp_path: Path) -> None:
+    """`DROP TABLE` в SQLite не уменьшает файл — страницы уходят в freelist.
+
+    Перестроение поэтому удваивало базу навсегда (замер: 1.66 ГБ до,
+    3.31 ГБ после на 400 000 строк), и вторая половина не использовалась
+    ничем. Проверяется freelist, а не размер файла: он — сам факт, а не
+    его следствие, и не шумит от размера страницы.
+    """
+    db_path = str(tmp_path / "big.db")
+    _first_generation_with_rows(db_path, rows=2000)
+    with SqliteRepository(db_path) as repository:
+        repository.init_schema()
+
+    raw = sqlite3.connect(db_path)
+    free = raw.execute("PRAGMA freelist_count").fetchone()[0]
+    rows = raw.execute("SELECT COUNT(*) FROM vacancy").fetchone()[0]
+    raw.close()
+    assert rows == 2000, "перелив обязан сохранить все строки"
+    assert free == 0, f"после перестроения в файле осталось {free} свободных страниц"

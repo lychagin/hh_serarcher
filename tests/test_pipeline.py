@@ -3,6 +3,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,6 +22,14 @@ from hh_search.scoring.base import Scorer
 from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sinks.base import Sink
 from hh_search.sources.http import PoliteClient
+from hh_search.storage.base import (
+    REJECT_CODE_ENRICH_FAILED,
+    REJECT_CODE_PREFILTER,
+    STATUS_NEW,
+    STATUS_REJECTED,
+    STATUS_REPORTED,
+    Repository,
+)
 from hh_search.storage.repository import SqliteRepository
 from hh_search.storage.run_log import ALLOWED_RUN_COUNTERS
 from tests.test_config import APP_YAML, PROFILE_YAML, write_config
@@ -1354,3 +1363,410 @@ def test_listing_request_carries_the_stored_validators(
     headers = listing_route.calls.last.request.headers
     assert headers["If-None-Match"] == '"v1"'
     assert headers["If-Modified-Since"] == "Wed, 01 Jul 2026 00:00:00 GMT"
+
+
+# --- I1: `Repository` как настоящая точка расширения (спека §4.2) ----------
+#
+# Спека обещает, что `PostgresRepository` не потребует правок в конвейере.
+# До появления `storage/base.py` обещание было неисполнимым по типам:
+# конвейер был аннотирован конкретным `SqliteRepository`, и `mypy --strict`
+# — часть ворот проекта — отвергал ЛЮБУЮ альтернативную реализацию, как бы
+# безупречно та ни работала в рантайме:
+#
+#     error: Argument 3 to "run_once" has incompatible type "MemoryRepository";
+#            expected "SqliteRepository"
+#
+# Поэтому проверка здесь двойная и обе половины обязательны. Рантайм —
+# полный прогон на реализации, у которой нет ни строчки SQL. Типы — сам
+# факт, что этот файл проходит `mypy --strict`: вызов `run_once` ниже
+# передаёт `MemoryRepository` туда, где объявлен протокол, и `_as_protocol`
+# фиксирует совместимость явно.
+
+
+@dataclass
+class _MemoryRow:
+    discovered: DiscoveredVacancy
+    cluster: str
+    weight: int
+    status: str = STATUS_NEW
+    details: VacancyDetails | None = None
+    score: ScoreBreakdown | None = None
+    attempts: int = 0
+    reject_code: str | None = None
+    reported_at: datetime | None = None
+
+
+class MemoryRepository:
+    """Хранилище целиком в `dict` — альтернативная реализация протокола.
+
+    Написана ради одного вопроса: правда ли конвейер зависит только от
+    интерфейса. Никакого SQL, никакого sqlite3, никакого файла.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, _MemoryRow] = {}
+        self.cache: dict[str, tuple[str | None, str | None]] = {}
+        self.runs: list[dict[str, object]] = []
+
+    # --- discovery ---------------------------------------------------
+
+    def add_discovered(self, vacancy: DiscoveredVacancy, cluster: str, weight: int) -> bool:
+        row = self.rows.get(vacancy.id)
+        if row is None:
+            self.rows[vacancy.id] = _MemoryRow(vacancy, cluster, weight)
+            return True
+        if weight > row.weight:
+            row.cluster, row.weight = cluster, weight
+        return False
+
+    def cache_headers(self, url: str) -> dict[str, str]:
+        etag, modified = self.cache.get(url, (None, None))
+        headers = {}
+        if etag:
+            headers["If-None-Match"] = etag
+        if modified:
+            headers["If-Modified-Since"] = modified
+        return headers
+
+    def save_cache_headers(self, url: str, etag: str | None, last_modified: str | None) -> None:
+        self.cache[url] = (etag, last_modified)
+
+    def reset_cache(self, url: str) -> None:
+        self.cache.pop(url, None)
+
+    # --- префильтр -----------------------------------------------------
+
+    def _queue(self, max_attempts: int) -> list[_MemoryRow]:
+        return [
+            row
+            for row in self.rows.values()
+            if row.status == STATUS_NEW and row.details is None and row.attempts < max_attempts
+        ]
+
+    def pending_titles(self, max_attempts: int) -> list[tuple[str, str]]:
+        return [(row.discovered.id, row.discovered.title) for row in self._queue(max_attempts)]
+
+    def mark_rejected(self, vacancy_id: str, reason: str, code: str) -> None:
+        row = self.rows[vacancy_id]
+        row.status, row.reject_code = STATUS_REJECTED, code
+
+    def rejected_by_prefilter(self) -> list[tuple[str, str]]:
+        return [
+            (row.discovered.id, row.discovered.title)
+            for row in self.rows.values()
+            if row.status == STATUS_REJECTED and row.reject_code == REJECT_CODE_PREFILTER
+        ]
+
+    def requeue_prefiltered(self, ids: Sequence[str]) -> int:
+        returned = 0
+        for vacancy_id in ids:
+            row = self.rows[vacancy_id]
+            if row.status == STATUS_REJECTED and row.reject_code == REJECT_CODE_PREFILTER:
+                row.status, row.reject_code, row.attempts = STATUS_NEW, None, 0
+                returned += 1
+        return returned
+
+    # --- обогащение ----------------------------------------------------
+
+    def pending_enrichment(self, max_attempts: int, limit: int) -> list[DiscoveredVacancy]:
+        return [row.discovered for row in self._queue(max_attempts)][:limit]
+
+    def bump_enrich_attempt(self, vacancy_id: str, max_attempts: int) -> int:
+        row = self.rows[vacancy_id]
+        row.attempts += 1
+        if row.attempts >= max_attempts and row.status == STATUS_NEW:
+            row.status, row.reject_code = STATUS_REJECTED, REJECT_CODE_ENRICH_FAILED
+        return row.attempts
+
+    def save_description(self, vacancy_id: str, details: VacancyDetails) -> None:
+        self.rows[vacancy_id].details = details
+
+    def save_enriched(
+        self, vacancy_id: str, details: VacancyDetails, score: ScoreBreakdown
+    ) -> None:
+        row = self.rows[vacancy_id]
+        row.details, row.score = details, score
+
+    def stalled_by_attempts(self, max_attempts: int) -> int:
+        return sum(
+            1
+            for row in self.rows.values()
+            if row.status == STATUS_NEW and row.details is None and row.attempts >= max_attempts
+        )
+
+    def stalled_rows_hint(self, max_attempts: int) -> str:
+        return f"MemoryRepository.rows: status=new, details=None, attempts >= {max_attempts}"
+
+    # --- пересчёт ------------------------------------------------------
+
+    def _unscored(self) -> list[_MemoryRow]:
+        return [
+            row
+            for row in self.rows.values()
+            if row.status == STATUS_NEW and row.details is not None and row.score is None
+        ]
+
+    def pending_scoring(self, limit: int) -> list[tuple[DiscoveredVacancy, VacancyDetails]]:
+        tasks = []
+        for row in self._unscored()[:limit]:
+            assert row.details is not None
+            tasks.append((row.discovered, row.details))
+        return tasks
+
+    def count_pending_scoring(self) -> int:
+        return len(self._unscored())
+
+    def save_score(self, vacancy_id: str, score: ScoreBreakdown) -> None:
+        self.rows[vacancy_id].score = score
+
+    # --- отчёт ---------------------------------------------------------
+
+    def unreported(self, limit: int) -> list[ScoredVacancy]:
+        ready = [
+            row
+            for row in self.rows.values()
+            if row.status == STATUS_NEW and row.details is not None and row.score is not None
+        ]
+        ready.sort(key=lambda row: row.score.total if row.score else 0.0, reverse=True)
+        result = []
+        for row in ready[:limit]:
+            assert row.details is not None and row.score is not None
+            result.append(
+                ScoredVacancy(
+                    discovered=row.discovered,
+                    details=row.details,
+                    score=row.score,
+                    cluster=row.cluster,
+                )
+            )
+        return result
+
+    def mark_reported(self, ids: Sequence[str]) -> None:
+        for vacancy_id in ids:
+            row = self.rows[vacancy_id]
+            row.status, row.reported_at = STATUS_REPORTED, datetime.now(UTC)
+
+    # --- журнал --------------------------------------------------------
+
+    def start_run(self) -> int:
+        self.runs.append({"status": "running"})
+        return len(self.runs)
+
+    def finish_run(
+        self,
+        run_id: int,
+        status: str,
+        *,
+        finished_at: datetime | None = None,
+        **counters: int | str | None,
+    ) -> None:
+        self.runs[run_id - 1] = {"status": status, "finished_at": finished_at, **counters}
+
+    def corrupted_count(self) -> int:
+        return 0
+
+
+def _as_protocol(repo: Repository) -> Repository:
+    """Совместимость с протоколом, зафиксированная для `mypy --strict`."""
+    return repo
+
+
+@respx.mock
+def test_run_once_accepts_any_repository(config: Config) -> None:
+    """Прогон целиком на реализации без единой строчки SQL.
+
+    Дифференциально проверено на FIX_BASE: рантайм проходил там ТОЖЕ (в
+    том и была коварность находки), а `mypy --strict` отвергал вызов
+    `run_once` с этим типом. Значит зелёный рантайм здесь ничего бы не
+    доказал в одиночку — доказательством служит пара «этот тест проходит»
+    и «этот файл проходит `mypy --strict`».
+    """
+    mock_source(TWO_ENRICHABLE)
+    repo = MemoryRepository()
+    sink = RecordingSink()
+
+    with make_client(config) as client:
+        stats = run_once(config, client, repo, KeywordScorer(config.profile), [sink], NOW)
+
+    assert _as_protocol(repo) is repo
+    assert stats.status == "ok"
+    assert (stats.discovered, stats.new_count, stats.enriched, stats.reported) == (2, 2, 2, 2)
+    assert sorted(sink.seen) == ["111", "222"]
+    assert all(row.status == STATUS_REPORTED for row in repo.rows.values())
+    assert repo.runs[0]["status"] == "ok"
+
+
+# --- M3: `discovered` считал одну вакансию дважды -------------------------
+
+
+@respx.mock
+def test_a_vacancy_repeated_on_the_next_page_is_counted_once(tmp_path: Path) -> None:
+    """Пагинация hh.ru сдвигается между запросами — повтор на границе обычен.
+
+    Выдача живая: пока идёт обход, вакансии добавляются и снимаются, и та
+    же запись съезжает со страницы 0 на страницу 1. `parse_listing` ловит
+    повтор только ВНУТРИ страницы, поэтому `discovered` считал одну
+    вакансию дважды. `new_count` при этом всегда был верен, из-за чего
+    расхождение выглядело как «нашли двоих, новый один» — то есть как
+    нормальная работа дедупликации, а не как ошибка счёта.
+    """
+    config = load_config(
+        write_config(tmp_path, **{"queries.yaml": ONE_PAGE.replace("pages: 1", "pages: 2")})
+    )
+    repository = SqliteRepository(":memory:")
+    repository.init_schema()
+    pages = {
+        LISTING_URL: listing_html(("111", "Senior Embedded Engineer")),
+        f"{LISTING_URL}?page=1": listing_html(
+            ("111", "Senior Embedded Engineer"), ("222", "Middle Python Developer")
+        ),
+    }
+    mock_robots()
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+    respx.get(url__startswith=LISTING_URL).mock(
+        side_effect=lambda request: httpx.Response(200, text=pages[str(request.url)])
+    )
+
+    stats = run(config, repository, [RecordingSink()])
+
+    assert (stats.discovered, stats.new_count) == (2, 2)
+
+
+@respx.mock
+def test_the_same_vacancy_in_two_listings_is_two_findings(tmp_path: Path) -> None:
+    """Контроль: дедупликация — на листинг, а не на прогон.
+
+    Две находки одной вакансии двумя разными запросами — это факт о
+    вакансии, и именно он решает, какой кластер ей достанется (побеждает
+    больший `weight`). Схлопнув их, `discovered` перестал бы отвечать на
+    вопрос «сколько раз мы её встретили».
+    """
+    two_listings = """
+queries:
+  - slug: programmist
+    cluster: embedded
+    weight: 9
+    pages: 1
+  - slug: devops
+    cluster: backend
+    weight: 3
+    pages: 1
+"""
+    config = load_config(write_config(tmp_path, **{"queries.yaml": two_listings}))
+    repository = SqliteRepository(":memory:")
+    repository.init_schema()
+    mock_robots()
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+    respx.get(url__startswith="https://hh.ru/vacancies/").mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            text=listing_html(
+                ("111", "Senior Embedded Engineer"), slug=str(request.url).rsplit("/", 1)[-1]
+            ),
+        )
+    )
+
+    stats = run(config, repository, [RecordingSink()])
+
+    assert (stats.discovered, stats.new_count) == (2, 1)
+
+
+# --- M7: пустой хвост пагинации рядом с 304 — не отказ прогона -------------
+
+
+@respx.mock
+def test_an_empty_tail_next_to_a_304_does_not_fail_the_run(tmp_path: Path) -> None:
+    """`pages: 2`, страница 0 — `304`, страница 1 — пустой хвост.
+
+    Сторож «отдал страницы, вакансий ноль» помечал такой прогон `failed`,
+    хотя источник демонстративно жив: он ответил `304`, то есть страницу
+    узнал и сказал «не изменилась». `failed` красит healthcheck, и цена
+    ошибки тут — красный индикатор на исправном сервисе.
+
+    Дрейф формата этой веткой не прячется: он отказывает РАЗБОРОМ, а
+    отказ разбора сбрасывает валидатор, поэтому следующий прогон получает
+    полный ответ, `unchanged` становится нулём и сторож срабатывает.
+    """
+    config = load_config(
+        write_config(tmp_path, **{"queries.yaml": ONE_PAGE.replace("pages: 1", "pages: 2")})
+    )
+    repository = SqliteRepository(":memory:")
+    repository.init_schema()
+    repository.save_cache_headers(LISTING_URL, '"v1"', None)
+    mock_robots()
+    respx.get(url__startswith=LISTING_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(304)
+            if str(request.url) == LISTING_URL
+            else httpx.Response(200, text=listing_html())
+        )
+    )
+
+    stats = run(config, repository, [RecordingSink()])
+
+    assert (stats.status, stats.discovered) == ("ok", 0)
+
+
+@respx.mock
+def test_without_a_304_an_empty_listing_still_fails_the_run(config: Config) -> None:
+    """Контроль: ослабление сторожа не затронуло случай, ради которого он есть."""
+    repository = SqliteRepository(":memory:")
+    repository.init_schema()
+    mock_robots()
+    respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(200, text=listing_html())
+    )
+
+    stats = run(config, repository, [RecordingSink()])
+
+    assert stats.status == "failed"
+
+
+# --- I2: потолок работы прогона доезжает до сети и до отсева ---------------
+
+
+@respx.mock
+def test_enrich_per_run_caps_requests_to_vacancy_pages(tmp_path: Path) -> None:
+    """Потолок обогащения — это прямой потолок запросов к hh.ru за прогон.
+
+    Без него накопленный бэклог означал прогон длиной в часы: замер на
+    50 листингах по 20 страниц — 20 990 запросов и 5.8 ч одних только
+    пауз вежливости при `interval_hours: 4`.
+    """
+    app_yaml = APP_YAML.replace(
+        "enrich:\n  max_attempts: 3\n", "enrich:\n  max_attempts: 3\nlimits:\n  enrich_per_run: 1\n"
+    )
+    config = load_config(write_config(tmp_path, **{"app.yaml": app_yaml, "queries.yaml": ONE_PAGE}))
+    repository = SqliteRepository(":memory:")
+    repository.init_schema()
+    _, _, page_route = mock_source(TWO_ENRICHABLE)
+
+    stats = run(config, repository, [RecordingSink()])
+
+    assert len(page_route.calls) == 1
+    assert stats.enriched == 1
+    # Отложенное не потеряно: следующий прогон возьмёт вторую вакансию.
+    assert len(repository.pending_enrichment(max_attempts=3, limit=10)) == 1
+
+
+@respx.mock
+def test_prefilter_still_covers_the_queue_beyond_the_enrich_ceiling(tmp_path: Path) -> None:
+    """Отсев обязан пройти по ВСЕЙ очереди, а не по окну обогащения.
+
+    Иначе вакансия, не поместившаяся в окно отсева, но попавшая в окно
+    обогащения после чужих отказов, ушла бы в сеть, ни разу не пройдя
+    единственный барьер перед ней. Здесь потолок обогащения — одна
+    вакансия, а стоп-слово стоит у второй.
+    """
+    app_yaml = APP_YAML.replace(
+        "enrich:\n  max_attempts: 3\n", "enrich:\n  max_attempts: 3\nlimits:\n  enrich_per_run: 1\n"
+    )
+    config = load_config(write_config(tmp_path, **{"app.yaml": app_yaml, "queries.yaml": ONE_PAGE}))
+    repository = SqliteRepository(":memory:")
+    repository.init_schema()
+    mock_source(TWO_VACANCIES)  # у второй вакансии в заголовке «Junior»
+
+    stats = run(config, repository, [RecordingSink()])
+
+    assert stats.rejected == 1
+    assert [vacancy_id for vacancy_id, _ in repository.rejected_by_prefilter()] == ["222"]

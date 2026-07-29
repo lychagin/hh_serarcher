@@ -140,3 +140,37 @@ def test_build_rss_url_omits_unset_filters() -> None:
     url = build_rss_url(RssQuery(text="Yocto"))
     assert "area=" not in url
     assert "schedule=" not in url
+
+
+# --- M2: разбор id ужесточён ровно так же, как в листинге ------------------
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://hh.ru/vacancy/0123456",
+        "https://hh.ru/vacancy/1234567890123456789012345",
+        "https://hh.ru/search/vacancy?text=/vacancy/123",
+        "https://hh.ru/vacancy/123/responses",
+    ],
+)
+def test_feed_link_that_is_not_a_vacancy_url_is_skipped(link: str) -> None:
+    """Ужесточение, сделанное для листинга, обязано действовать и здесь.
+
+    Здесь была своя копия регулярки — `/vacancy/(\\d+)` через `search()`.
+    Ведущий нуль давал вторую строку в базе для той же вакансии (ключ
+    текстовый), `\\d+` принимал четырёхсотзначное число, а `search` без
+    якорей находил id в query-строке и в хвосте пути. Модуль выключен
+    запретом robots.txt, но объявлен готовым к восстановлению — то есть
+    восстановление вернуло бы вместе с собой и старый баг.
+    """
+    xml_text = f"""<rss version="2.0"><channel>
+        <item><link>{link}</link>
+        <pubDate>2026-07-27T09:00:00+03:00</pubDate>
+        <title>Вакансия</title><description>Регион: Москва</description></item>
+        <item><link>https://hh.ru/vacancy/123456789</link>
+        <pubDate>2026-07-27T09:00:00+03:00</pubDate>
+        <title>Вакансия</title><description>Регион: Москва</description></item>
+    </channel></rss>"""
+    vacancies = parse_feed(xml_text, "Yocto")
+    assert [vacancy.id for vacancy in vacancies] == ["123456789"]

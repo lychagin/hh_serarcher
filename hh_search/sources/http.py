@@ -66,8 +66,14 @@ def _product_tokens(user_agent: str) -> set[str]:
     return tokens
 
 
-def normalize(url: str) -> str:
+def normalize_url(url: str) -> str:
     """URL в том виде, в каком его отправит httpx (RFC 3986 §6.2).
+
+    Имя с суффиксом `_url` не для красоты: голым `normalize` в этом
+    проекте уже называется схлопывание омоглифов в `filtering/matching.py`
+    (`«1С» -> «1c»`), и оба экспортировались и вызывались по имени. Две
+    публичные функции с одинаковым именем и несовпадающим смыслом — это
+    приглашение импортировать не ту.
 
     Единственная точка нормализации в модуле, и вызывается она ДО проверки
     robots.txt. Причина — расхождение по построению: `httpx` перед
@@ -265,7 +271,7 @@ class PoliteClient:
         # методу и матчер, и `self._client.get` видят одну и ту же строку,
         # поэтому щель между «что проверили» и «что ушло» закрыта по
         # построению, а не дисциплиной каждой новой точки входа в URL.
-        url = normalize(url)
+        url = normalize_url(url)
         self._check_robots(url)
         last_error: Exception | None = None
         last_attempt = self._config.max_retries - 1
@@ -340,7 +346,7 @@ class PoliteClient:
     def _check_robots(self, url: str) -> None:
         """Проверяет НОРМАЛИЗОВАННЫЙ URL по robots.txt его хоста.
 
-        На вход обязан приходить результат `normalize()` — то есть ровно та
+        На вход обязан приходить результат `normalize_url()` — то есть ровно та
         строка, которую отправит httpx. Проверять что-либо иное значит
         выносить вердикт не о том запросе, который уйдёт в сеть.
 

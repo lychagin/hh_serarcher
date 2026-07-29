@@ -33,7 +33,10 @@
 улика, а незавершённая работа.
 """
 
+import logging
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 # (таблица, колонка, определение) — только те колонки, что появлялись
 # после первой версии схемы. Порядок не важен: каждая строка
@@ -114,18 +117,43 @@ def apply_schema(connection: sqlite3.Connection, schema_sql: str) -> None:
     посреди перестроения, и первым делом надо доиграть ЕГО работу.
     """
     detached = _resume_or_detach(connection)
+    _add_missing_columns(connection)
     connection.executescript(schema_sql)
     if detached:
         _refill_from_legacy(connection)
-    for table, column, definition in ADDED_COLUMNS:
-        if column not in _columns(connection, table):
-            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     # Идемпотентно: заполняют только пустые значения, повторный прогон не
-    # находит их и не делает ничего. Выполняются после ALTER — на этот
+    # находит их и не делает ничего. Выполняются последними — на этот
     # момент все участвующие колонки заведомо существуют.
     connection.execute(_BACKFILL_PRIMARY_QUERY)
     connection.execute(_BACKFILL_REJECT_CODE)
     connection.commit()
+    if detached:
+        _reclaim_space(connection)
+
+
+def _add_missing_columns(connection: sqlite3.Connection) -> None:
+    """`ALTER TABLE ... ADD COLUMN` для всего, чего в базе ещё нет.
+
+    Стоит ДО `schema.sql`, и это не перестановка ради вкуса. Тот файл
+    заводит не только таблицы, но и индексы, а индекс может стоять на
+    колонке, которой у мигрирующей базы ещё нет: `idx_vacancy_reject`
+    смотрит на `reject_code`, а он появляется как раз здесь. В прежнем
+    порядке (сначала schema.sql, потом ALTER) первый же
+    `CREATE INDEX ... (status, reject_code)` ронял ВЕСЬ `executescript` на
+    «no such column», и база оставалась без остальных таблиц. Новый
+    порядок снимает это правило целиком: к моменту `schema.sql` все
+    колонки на месте, и о поколении каждой из них помнить больше не надо.
+
+    Проверка существования таблицы обязательна именно из-за нового
+    порядка: на пустой базе таблиц ещё нет вовсе (их создаст schema.sql
+    строкой ниже — уже со всеми колонками), а во время перестроения
+    `vacancy` отодвинута в сторону. И то, и другое — «добавлять нечего»,
+    а не ошибка.
+    """
+    existing = _tables(connection)
+    for table, column, definition in ADDED_COLUMNS:
+        if table in existing and column not in _columns(connection, table):
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _resume_or_detach(connection: sqlite3.Connection) -> bool:
@@ -207,6 +235,36 @@ def _refill_from_legacy(connection: sqlite3.Connection) -> None:
         raise RuntimeError(f"миграция vacancy порвала внешние ключи: {broken!r}")
     connection.commit()
     connection.execute("PRAGMA foreign_keys=ON")
+
+
+def _reclaim_space(connection: sqlite3.Connection) -> None:
+    """Вернуть системе место, занятое отодвинутой таблицей.
+
+    `DROP TABLE` в SQLite не уменьшает файл: страницы попадают в
+    freelist и остаются в нём до `VACUUM`. Перестроение поэтому
+    удваивает базу навсегда — замер на 400 000 строк: 1.66 ГБ до
+    миграции, 3.31 ГБ после, и вторая половина не используется ничем.
+
+    Требование к свободному месту названо честно: `VACUUM` пишет копию
+    базы рядом, то есть на пике нужен ЕЩЁ один размер файла. На реальном
+    масштабе этого сервиса (~2.83 КБ на вакансию, ~85 МБ в год) речь идёт
+    о десятках мегабайт, и платить их один раз за жизнь базы дешевле, чем
+    носить удвоенный файл вечно.
+
+    Отказ здесь не аварийный: миграция к этому моменту завершена и
+    закоммичена, освобождение места — уборка. Уронить сервис из-за того,
+    что на томе не нашлось места под временную копию, значило бы сделать
+    уборку опаснее беспорядка.
+    """
+    try:
+        connection.execute("VACUUM")
+    except sqlite3.Error as error:
+        logger.warning(
+            "VACUUM после перестроения таблицы не выполнен (%s): миграция завершена и "
+            "корректна, но файл базы остался примерно вдвое больше нужного — место "
+            "вернёт любой следующий VACUUM",
+            error,
+        )
 
 
 def _tables(connection: sqlite3.Connection) -> set[str]:

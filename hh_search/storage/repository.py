@@ -1,6 +1,6 @@
 import logging
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -11,6 +11,15 @@ from hh_search.domain.models import (
     ScoredVacancy,
     VacancyDetails,
 )
+from hh_search.storage.base import (
+    DEFAULT_BATCH_LIMIT,
+    REJECT_CODE_ENRICH_FAILED,
+    REJECT_CODE_PREFILTER,
+    REJECT_ENRICH_FAILED,
+    STATUS_NEW,
+    STATUS_REJECTED,
+    STATUS_REPORTED,
+)
 from hh_search.storage.mappers import to_discovered, to_id_and_title, to_scored, to_scoring_task
 from hh_search.storage.migrations import apply_schema
 from hh_search.storage.quarantine import Quarantine, safe_rows
@@ -19,26 +28,21 @@ from hh_search.storage.time_utils import now_iso, to_utc_iso, to_utc_iso_optiona
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
-STATUS_NEW = "new"
-STATUS_REJECTED = "rejected"
-STATUS_REPORTED = "reported"
-
-# Машинные коды причины отказа — колонка `reject_code`, отдельная от
-# человекочитаемого `reject_reason`. Разведены они не ради красоты:
-# отказ префильтра обратим (решение о нём локальное, и правка конфига
-# обязана его отменять), а исчерпание попыток скачивания — нет. Выбирать
-# обратимые строки разбором текста причины нельзя: текст префильтра
-# перечисляет совпавшие стоп-слова и будет меняться, а разъехавшийся
-# префикс молча изменил бы множество возвращаемых вакансий — ровно тот
-# класс тихого отказа, против которого написан весь остальной модуль.
-REJECT_CODE_PREFILTER = "prefilter"
-REJECT_CODE_ENRICH_FAILED = "enrich_failed"
-
-# Текст причины при исчерпании попыток скачивания (спека §5.2). Ставится
-# внутри `bump_enrich_attempt`, тем же UPDATE, что и счётчик, и совпадает
-# с кодом: этому отказу нечего добавить к коду, тогда как причина
-# префильтра перечисляет слова и потому от кода отличается.
-REJECT_ENRICH_FAILED = REJECT_CODE_ENRICH_FAILED
+# Коды и статусы переехали в `storage/base.py`, к протоколу: их называет
+# конвейер, и импортировать ради константы модуль, в котором живёт SQL,
+# значит держать в нём зависимость от реализации хранилища. Здесь они
+# перечислены заново только затем, чтобы прежние импорты
+# `from ...repository import REJECT_CODE_PREFILTER` не сломались.
+__all__ = [
+    "REJECT_CODE_ENRICH_FAILED",
+    "REJECT_CODE_PREFILTER",
+    "REJECT_ENRICH_FAILED",
+    "SCHEMA_PATH",
+    "STATUS_NEW",
+    "STATUS_REJECTED",
+    "STATUS_REPORTED",
+    "SqliteRepository",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -122,16 +126,6 @@ class SqliteRepository:
         apply_schema(self._connection, SCHEMA_PATH.read_text(encoding="utf-8"))
 
     # --- discovery -----------------------------------------------------
-
-    def known_ids(self, ids: Iterable[str]) -> set[str]:
-        wanted = list(ids)
-        if not wanted:
-            return set()
-        placeholders = ",".join("?" * len(wanted))
-        rows = self._connection.execute(
-            f"SELECT id FROM vacancy WHERE id IN ({placeholders})", wanted
-        )
-        return {row["id"] for row in rows}
 
     def add_discovered(self, vacancy: DiscoveredVacancy, cluster: str, weight: int) -> bool:
         cursor = self._connection.execute(
@@ -244,8 +238,51 @@ class SqliteRepository:
 
     # --- 1: обогащение, единственная выборка, ходящая в сеть -------------
 
-    def pending_enrichment(self, max_attempts: int) -> list[DiscoveredVacancy]:
+    # Предикат очереди обогащения. Один текст на две выборки — полную
+    # (`pending_enrichment`) и дешёвую, из двух колонок (`pending_titles`):
+    # они обязаны отбирать РОВНО одно множество, иначе префильтр судит не
+    # о тех строках, которые пойдут в сеть.
+    _PENDING_WHERE_SQL = (
+        "WHERE status = ? AND description IS NULL "
+        "AND CAST(COALESCE(enrich_attempts, 0) AS INTEGER) < ? "
+        "ORDER BY COALESCE(published_at, first_seen_at) DESC"
+    )
+
+    def pending_titles(self, max_attempts: int) -> list[tuple[str, str]]:
+        """`(id, заголовок)` всей очереди обогащения — всё, чем живёт отсев.
+
+        Префильтр принимает решение по одному заголовку (`Prefilter.
+        reason_for_title`), поэтому строить ради него `DiscoveredVacancy`
+        из одиннадцати колонок незачем — а на бэклоге это была самая
+        дорогая выборка шага, не ходящего в сеть вовсе.
+
+        Лимита здесь нет СОЗНАТЕЛЬНО, и это не забывчивость. Отсев обязан
+        накрывать очередь целиком: если бы он видел только первые
+        `limit` строк, то правка `negative` доставала бы бэклог по кусочку,
+        а главное — вакансии, вытесненные за границу окна отсева, но
+        попавшие в окно обогащения после отказов, ушли бы в сеть, ни разу
+        не пройдя единственный барьер перед ней. Цена ограничена формой
+        строки: две короткие колонки вместо модели с зарплатой и датами.
+        """
+        rows = self._connection.execute(
+            f"SELECT CAST(id AS BLOB) AS id, CAST(title AS BLOB) AS title FROM vacancy "
+            f"{self._PENDING_WHERE_SQL}",
+            (STATUS_NEW, max_attempts),
+        ).fetchall()
+        return safe_rows(rows, to_id_and_title, self._quarantine)
+
+    def pending_enrichment(
+        self, max_attempts: int, limit: int = DEFAULT_BATCH_LIMIT
+    ) -> list[DiscoveredVacancy]:
         """Очередь обогащения — единственная выборка, ходящая в сеть.
+
+        `limit` здесь не про память, а про нагрузку на источник: длина
+        этой выборки И ЕСТЬ число запросов к hh.ru за прогон. Без него
+        накопленный бэклог означал прогон длиной в часы (замер: 50
+        листингов по 20 страниц — 20 990 запросов и 5.8 ч одних только
+        пауз вежливости при `interval_hours: 4`, то есть демон работает
+        встык, без пауз между прогонами). Порядок выборки — свежие
+        первыми, поэтому потолок откладывает старое, а не теряет его.
 
         `CAST(COALESCE(enrich_attempts, 0) AS INTEGER)`, а не голая
         колонка: у SQLite типы динамические, и текст в этой колонке
@@ -260,11 +297,8 @@ class SqliteRepository:
         поэтому вечного цикла из этого не выходит.
         """
         rows = self._connection.execute(
-            f"SELECT {_DISCOVERED_COLUMNS_SQL} FROM vacancy "
-            "WHERE status = ? AND description IS NULL "
-            "AND CAST(COALESCE(enrich_attempts, 0) AS INTEGER) < ? "
-            "ORDER BY COALESCE(published_at, first_seen_at) DESC",
-            (STATUS_NEW, max_attempts),
+            f"SELECT {_DISCOVERED_COLUMNS_SQL} FROM vacancy {self._PENDING_WHERE_SQL} LIMIT ?",
+            (STATUS_NEW, max_attempts, limit),
         ).fetchall()
         return safe_rows(rows, to_discovered, self._quarantine)
 
@@ -429,6 +463,21 @@ class SqliteRepository:
         ).fetchone()
         return int(row["stalled"]) if row else 0
 
+    def stalled_rows_hint(self, max_attempts: int) -> str:
+        """Чем человек найдёт эти строки в ЭТОМ хранилище.
+
+        Метод, а не строка в тексте лога конвейера, — и это не педантизм.
+        Совет был написан SQL'ем прямо в `pipeline/enrichment.py`, то есть
+        вне единственного слоя, знающего про SQL (§4.3): первая же правка
+        схемы протухала бы молча, а `PostgresRepository` из §4.2 подсказал
+        бы человеку запрос к чужой базе. Предикат здесь тот же, что у
+        `stalled_by_attempts` строкой выше, — разойтись им нечем.
+        """
+        return (
+            "SELECT id FROM vacancy WHERE status='new' AND description IS NULL "
+            f"AND enrich_attempts >= {max_attempts}"
+        )
+
     def corrupted_count(self) -> int:
         """Сколько строк ушло в терминальный карантин за жизнь этого объекта.
 
@@ -515,21 +564,48 @@ class SqliteRepository:
 
     # --- 2: пересчёт оценки, сеть не задействуется -----------------------
 
-    def pending_scoring(self) -> list[tuple[DiscoveredVacancy, VacancyDetails]]:
+    def pending_scoring(
+        self, limit: int = DEFAULT_BATCH_LIMIT
+    ) -> list[tuple[DiscoveredVacancy, VacancyDetails]]:
         """Описание есть, оценки нет: пересчитать локально.
 
         Ровно та щель, через которую вакансия раньше проваливалась мимо
         обеих выборок, — теперь это явное состояние со своей очередью, а
         не повод идти за уже скачанной страницей второй раз.
+
+        Строки здесь несут описание, то есть по памяти стоят столько же,
+        сколько `unreported()`; отсюда тот же `limit`. Считать застрявших
+        по длине этой выборки поэтому нельзя — для счётчика `stuck` есть
+        `count_pending_scoring()`, который не декодирует ни одного
+        значения и не зависит от потолка.
         """
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
             "CAST(valid_through AS BLOB) AS valid_through "
             "FROM vacancy WHERE status = ? AND description IS NOT NULL "
-            "AND score_detail IS NULL ORDER BY COALESCE(published_at, first_seen_at) DESC",
-            (STATUS_NEW,),
+            "AND score_detail IS NULL ORDER BY COALESCE(published_at, first_seen_at) DESC "
+            "LIMIT ?",
+            (STATUS_NEW, limit),
         ).fetchall()
         return safe_rows(rows, to_scoring_task, self._quarantine)
+
+    def count_pending_scoring(self) -> int:
+        """Сколько вакансий ждут локального пересчёта. Тот же предикат.
+
+        COUNT(*) вместо `len(pending_scoring())` по двум причинам сразу.
+        Во-первых, счётчик `stuck` уезжает в журнал прогона и обязан
+        оставаться верным при любом `limit`: иначе бэклог из десяти тысяч
+        застрявших рапортовал бы ровно `limit`. Во-вторых, COUNT не
+        декодирует ни одного значения, поэтому не падает даже на
+        полностью испорченной таблице — тот же приём, что в
+        `stalled_by_attempts`.
+        """
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS pending FROM vacancy WHERE status = ? "
+            "AND description IS NOT NULL AND score_detail IS NULL",
+            (STATUS_NEW,),
+        ).fetchone()
+        return int(row["pending"]) if row else 0
 
     def save_score(self, vacancy_id: str, score: ScoreBreakdown) -> None:
         """Записать пересчитанную оценку, не трогая описание."""
@@ -541,7 +617,7 @@ class SqliteRepository:
 
     # --- 3: отчёт --------------------------------------------------------
 
-    def unreported(self) -> list[ScoredVacancy]:
+    def unreported(self, limit: int = DEFAULT_BATCH_LIMIT) -> list[ScoredVacancy]:
         """Готовое к отправке. Сторожа очереди пересчёта здесь БОЛЬШЕ НЕТ.
 
         Он тут был (`_warn_about_unscored`) и делал ровно две вещи, обе
@@ -562,18 +638,28 @@ class SqliteRepository:
         диагностика построена на том, что сообщение называет причину.
         Сторож, называющий выдуманную причину, обесценивает остальные.
         Спека §5.2 описывает прежнее поведение и правится отдельно.
+
+        `limit` обязателен по памяти, и это измерено: на 50 000 готовых
+        строк выборка стоила 12.5 с и 762 МБ RSS — то есть OOM на VPS с
+        гигабайтом. Копится очередь ровно в том сценарии, где отказ уже
+        случился (приёмники не приняли отчёт), поэтому неограниченная
+        выборка добавляла к отказу ещё и смерть процесса. Порядок
+        `score DESC` делает потолок безобидным: отправляется самое высоко
+        оценённое, остальное берёт следующий прогон.
         """
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
             "CAST(valid_through AS BLOB) AS valid_through, "
             "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
             "FROM vacancy WHERE status = ? AND description IS NOT NULL "
-            "AND score_detail IS NOT NULL ORDER BY score DESC",
-            (STATUS_NEW,),
+            "AND score_detail IS NOT NULL ORDER BY score DESC LIMIT ?",
+            (STATUS_NEW, limit),
         ).fetchall()
         return safe_rows(rows, to_scored, self._quarantine)
 
-    def reported_since(self, cutoff: datetime) -> list[ScoredVacancy]:
+    def reported_since(
+        self, cutoff: datetime, limit: int = DEFAULT_BATCH_LIMIT
+    ) -> list[ScoredVacancy]:
         """Уже отправленное — для повторной генерации отчёта командой `report`.
 
         Читается ровно теми же средствами, что `unreported()`:
@@ -585,14 +671,21 @@ class SqliteRepository:
         берётся из колонки `primary_query`, а не подзапросом по
         `vacancy_query`: подзапрос без ORDER BY недетерминирован и мог
         разойтись с кластером в том же отчёте.
+
+        Потолок тот же и по той же причине: замер `report --since 60` на
+        базе с 22 000 вакансий дал 351 МБ RSS, то есть OOM по команде
+        человека на VPS с 512 МБ. Разница с `unreported()` в том, что
+        здесь усечение видит человек, а не следующий прогон, — поэтому
+        CLI обязан сказать вслух, что отчёт неполон (см. `__main__.py`).
         """
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
             "CAST(valid_through AS BLOB) AS valid_through, "
             "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
             "FROM vacancy WHERE status = ? AND reported_at >= ? "
-            "AND description IS NOT NULL AND score_detail IS NOT NULL ORDER BY score DESC",
-            (STATUS_REPORTED, to_utc_iso(cutoff)),
+            "AND description IS NOT NULL AND score_detail IS NOT NULL "
+            "ORDER BY score DESC LIMIT ?",
+            (STATUS_REPORTED, to_utc_iso(cutoff), limit),
         ).fetchall()
         return safe_rows(rows, to_scored, self._quarantine)
 

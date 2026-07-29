@@ -52,12 +52,6 @@ def test_find_returns_original_spelling_without_duplicates() -> None:
     assert matcher.find("Yocto, BSP и снова yocto") == ["Yocto", "BSP"]
 
 
-def test_has_any_is_true_when_something_matched() -> None:
-    matcher = SignalMatcher(["junior"])
-    assert matcher.has_any("Junior developer") is True
-    assert matcher.has_any("Senior developer") is False
-
-
 # --- Раунд исправлений 1 ---------------------------------------------------
 
 

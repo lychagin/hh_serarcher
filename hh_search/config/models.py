@@ -17,6 +17,11 @@ from pydantic import (
 # той же регуляркой. Зависимость односторонняя — matching не знает о конфиге.
 from hh_search.filtering.matching import normalize
 
+# Умолчание потолка выборок берётся у слоя, который его исполняет, а не
+# пишется здесь вторым числом: разъехавшись, они дали бы конфиг, который
+# «ничего не менял», и репозиторий, тихо применяющий другое значение.
+from hh_search.storage.base import DEFAULT_BATCH_LIMIT
+
 
 class Base(BaseModel):
     # extra="forbid" ловит опечатку в ИМЕНИ ключа, но не в значении, а опечатка
@@ -165,6 +170,43 @@ class EnrichConfig(Base):
     max_attempts: int = Field(default=3, ge=1)
 
 
+class LimitsConfig(Base):
+    """Потолок объёма работы ОДНОГО прогона. Не оптимизация, а предохранитель.
+
+    До него объём не был ограничен ничем. `pages ≤ 20` — вежливость к
+    одному листингу, но число листингов не ограничивалось, и произведение
+    никто не проверял: конфиг из 50 листингов по 20 страниц принимался
+    молча и означал 20 990 запросов к hh.ru и 5.8 часа одних только пауз
+    вежливости при `interval_hours: 4` — то есть прогон длиннее интервала
+    и демон, работающий встык. Выборки отчёта при этом поднимали в память
+    всё подходящее: 50 000 готовых строк — 762 МБ RSS, OOM на VPS с
+    гигабайтом.
+
+    Умолчания выбраны так, чтобы штатный режим их не заметил. Замер
+    прогона на образцовом конфиге (5 листингов, 9 страниц): 70 запросов —
+    9 к листингам при потолке 60 и 60 к страницам вакансий при потолке
+    200; в устойчивом режиме, когда почти всё уже обогащено, их около 25.
+    Отчёт при этом отдаёт десятки вакансий при потолке в 500 строк.
+    """
+
+    # Суммарное число страниц листингов за прогон = число запросов шага
+    # discovery. Проверяется как СУММА по всем листингам (см.
+    # `Config.check_work_fits_limits`), потому что вежливость измеряется
+    # запросами к источнику, а не аккуратностью каждой отдельной записи
+    # конфига. Потолок поля — 500: при паузе 1 с это 8 минут одних пауз,
+    # и всё, что больше, стоит объявлять сознательно, а не опечаткой.
+    listing_pages_per_run: int = Field(default=60, ge=1, le=500)
+    # Прямой потолок запросов к странице вакансии за прогон: длина
+    # `pending_enrichment` И ЕСТЬ число таких запросов. Бэклог от этого не
+    # теряется — выборка отдаёт свежие первыми, остальное берёт следующий
+    # прогон.
+    enrich_per_run: int = Field(default=200, ge=1)
+    # Сколько строк одна выборка поднимает в память. Накрывает `unreported`,
+    # `pending_scoring` и `reported_since` — три выборки, читающие колонку
+    # `description`, на которую приходится ~80% размера базы.
+    rows_per_batch: int = Field(default=DEFAULT_BATCH_LIMIT, ge=1)
+
+
 class PathsConfig(Base):
     state: Path
     reports: Path
@@ -177,9 +219,42 @@ class AppConfig(Base):
     schedule: ScheduleConfig = ScheduleConfig()
     http: HttpConfig = HttpConfig()
     enrich: EnrichConfig = EnrichConfig()
+    limits: LimitsConfig = LimitsConfig()
     # Пустой список приёмников — прогон, который работает и никуда не отчитывается.
     sinks: list[NonEmptyStr] = Field(min_length=1)
     paths: PathsConfig
+
+    @model_validator(mode="after")
+    def check_run_fits_interval(self) -> "AppConfig":
+        """Прогон обязан помещаться в интервал между прогонами.
+
+        Считается по нижней границе — по одним лишь паузам вежливости,
+        без времени ответа источника и без разбора: `(страницы листингов
+        + страницы вакансий) × delay_between_requests_sec`. Даже такая
+        оценка ловит настоящую беду: 50 листингов по 20 страниц при
+        `interval_hours: 4` дают 5.8 ч только пауз, то есть прогон
+        заведомо длиннее интервала, планировщик запускает следующий сразу
+        по окончании предыдущего, и вежливая по замыслу служба ходит в
+        hh.ru непрерывно. Раньше такой конфиг принимался молча.
+
+        Отказ на старте, а не потолок в рантайме: число запросов целиком
+        определяется конфигом, поэтому человеку есть что поправить, и
+        узнать об этом он обязан до первого запроса (§7).
+        """
+        pause_sec = (
+            self.limits.listing_pages_per_run + self.limits.enrich_per_run
+        ) * self.http.delay_between_requests_sec
+        interval_sec = self.schedule.interval_hours * 3600
+        if pause_sec > interval_sec:
+            raise ValueError(
+                f"один прогон не помещается в интервал: потолок "
+                f"{self.limits.listing_pages_per_run} + {self.limits.enrich_per_run} запросов "
+                f"при паузе {self.http.delay_between_requests_sec} с — это минимум "
+                f"{pause_sec / 3600:.1f} ч одних только пауз вежливости, а интервал "
+                f"{self.schedule.interval_hours} ч. Демон будет работать встык, без пауз "
+                "между прогонами. Уменьшите app.limits или увеличьте schedule.interval_hours"
+            )
+        return self
 
     @model_validator(mode="after")
     def substitute_contact_email(self) -> "AppConfig":
@@ -310,8 +385,63 @@ class QuerySpec(Base):
 class QueriesConfig(Base):
     queries: list[QuerySpec] = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def reject_duplicate_slugs(self) -> "QueriesConfig":
+        """Один и тот же slug дважды — всегда опечатка, и тихая.
+
+        Мотивация та же, что у `_reject_duplicate_signals`: имя
+        правильное, значение законное, результат испорчен молча. hh.ru
+        получает одни и те же страницы дважды (при `pages: 20` — сорок
+        лишних запросов), `stats.discovered` удваивается, а кластер
+        достаётся тому из двух описаний, у которого больше `weight`, —
+        то есть человек, аккуратно расписавший два разных кластера,
+        получает один и не узнаёт об этом ниоткуда.
+        """
+        seen: dict[str, str] = {}
+        for query in self.queries:
+            previous = seen.get(query.slug)
+            if previous is not None:
+                raise ValueError(
+                    f"листинг {query.slug!r} описан дважды (кластеры {previous!r} и "
+                    f"{query.cluster!r}): hh.ru получит одни и те же страницы по два раза, "
+                    "а кластер достанется тому описанию, у которого больше weight"
+                )
+            seen[query.slug] = query.cluster
+        return self
+
+    @property
+    def total_pages(self) -> int:
+        """Сколько запросов к hh.ru стоит шаг discovery одного прогона."""
+        return sum(query.pages for query in self.queries)
+
 
 class Config(Base):
     app: AppConfig
     profile: ProfileConfig
     queries: QueriesConfig
+
+    @model_validator(mode="after")
+    def check_work_fits_limits(self) -> "Config":
+        """Сумма страниц по всем листингам — против потолка прогона.
+
+        Проверять `pages` у каждого листинга по отдельности (как делает
+        `QuerySpec`, `le=20`) недостаточно и всегда было недостаточно:
+        вежливость измеряется числом запросов к источнику, а его даёт
+        произведение «листинги × страницы», которое не проверял никто.
+        Принятый конфиг из 200 листингов означал 4 000 страниц за прогон.
+
+        Отказ, а не молчаливое усечение: обрезать список листингов
+        значило бы, что часть конфига не работает и об этом никто не
+        сказал, — тот самый класс тихой потери, против которого написан
+        весь проект.
+        """
+        requested = self.queries.total_pages
+        ceiling = self.app.limits.listing_pages_per_run
+        if requested > ceiling:
+            raise ValueError(
+                f"{len(self.queries.queries)} листингов запрашивают суммарно {requested} "
+                f"страниц за прогон при потолке {ceiling} "
+                f"(app.limits.listing_pages_per_run). Одна страница — один запрос к hh.ru; "
+                "уменьшите pages, число листингов либо поднимите потолок сознательно"
+            )
+        return self

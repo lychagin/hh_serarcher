@@ -120,9 +120,12 @@ class SignalGroupMatcher:
                 found.append(GROUP_SEPARATOR.join(matched))
         return found
 
-    def has_any(self, text: str) -> bool:
-        haystack = normalize(text)
-        return any(regex.search(haystack) for group in self._compiled for regex in group)
+    # `has_any` здесь был и удалён: остаток RSS-эпохи, который не вызывал
+    # никто, кроме тестов на него самого. Всё, что он умел, — `bool(find(
+    # text))`, а `find` при этом ещё и называет совпавшее, из-за чего
+    # второй метод не имел ни одного случая, где был бы лучше. Мёртвый
+    # публичный метод — это обещание, которое некому проверить: он не
+    # участвует ни в одном пути данных и потому не ломается заметно.
 
 
 class SignalMatcher(SignalGroupMatcher):

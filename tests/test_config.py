@@ -496,3 +496,71 @@ def test_a_real_address_still_passes(tmp_path: Path, address: str) -> None:
     good = APP_YAML.replace('contact_email: "me@lychagin-hh.ru"', f'contact_email: "{address}"')
     config = load_config(write_config(tmp_path, **{"app.yaml": good}))
     assert config.app.user_agent.endswith(f"{address})")
+
+
+# --- I2/M4: объём работы прогона ограничен, а конфиг не принимает дубликатов
+
+
+def test_two_listings_with_the_same_slug_are_rejected(tmp_path: Path) -> None:
+    """Один slug дважды — тихая опечатка с тремя последствиями сразу.
+
+    hh.ru получает одни и те же страницы по два раза, `discovered`
+    удваивается, а кластер достаётся описанию с большим `weight` — то
+    есть человек, расписавший два разных кластера, получает один и
+    узнать об этом ниоткуда не может.
+    """
+    duplicate = """
+queries:
+  - slug: programmist
+    cluster: embedded
+    weight: 9
+    pages: 1
+  - slug: programmist
+    cluster: backend
+    weight: 3
+    pages: 1
+"""
+    with pytest.raises(ValidationError, match="описан дважды"):
+        load_config(write_config(tmp_path, **{"queries.yaml": duplicate}))
+
+
+def test_sum_of_pages_over_the_ceiling_is_a_config_error(tmp_path: Path) -> None:
+    """`pages ≤ 20` у каждого листинга не ограничивает ПРОИЗВЕДЕНИЕ.
+
+    Именно произведение и есть число запросов к hh.ru за прогон: конфиг
+    из 50 листингов по 20 страниц принимался молча и означал тысячу
+    страниц (и двадцать тысяч страниц вакансий следом).
+    """
+    listings = "queries:\n" + "".join(
+        f"  - slug: slug-{index}\n    cluster: c{index}\n    pages: 20\n" for index in range(5)
+    )
+    with pytest.raises(ValidationError, match="запрашивают суммарно 100 страниц"):
+        load_config(write_config(tmp_path, **{"queries.yaml": listings}))
+
+
+def test_limits_that_do_not_fit_the_interval_are_a_config_error(tmp_path: Path) -> None:
+    """Прогон длиннее интервала — это демон, работающий встык, без пауз.
+
+    Считается по нижней границе, по одним лишь паузам вежливости: даже
+    она ловит замеренный случай (5.8 ч пауз при `interval_hours: 4`).
+    """
+    app_yaml = APP_YAML.replace(
+        "enrich:\n  max_attempts: 3\n",
+        "enrich:\n  max_attempts: 3\nlimits:\n  listing_pages_per_run: 500\n"
+        "  enrich_per_run: 20000\n",
+    )
+    with pytest.raises(ValidationError, match="не помещается в интервал"):
+        load_config(write_config(tmp_path, **{"app.yaml": app_yaml}))
+
+
+def test_default_limits_leave_the_normal_run_untouched(tmp_path: Path) -> None:
+    """Штатный прогон делает 25 запросов — потолки на порядок выше.
+
+    Предохранитель, задевающий нормальный режим, — это не предохранитель,
+    а поломка, поэтому число названо тестом, а не комментарием.
+    """
+    cfg = load_config(write_config(tmp_path))
+    assert cfg.app.limits.listing_pages_per_run == 60
+    assert cfg.app.limits.enrich_per_run == 200
+    assert cfg.app.limits.rows_per_batch == 500
+    assert cfg.queries.total_pages == 2  # образец: один листинг, две страницы

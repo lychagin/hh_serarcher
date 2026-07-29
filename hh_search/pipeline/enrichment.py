@@ -37,7 +37,7 @@ from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
 from hh_search.sources.http import PoliteClient
 from hh_search.sources.vacancy_page import SalaryBlockStats, parse_vacancy_page, vacancy_url
-from hh_search.storage.repository import SqliteRepository
+from hh_search.storage.base import Repository
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +45,15 @@ logger = logging.getLogger(__name__)
 def enrich(
     config: Config,
     client: PoliteClient,
-    repo: SqliteRepository,
+    repo: Repository,
     scorer: Scorer,
     stats: RunStats,
     forbidden: ForbiddenStreak,
 ) -> None:
     """Скачать страницы очереди обогащения, оценить и сохранить."""
-    pending = repo.pending_enrichment(config.app.enrich.max_attempts)
+    pending = repo.pending_enrichment(
+        config.app.enrich.max_attempts, config.app.limits.enrich_per_run
+    )
     salary_stats = SalaryBlockStats()
     # Отказы копятся, а не печатаются по одному: при аварии источника они
     # отличаются только URL (см. pipeline/failures.py).
@@ -118,7 +120,7 @@ def enrich(
 
 def _burn_attempt(
     config: Config,
-    repo: SqliteRepository,
+    repo: Repository,
     stats: RunStats,
     vacancy_id: str,
     reason: str,
@@ -144,7 +146,7 @@ def _burn_attempt(
 
 
 def _save(
-    repo: SqliteRepository,
+    repo: Repository,
     scorer: Scorer,
     vacancy: DiscoveredVacancy,
     details: VacancyDetails,
@@ -175,7 +177,7 @@ def _save(
     return True
 
 
-def _check_not_stalled(config: Config, repo: SqliteRepository, stats: RunStats) -> None:
+def _check_not_stalled(config: Config, repo: Repository, stats: RunStats) -> None:
     """Сторож правки `enrich.max_attempts` вниз — счёт после шага, а не до.
 
     Считать надо именно здесь: строки, честно исчерпавшие лимит В ЭТОМ
@@ -199,12 +201,13 @@ def _check_not_stalled(config: Config, repo: SqliteRepository, stats: RunStats) 
         "%d вакансий без описания имеют enrich_attempts >= %d и потому не видны НИ ОДНОЙ "
         "из трёх выборок: лимит попыток (enrich.max_attempts) понижен уже после того, как "
         "попытки были потрачены. Скачивания не было — вернуть их можно, подняв лимит "
-        "обратно либо командой `mark <id> new` (она обнуляет счётчик). Найти: "
-        "SELECT id FROM vacancy WHERE status='new' AND description IS NULL "
-        "AND enrich_attempts >= %d",
+        "обратно либо командой `mark <id> new` (она обнуляет счётчик). Найти: %s",
         stalled,
         config.app.enrich.max_attempts,
-        config.app.enrich.max_attempts,
+        # Запрос спрашивается у хранилища, а не пишется здесь: SQL — знание
+        # слоя storage (§4.3), и совет, написанный в конвейере, протухает
+        # молча при первой же правке схемы.
+        repo.stalled_rows_hint(config.app.enrich.max_attempts),
     )
 
 
@@ -272,15 +275,18 @@ def _canary(
         )
 
 
-def rescore(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> int:
+def rescore(repo: Repository, scorer: Scorer, stats: RunStats, limit: int) -> int:
     """Шаг 6: локальный пересчёт оценок. Сеть не задействуется.
 
     Обслуживает две очереди сразу: вакансии, у которых оценка не
     посчиталась при обогащении (`save_description` выше), и те, у которых
     оценку обнулил карантин, прочитав её как испорченную.
+
+    `limit` здесь не про сеть, а про память: строки очереди несут
+    описание, то есть стоят столько же, сколько строки отчёта.
     """
     rescored = 0
-    for vacancy, details in repo.pending_scoring():
+    for vacancy, details in repo.pending_scoring(limit):
         try:
             repo.save_score(vacancy.id, scorer.score(vacancy, details))
         except Exception as error:  # noqa: BLE001 — одна вакансия не роняет прогон

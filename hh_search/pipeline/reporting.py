@@ -24,7 +24,7 @@ from hh_search.pipeline.enrichment import rescore
 from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
 from hh_search.sinks.base import Sink
-from hh_search.storage.repository import SqliteRepository
+from hh_search.storage.base import Repository
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +32,14 @@ _PASSES = 2
 
 
 def report(
-    repo: SqliteRepository,
+    repo: Repository,
     scorer: Scorer,
     sinks: Sequence[Sink],
     stats: RunStats,
     moment: datetime,
+    limit: int,
 ) -> None:
-    ready = _collect(repo, scorer, stats)
+    ready = _collect(repo, scorer, stats, limit)
     if not ready:
         return
     if not sinks:
@@ -61,26 +62,35 @@ def report(
     )
 
 
-def _collect(repo: SqliteRepository, scorer: Scorer, stats: RunStats) -> list[ScoredVacancy]:
+def _collect(repo: Repository, scorer: Scorer, stats: RunStats, limit: int) -> list[ScoredVacancy]:
     """Готовое к отправке — после того, как очередь пересчёта разобрана."""
     ready: list[ScoredVacancy] = []
     for _ in range(_PASSES):
-        stats.rescored += rescore(repo, scorer, stats)
-        ready = repo.unreported()
+        stats.rescored += rescore(repo, scorer, stats, limit)
+        ready = repo.unreported(limit)
     # Хранилище кричит из `unreported()` о застрявших строках, но пропуск
     # шага не должен быть тихим и здесь: `stuck` уезжает в журнал прогона,
     # а id — в лог, потому что без них не понять, какие вакансии, уже
     # стоившие запроса к hh.ru, не попадут ни в один отчёт.
-    stuck = repo.pending_scoring()
-    stats.stuck = len(stuck)
+    #
+    # Считается COUNT'ом, а не длиной выборки: с появлением потолка
+    # `len(pending_scoring(limit))` рапортовал бы ровно `limit` при любом
+    # размере бэклога — счётчик, который перестаёт расти ровно там, где
+    # беда становится большой. Имена по-прежнему берутся из выборки, но
+    # ровно те, что в неё поместились, и сообщение об этом говорит.
+    stuck = repo.count_pending_scoring()
+    stats.stuck = stuck
     if stuck:
-        stats.degrade(PARTIAL, f"оценка не досчитана у {len(stuck)} вакансий")
+        stats.degrade(PARTIAL, f"оценка не досчитана у {stuck} вакансий")
+        named = [vacancy.id for vacancy, _ in repo.pending_scoring(limit)]
+        tail = f" и ещё {stuck - len(named)}" if stuck > len(named) else ""
         logger.error(
-            "%d вакансий с готовым описанием остались без оценки и не попадут в отчёт: %s. "
+            "%d вакансий с готовым описанием остались без оценки и не попадут в отчёт: %s%s. "
             "Описание у них есть, перекачка не нужна — нужен локальный пересчёт; почему "
             "он не удался, сказано записями выше",
-            len(stuck),
-            ", ".join(vacancy.id for vacancy, _ in stuck),
+            stuck,
+            ", ".join(named),
+            tail,
         )
     return ready
 

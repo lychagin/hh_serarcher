@@ -1,5 +1,12 @@
 """Оркестрация семи шагов конвейера (спека §4.1).
 
+Хранилище здесь и во всех модулях шага — это протокол
+`storage.base.Repository`, а не `SqliteRepository`. До этой правки §4.2
+обещала, что `PostgresRepository` не потребует изменений в конвейере, а
+`mypy --strict` — часть ворот проекта — отвергал любую альтернативную
+реализацию: аннотация называла конкретный класс. Проверено исполнением,
+см. `tests/test_pipeline.py::test_run_once_accepts_any_repository`.
+
 Модуль разбит на файлы по шагам, а `run_once` здесь оставлен один и
 целиком: единственное, что он знает, — ПОРЯДОК шагов и то, что журнал
 прогона закрывается при любом исходе. Порядок здесь — не оформление:
@@ -27,7 +34,7 @@ from hh_search.pipeline.stats import EXIT_CODES, FAILED, OK, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
 from hh_search.sinks.base import Sink
 from hh_search.sources.http import PoliteClient
-from hh_search.storage.repository import SqliteRepository
+from hh_search.storage.base import Repository
 
 __all__ = ["EXIT_CODES", "FAILED", "OK", "PARTIAL", "RunStats", "run_once"]
 
@@ -37,7 +44,7 @@ logger = logging.getLogger(__name__)
 def run_once(
     config: Config,
     client: PoliteClient,
-    repo: SqliteRepository,
+    repo: Repository,
     scorer: Scorer,
     sinks: Sequence[Sink],
     now: datetime | None = None,
@@ -65,7 +72,7 @@ def run_once(
         discover(config, client, repo, stats, forbidden)
         prefilter(config, repo, stats)
         enrich(config, client, repo, scorer, stats, forbidden)
-        report(repo, scorer, sinks, stats, moment)
+        report(repo, scorer, sinks, stats, moment, config.app.limits.rows_per_batch)
     except AccessForbidden as error:
         stats.degrade(FAILED, f"hh.ru закрыл доступ: {error}")
         # Без «прогон остановлен» и без «обходные пути» — то и другое
@@ -99,7 +106,7 @@ def run_once(
     return stats
 
 
-def _finish(repo: SqliteRepository, run_id: int, stats: RunStats) -> None:
+def _finish(repo: Repository, run_id: int, stats: RunStats) -> None:
     """Досчитать карантин и закрыть строку журнала — на ЛЮБОМ исходе.
 
     Карантин срабатывает внутри выборок, поэтому узнать о нём можно

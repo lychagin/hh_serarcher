@@ -189,7 +189,7 @@ def test_example_field_has_no_duplicate_signals(example_config: Config, field: s
 def test_example_signal_actually_fires(example_config: Config, title: str, signal: str) -> None:
     """Сигнал есть в образце И срабатывает на заголовке, ради которого внесён."""
     assert signal in _all_signals(example_config), f"{signal!r} пропал из образца"
-    assert SignalMatcher([signal]).has_any(title)
+    assert SignalMatcher([signal]).find(title) == [signal]
 
 
 @pytest.mark.parametrize("title", MUST_NOT_BE_REJECTED)

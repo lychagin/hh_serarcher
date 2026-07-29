@@ -49,6 +49,21 @@ CREATE TABLE IF NOT EXISTS vacancy (
 
 CREATE INDEX IF NOT EXISTS idx_vacancy_status ON vacancy(status);
 
+-- Возврат из отказа префильтра (`rejected_by_prefilter`) перебирал ВСЕ
+-- отказанные строки, чтобы отобрать из них обратимые, и делал это каждый
+-- прогон. Колонки ровно те и в том порядке, в каком стоят в предикате.
+-- Колонка `reject_code` появляется у мигрирующей базы только на шаге
+-- ALTER TABLE, поэтому он идёт ДО применения этого файла (см.
+-- migrations.py): иначе CREATE INDEX уронил бы весь executescript на
+-- «no such column», не создав и остальных таблиц.
+CREATE INDEX IF NOT EXISTS idx_vacancy_reject ON vacancy(status, reject_code);
+
+-- `reported_since` — единственный способ человека вернуть историю, и он
+-- шёл полным перебором отправленных, которые копятся вечно. Дата второй
+-- колонкой: по ней идёт диапазонное сравнение, и в составном индексе
+-- такое поле обязано стоять последним.
+CREATE INDEX IF NOT EXISTS idx_vacancy_reported ON vacancy(status, reported_at);
+
 -- primary_query всегда переписывается тем же UPDATE, что и cluster/
 -- cluster_weight (см. repository.py), поэтому в отчёте found_by_query
 -- гарантированно совпадает с запросом, определившим кластер. Таблица
@@ -95,6 +110,13 @@ CREATE TABLE IF NOT EXISTS run (
     corrupted   INTEGER DEFAULT 0,
     error       TEXT
 );
+
+-- `last_successful_run()` — это и есть healthcheck, а `close_abandoned_runs()`
+-- вызывается каждым прогоном; обе обходили таблицу целиком, а она растёт
+-- шесть строк в сутки и не чистится ничем. Одна пара колонок обслуживает
+-- обе: статус равенством, дата — сортировкой сразу за ним, поэтому
+-- `ORDER BY finished_at DESC` берётся из индекса, без отдельной сортировки.
+CREATE INDEX IF NOT EXISTS idx_run_status_finished ON run(status, finished_at);
 
 CREATE TABLE IF NOT EXISTS http_cache (
     url           TEXT PRIMARY KEY,

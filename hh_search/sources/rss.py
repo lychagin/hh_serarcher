@@ -32,7 +32,7 @@ Discovery живёт в `listing.py`. Разбор зарплаты переех
 import logging
 import re
 from datetime import datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from xml.etree import ElementTree
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -40,6 +40,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from hh_search.domain.models import DiscoveredVacancy
 from hh_search.errors import FetchFailed
 from hh_search.sources.salary import parse_salary
+from hh_search.sources.vacancy_page import vacancy_id_from_path, vacancy_url
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,6 @@ RSS_BASE_URL = "https://hh.ru/search/vacancy/rss"
 # элементов, и однотипных причин там обычно одна-две.
 _MAX_LOGGED_REASONS = 5
 
-_ID_RE = re.compile(r"/vacancy/(\d+)")
 _COMPANY_RE = re.compile(r"Вакансия компании:\s*([^<]+)")
 _REGION_RE = re.compile(r"Регион:\s*([^<]+)")
 _INCOME_RE = re.compile(r"дохода:\s*([^<]+)")
@@ -128,8 +128,16 @@ def parse_feed(xml_text: str, query_text: str) -> list[DiscoveredVacancy]:
     skipped: list[str] = []
     for item in items:
         link = (item.findtext("link") or "").strip()
-        id_match = _ID_RE.search(link)
-        if not id_match:
+        # Тот же разбор, что у листинга, и это не косметика. Здесь была
+        # своя копия регулярки — `/vacancy/(\d+)` через `search()`, — и
+        # ужесточение, сделанное для листинга с явной мотивацией (ведущий
+        # нуль даёт вторую строку в базе для той же вакансии, `\d+`
+        # принимает четырёхсотзначное число, `search` находит id в
+        # query-строке), сюда перенесено не было. Модуль объявлен готовым
+        # к восстановлению, а восстановление вернуло бы старый баг вместе
+        # с ним.
+        vacancy_id = vacancy_id_from_path(urlsplit(link).path)
+        if vacancy_id is None:
             skipped.append(f"в <link> нет id вакансии: {link!r}")
             continue
         raw_published_at = (item.findtext("pubDate") or "").strip()
@@ -142,8 +150,8 @@ def parse_feed(xml_text: str, query_text: str) -> list[DiscoveredVacancy]:
         income = _first_group(_INCOME_RE, description) or ""
         vacancies.append(
             DiscoveredVacancy(
-                id=id_match.group(1),
-                url=f"https://hh.ru/vacancy/{id_match.group(1)}",
+                id=vacancy_id,
+                url=vacancy_url(vacancy_id),
                 title=(item.findtext("title") or "").strip(),
                 company=_first_group(_COMPANY_RE, description),
                 area=_first_group(_REGION_RE, description),

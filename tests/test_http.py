@@ -9,6 +9,7 @@ import respx
 
 from hh_search.config.models import HttpConfig, QuerySpec
 from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
+from hh_search.sources import http
 from hh_search.sources.http import PoliteClient, Robots
 from hh_search.sources.listing import build_listing_url
 from hh_search.sources.rss import RssQuery, build_rss_url
@@ -703,3 +704,20 @@ def test_the_denial_does_not_outlive_the_client() -> None:
     with second:
         assert second.get("https://hh.ru/vacancy/1").status_code == 200
     assert seen.count("https://hh.ru/robots.txt") == 2
+
+
+# --- M5: две публичные `normalize()` с разным смыслом развели по именам ----
+
+
+def test_url_normalizer_is_not_called_normalize() -> None:
+    """`filtering.matching.normalize` схлопывает омоглифы, эта — правит URL.
+
+    Одинаковое имя при несовпадающем смысле — приглашение импортировать
+    не ту: обе публичные, обе вызывались по имени. Проверяется не только
+    новое имя, но и отсутствие старого — иначе «переименование» осталось
+    бы добавлением синонима.
+    """
+    assert (
+        http.normalize_url("https://hh.ru/vacancies/./?page=1") == "https://hh.ru/vacancies/?page=1"
+    )
+    assert not hasattr(http, "normalize")

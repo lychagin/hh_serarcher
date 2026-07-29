@@ -1058,3 +1058,59 @@ def read_only_root_config(tmp_path: Path) -> str:
         .replace("/data/reports", str(tmp_path / "reports"))
         .replace("/data/logs", str(tmp_path / "logs"))
     )
+
+
+# --- I2: усечение отчёта потолком обязано быть сказано вслух ---------------
+
+
+@respx.mock
+def test_report_says_out_loud_that_it_was_truncated(tmp_path: Path) -> None:
+    """Неполный отчёт, выданный за полный, — та самая тихая потеря.
+
+    Потолок здесь лечит замеренный OOM (`report --since 60` на базе с
+    22 000 вакансий — 351 МБ RSS, то есть смерть процесса по команде
+    человека на VPS с 512 МБ). Но усечение видит ЧЕЛОВЕК, а не следующий
+    прогон, поэтому молчать о нём нельзя: отбор идёт по убыванию оценки,
+    и за границей всегда остаётся хвост.
+    """
+    config_dir = prepare(tmp_path)
+    app_file = config_dir / "app.yaml"
+    app_file.write_text(
+        app_file.read_text(encoding="utf-8") + "limits:\n  rows_per_batch: 1\n", encoding="utf-8"
+    )
+    mock_source()
+    invoke(config_dir, "run")
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.mark_reported(["111", "222"])
+
+    result = invoke(config_dir, "report", "--since", "7d")
+
+    assert result.exit_code == 0
+    assert "отчёт усечён потолком app.limits.rows_per_batch = 1" in result.output
+
+
+@respx.mock
+def test_a_report_that_fits_says_nothing_about_truncation(tmp_path: Path) -> None:
+    """Контроль: предупреждение не имеет права быть постоянным фоном."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    with SqliteRepository(state_path(config_dir)) as repo:
+        repo.mark_reported(["111"])
+
+    result = invoke(config_dir, "report", "--since", "7d")
+
+    assert "усечён" not in result.output
+
+
+# --- M11: цветной трейсбек rich выключен ----------------------------------
+
+
+def test_cli_does_not_print_rich_tracebacks() -> None:
+    """Одна ошибка на 20–50 строк с рамками — худшая форма для `docker logs`.
+
+    Зависимость от rich так не снимается (её тянет сам typer, ~13 МБ
+    образа), и снять её нечем, кроме отказа от typer. Выключается именно
+    оформление трейсбека — то, что мешает читать журнал сервиса.
+    """
+    assert app.pretty_exceptions_enable is False
