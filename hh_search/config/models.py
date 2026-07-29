@@ -290,7 +290,11 @@ class Weights(Base):
         # конечность и неотрицательность требуются полями выше.
         total = self.title + self.stack + self.responsibilities + self.domain
         if abs(total - 1.0) > 1e-6:
-            raise ValueError(f"weights must sum to 1.0, got {total}")
+            # По-русски, как и все прочие сообщения этого сервиса: единственное
+            # английское осталось от первой редакции плана и жило дольше всех
+            # именно потому, что триаж отложенных minor записал «все сообщения
+            # уже по-русски», не проверив исполнением.
+            raise ValueError(f"веса обязаны суммироваться в 1.0, получено {total}")
         return self
 
 

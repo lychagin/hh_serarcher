@@ -94,7 +94,7 @@ def test_unknown_key_is_rejected(tmp_path: Path) -> None:
 
 def test_weights_must_sum_to_one(tmp_path: Path) -> None:
     broken = PROFILE_YAML.replace("title: 0.40", "title: 0.90")
-    with pytest.raises(ValidationError, match="sum to 1.0"):
+    with pytest.raises(ValidationError, match="суммироваться в 1.0"):
         load_config(write_config(tmp_path, **{"profile.yaml": broken}))
 
 

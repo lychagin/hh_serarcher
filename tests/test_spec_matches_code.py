@@ -1,0 +1,232 @@
+"""Сторожа спеки: разделы, которые обязаны сверяться, а не обещать.
+
+Финальное ревью ветки нашло закономерность, которая дороже любой отдельной
+находки: три места спеки (§5.1 DDL, §7 образцы конфигов, §8.3 блок CLI) не
+разошлись с кодом ПОТОМУ ЧТО их сторожат тесты — и ровно они оказались
+единственными безупречными. Всё, что разошлось, — разделы без теста: §4.3
+объявляла несуществующими девять живых модулей и не знала ещё о восьми,
+§4.1 ошибалась в объёме прогона в полтора раза, §8.2 приводила `compose.yaml`,
+который воспроизводимо падает, §10 хранила счётчик тестов, обязанный
+протухать.
+
+Отсюда правило, по которому написан этот файл: **утверждение спеки, которое
+дёшево сверяется исполнением, обязано сверяться исполнением.** А счётчик,
+который не сторожит ничего и устаревает сам (число тестов), из спеки убран,
+а не обновлён.
+
+Сторожа из этого файла проверены мутацией: порча утверждения в документе
+красит ровно один тест.
+
+Родственные сторожа живут в `tests/test_config_example.py` (§5.1 DDL, §7
+образцы конфигов, §8.3 блок CLI): они выросли из сверки образцов
+конфигурации и остались рядом с ней.
+"""
+
+import ast
+import re
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+SPEC = ROOT / "docs/superpowers/specs/2026-07-27-hh-autosearch-design.md"
+PACKAGE = ROOT / "hh_search"
+FIXTURES = Path(__file__).parent / "fixtures"
+
+# Ориентир §4.3 после переформулировки: считаются строки КОДА, то есть
+# непустые строки, не являющиеся комментарием и не входящие в докстринг.
+# Объяснение неочевидного решения в комментарии ценнее соблюдения счётчика,
+# поэтому комментарии из счёта исключены сознательно.
+CODE_LINE_BUDGET = 150
+
+
+def spec_section(start: str, end: str) -> str:
+    text = SPEC.read_text(encoding="utf-8")
+    return text[text.index(start) : text.index(end)]
+
+
+def spec_block(section: str, language: str) -> str:
+    block = re.search(rf"```{language}\n(.*?)\n```", section, re.S)
+    assert block is not None, f"в разделе пропал блок ```{language}```"
+    return block.group(1)
+
+
+# --- §4.3: инвентарь модулей ----------------------------------------------
+
+
+def _tree_entries(block: str) -> set[str]:
+    """Пути из дерева §4.3. Отступ в два пробела — один уровень вложенности."""
+    stack: list[str] = []
+    entries: set[str] = set()
+    for line in block.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        assert indent % 2 == 0, f"нечётный отступ в дереве §4.3: {line!r}"
+        name = line.strip().split()[0]
+        del stack[indent // 2 :]
+        if name.endswith("/"):
+            stack.append(name.rstrip("/"))
+            continue
+        entries.add("/".join([*stack, name]))
+    return entries
+
+
+def _real_entries() -> set[str]:
+    """Всё содержимое пакета, кроме пустых `__init__.py`.
+
+    Пустой `__init__.py` — маркер пакета, а не модуль: перечислять его в
+    дереве значило бы семь строк шума. Всё остальное (включая непустые
+    `pipeline/__init__.py` и `sinks/__init__.py`, где живёт код) обязано
+    быть в дереве.
+    """
+    return {
+        str(path.relative_to(PACKAGE.parent))
+        for path in PACKAGE.rglob("*")
+        if path.is_file() and path.suffix in {".py", ".sql"} and path.stat().st_size > 0
+    }
+
+
+def test_spec_module_tree_matches_the_package() -> None:
+    """§4.3 обязана называть ровно те модули, которые существуют.
+
+    Расхождение здесь стоило дороже всех прочих: шапка и §4.3 объявляли
+    девять существующих модулей несозданными («задачи 1–6 реализованы,
+    дальше — конвейер»), а восьми не знали вовсе. Читатель, пришедший в
+    проект по ссылке из README, получал описание половины сервиса как
+    плана на будущее.
+    """
+    documented = _tree_entries(spec_block(spec_section("### 4.3", "## 5."), "text"))
+    assert documented == _real_entries()
+
+
+# --- §4.3: ориентир «≤150 строк кода» -------------------------------------
+
+
+def _code_lines(path: Path) -> int:
+    """Непустые строки, не являющиеся комментарием и не входящие в докстринг."""
+    source = path.read_text(encoding="utf-8")
+    inside_docstring: set[int] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            assert first.end_lineno is not None
+            inside_docstring.update(range(first.lineno, first.end_lineno + 1))
+    return sum(
+        1
+        for number, line in enumerate(source.splitlines(), 1)
+        if line.strip() and not line.lstrip().startswith("#") and number not in inside_docstring
+    )
+
+
+def _documented_exceptions() -> set[str]:
+    """Файлы из таблицы исключений §4.3 — первая колонка, в обратных кавычках."""
+    section = spec_section("**Ориентир", "## 5.")
+    return {match.group(1) for match in re.finditer(r"^\| `([^`]+)` \|", section, re.M)}
+
+
+def test_spec_names_every_module_over_the_code_budget() -> None:
+    """Список исключений §4.3 обязан совпадать с замером, а не с памятью.
+
+    Прежняя редакция приводила таблицу из семи файлов с точными числами
+    строк — числа устарели на следующем же коммите, потому что сторожа у
+    них не было. Здесь сторожится не число (оно меняется от любой правки),
+    а СПИСОК: файл, перешедший границу, обязан получить в спеке строку с
+    обоснованием, а файл, ужавшийся обратно, — из таблицы уйти.
+    """
+    measured = {
+        str(path.relative_to(PACKAGE.parent))
+        for path in PACKAGE.rglob("*.py")
+        if _code_lines(path) > CODE_LINE_BUDGET
+    }
+    assert _documented_exceptions() == measured
+
+
+# --- §8.2: образец compose.yaml -------------------------------------------
+
+
+def test_spec_compose_sample_matches_the_real_compose() -> None:
+    """§8.2 обязана приводить тот `compose.yaml`, который лежит в репозитории.
+
+    Расхождение было не косметическим: в образце §8.2 не было ключа
+    `user:`, и запуск ровно того, что описано, воспроизводимо падал «нет
+    доступа к каталогу данных /data/state» — то есть образец
+    воспроизводил ровно ту ловушку, которую §8.2 разбирает тремя абзацами
+    ниже. Проверено исполнением 2026-07-29: `docker compose run --rm
+    hh-search init-db` на образце из спеки, каталог `./data` от uid 1000,
+    контейнер от uid 10001.
+
+    Сверка семантическая (`yaml.safe_load`), а не посимвольная:
+    комментарии файла в спеку не переносятся — они объясняют выбор тому,
+    кто правит файл, а спека объясняет его сама.
+    """
+    documented = yaml.safe_load(spec_block(spec_section("### 8.2", "### 8.3"), "yaml"))
+    real = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
+    assert documented == real
+
+
+# --- §4.1: объём шага discovery -------------------------------------------
+
+
+def test_spec_discovery_volume_matches_the_sample_config() -> None:
+    """Единственное место, где документ оценивает нагрузку на источник.
+
+    Оно и разошлось: §4.1 говорила «3 листинга, суммарно 6 страниц — 6
+    запросов и потолок 120 записей», тогда как образец §7 и
+    `config.example/queries.yaml` описывают пять листингов и девять
+    страниц. Ошибка в полтора раза там, где вежливость к hh.ru измеряется
+    числом.
+    """
+    stated = re.search(
+        r"\((\d+) листинг\w*, суммарно (\d+) страниц\w*\) — (\d+) запрос\w* "
+        r"и потолок (\d+) записей",
+        spec_section("### 4.1", "### 4.2"),
+    )
+    assert stated is not None, "в §4.1 пропала оценка объёма шага discovery"
+    listings, pages, requests, ceiling = (int(group) for group in stated.groups())
+    sample = yaml.safe_load((ROOT / "config.example/queries.yaml").read_text(encoding="utf-8"))
+    assert listings == len(sample["queries"])
+    assert pages == sum(query["pages"] for query in sample["queries"])
+    # Одна страница — один запрос; на странице листинга ровно 20 вакансий (§3.2).
+    assert requests == pages
+    assert ceiling == pages * 20
+
+
+# --- §10: таблица фикстур -------------------------------------------------
+
+
+def test_spec_fixture_table_matches_the_fixtures_on_disk() -> None:
+    """Фикстуры — живые ответы источника, и §10 объясняет назначение каждой.
+
+    Фикстура, которой в таблице нет, выглядит мусором и удаляется первой;
+    строка таблицы без файла обещает покрытие, которого нет.
+    """
+    section = spec_section("**Фикстуры", "**Интеграционный тест")
+    documented = {match.group(1) for match in re.finditer(r"^\| `([^`]+)` \|", section, re.M)}
+    assert documented == {path.name for path in FIXTURES.iterdir() if path.is_file()}
+
+
+# --- мета: счётчик тестов обязан отсутствовать ----------------------------
+
+
+def test_spec_does_not_count_tests() -> None:
+    """Число зелёных тестов в спеке — утверждение, обязанное протухать.
+
+    Оно устаревает от любого добавленного теста, сторожить его нечем
+    (сторож был бы тем же числом во второй раз), а пользы не несёт: счёт
+    тестов не говорит читателю ничего, чего не говорит `uv run pytest`.
+    Прошлая редакция называла число, отставшее от фактического почти
+    втрое. Поэтому счётчик убран, а не обновлён, — и этот тест не даёт
+    ему вернуться.
+    """
+    text = SPEC.read_text(encoding="utf-8")
+    assert not re.search(r"\d+\s+тест\w*\s+зелён", text), (
+        "в спеке снова появился счётчик тестов: он устареет на следующем коммите, "
+        "а сторожить его нечем"
+    )
