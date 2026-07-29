@@ -274,3 +274,34 @@ def test_readme_names_the_real_report_headings() -> None:
     for heading in ("## Топ", "## Остальное"):
         assert f'"{heading}"' in source, f"markdown_sink больше не пишет раздел {heading}"
         assert f"`{heading}`" in section, f"README не называет раздел {heading}"
+
+
+# --- README §«Отчёт в Telegram» --------------------------------------------
+
+
+def test_readme_names_the_real_telegram_variables() -> None:
+    """Имена переменных в README — копия того, что читает код.
+
+    Переменные читает `TelegramCredentials.from_env` в `telegram_client.py`,
+    а не `telegram_sink.py`: транспорт и приёмник — разные модули (Task 3).
+    """
+    section = readme_section("## Отчёт в Telegram", "## Разработка")
+    source = (PACKAGE / "sinks" / "telegram_client.py").read_text(encoding="utf-8")
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        assert name in source, f"код больше не читает {name}"
+        assert name in section, f"README не называет {name}"
+
+
+def test_env_example_documents_the_telegram_variables() -> None:
+    """`.env.example` — то, что человек копирует. Пропуск переменной там
+    означает отказ на старте у каждого, кто пошёл по инструкции."""
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        assert name in example, f".env.example не называет {name}"
+
+
+def test_readme_names_the_real_sink_name() -> None:
+    from hh_search.sinks.telegram_sink import TelegramSink
+
+    section = readme_section("## Отчёт в Telegram", "## Разработка")
+    assert f"`{TelegramSink.name}`" in section
