@@ -122,7 +122,17 @@ def test_an_unusable_log_directory_is_reported_and_not_fatal(
 
 
 def _break_the_log_directory(logs: Path) -> None:
-    """Ротация на следующей же записи — и писать её некуда."""
+    """Ротация на следующей же записи — и писать её некуда.
+
+    Запись «до аварии» здесь обязательна, а не для красоты: начиная с
+    3.12.4 CPython не ротирует ПУСТОЙ файл (`shouldRollover` возвращает
+    False при нулевой позиции). На 3.12.3 ротация наступала и у пустого,
+    поэтому тест, ломавший каталог до первой записи, был зелёным локально
+    и красным в CI — расхождение поймал именно CI, на 3.12.13.
+    Непустой файл ротируется на любой патч-версии, так что премисса
+    «следующая запись пойдёт в doRollover» держится везде.
+    """
+    logging.getLogger("hh_search.test").info("до аварии")
     for handler in logging.getLogger().handlers:
         if isinstance(handler, ResilientFileHandler):
             handler.maxBytes = 1
@@ -147,7 +157,6 @@ def test_a_log_directory_that_breaks_later_disables_the_file_once(
     """
     logs = tmp_path / "logs"
     setup_logging(logs)
-    logging.getLogger("hh_search.test").info("до аварии")
     _break_the_log_directory(logs)
 
     noise = io.StringIO()
