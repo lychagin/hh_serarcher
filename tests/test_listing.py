@@ -168,6 +168,32 @@ def test_parse_listing_raises_when_item_list_is_missing() -> None:
         parse_listing(html, "programmist")
 
 
+def test_missing_item_list_does_not_blame_the_markup_alone() -> None:
+    """Отсутствие блока — симптом двух разных причин, и сторож обязан назвать обе.
+
+    Живой прогон 2026-07-29: `programmist?page=2` пришла без блока, отказ
+    объявил «похоже, разметка страницы изменилась», а повторный запрос той
+    же страницы разобрался тем же парсером на 20 элементов. То есть отказ
+    назвал причину, которой не было, и увёл диагностику в поиск дрейфа
+    вёрстки. Это тот же дефект, что чинил коммит 6447e7c, — сторож,
+    выдумывающий причину.
+
+    Соседний отказ (`itemListElement` не список) под это правило НЕ подпадает
+    и проверяется отдельно: там блок на месте, а его форма неверна — это
+    дрейф и есть, гадать не о чем.
+    """
+    html = (
+        '<link rel="canonical" href="https://hh.ru/vacancies/programmist">'
+        '<script type="application/ld+json">{"@type": "BreadcrumbList"}</script>'
+    )
+    with pytest.raises(FetchFailed) as caught:
+        parse_listing(html, "programmist")
+    message = str(caught.value)
+    assert "разметк" in message, "версия про смену разметки обязана остаться"
+    assert "разов" in message or "вырожденн" in message, "вторая версия обязана быть названа"
+    assert "похоже, разметка страницы изменилась" not in message
+
+
 def test_parse_listing_raises_when_not_a_single_item_parsed() -> None:
     """Элементы есть, но ни один не разобрался — это смена формата, а не
     «вакансий нет». Тихая пустота здесь означала бы месяцы молчания при

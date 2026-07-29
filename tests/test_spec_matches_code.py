@@ -230,3 +230,47 @@ def test_spec_does_not_count_tests() -> None:
         "в спеке снова появился счётчик тестов: он устареет на следующем коммите, "
         "а сторожить его нечем"
     )
+
+
+# --- README §«Где смотреть результаты» ------------------------------------
+
+
+README = ROOT / "README.md"
+
+
+def readme_section(start: str, end: str) -> str:
+    text = README.read_text(encoding="utf-8")
+    return text[text.index(start) : text.index(end)]
+
+
+def test_readme_names_the_real_report_files() -> None:
+    """Имена файлов отчёта в README обязаны совпадать с тем, что пишут приёмники.
+
+    Секция описывает, куда человек идёт смотреть выдачу, — то есть ровно то
+    утверждение, которое ломается тихо: переименование файла оставит README
+    правдоподобным, а читателя отправит в пустой каталог.
+    """
+    section = readme_section("## Где смотреть результаты", "## Разработка")
+    for module, suffix in (("csv_sink", "csv"), ("markdown_sink", "md")):
+        source = (PACKAGE / "sinks" / f"{module}.py").read_text(encoding="utf-8")
+        assert f'-new.{suffix}"' in source, f"{module} больше не пишет файл `-new.{suffix}`"
+        assert f"-new.{suffix}`" in section, f"README не называет файл `-new.{suffix}`"
+
+
+def test_readme_lists_the_real_csv_columns() -> None:
+    """Список колонок CSV в README — копия `COLUMNS`, и копии обязаны сверяться."""
+    from hh_search.sinks.csv_sink import COLUMNS
+
+    section = readme_section("## Где смотреть результаты", "## Разработка")
+    assert ";".join(COLUMNS) in section, (
+        "перечень колонок в README разошёлся с `csv_sink.COLUMNS`: " + ";".join(COLUMNS)
+    )
+
+
+def test_readme_names_the_real_report_headings() -> None:
+    """Разделы markdown-отчёта названы так же, как их пишет приёмник."""
+    section = readme_section("## Где смотреть результаты", "## Разработка")
+    source = (PACKAGE / "sinks" / "markdown_sink.py").read_text(encoding="utf-8")
+    for heading in ("## Топ", "## Остальное"):
+        assert f'"{heading}"' in source, f"markdown_sink больше не пишет раздел {heading}"
+        assert f"`{heading}`" in section, f"README не называет раздел {heading}"
