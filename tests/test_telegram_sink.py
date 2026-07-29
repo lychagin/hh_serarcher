@@ -7,15 +7,19 @@
 """
 
 import logging
+from pathlib import Path
 
 import httpx
 import pytest
 
 from hh_search.sinks.telegram_sink import (
+    MESSAGE_LIMIT,
     TelegramClient,
     TelegramCredentials,
     TelegramError,
+    TelegramSink,
 )
+from tests.test_html_report import NOW, vacancy
 
 TOKEN = "1234567890:AAHtestTOKENvalueMUSTneverLEAK"
 CHAT_ID = "-1001234567890"
@@ -167,3 +171,135 @@ def test_ok_false_in_200_body_becomes_telegram_error() -> None:
     message = str(caught.value)
     assert TOKEN not in message
     assert "chat not found" in message
+
+
+class FakeClient:
+    """Подставной транспорт: считает вызовы и запоминает отправленное."""
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.messages: list[str] = []
+        self.documents: list[tuple[str, bytes, str]] = []
+        self._fail_on = fail_on
+
+    def send_message(self, text: str) -> None:
+        if self._fail_on == "sendMessage":
+            raise TelegramError("sendMessage: транспорт отказал (ConnectError)")
+        self.messages.append(text)
+
+    def send_document(self, filename: str, content: bytes, caption: str) -> None:
+        if self._fail_on == "sendDocument":
+            raise TelegramError("sendDocument: транспорт отказал (ConnectError)")
+        self.documents.append((filename, content, caption))
+
+
+def sink(tmp_path: Path, client: FakeClient, threshold: float = 60.0) -> TelegramSink:
+    return TelegramSink(tmp_path, threshold, client)  # type: ignore[arg-type]
+
+
+def test_emit_sends_message_and_document(tmp_path: Path) -> None:
+    client = FakeClient()
+    written = sink(tmp_path, client).emit([vacancy(total=87.3)], NOW)
+    assert written == 1
+    assert len(client.messages) == 1
+    assert len(client.documents) == 1
+
+
+def test_emit_writes_the_day_file(tmp_path: Path) -> None:
+    sink(tmp_path, FakeClient()).emit([vacancy()], NOW)
+    assert (tmp_path / "2026-07-29-new.html").exists()
+
+
+def test_document_filename_matches_the_day_file(tmp_path: Path) -> None:
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy()], NOW)
+    assert client.documents[0][0] == "2026-07-29-new.html"
+
+
+def test_second_emit_of_the_same_vacancy_writes_nothing_and_stays_silent(
+    tmp_path: Path,
+) -> None:
+    """Дедупликация по файлу дня — она же защита от дубля в канале.
+
+    При отказе ЛЮБОГО приёмника вакансии не помечаются отправленными
+    (`pipeline/reporting.py`) и приезжают в следующий прогон целиком.
+    """
+    client = FakeClient()
+    target = sink(tmp_path, client)
+    target.emit([vacancy(vacancy_id="1")], NOW)
+    assert target.emit([vacancy(vacancy_id="1")], NOW) == 0
+    assert len(client.messages) == 1
+    assert len(client.documents) == 1
+
+
+def test_second_emit_sends_only_the_new_vacancy(tmp_path: Path) -> None:
+    client = FakeClient()
+    target = sink(tmp_path, client)
+    target.emit([vacancy(vacancy_id="1", title="Первая")], NOW)
+    assert (
+        target.emit(
+            [vacancy(vacancy_id="1", title="Первая"), vacancy(vacancy_id="2", title="Вторая")],
+            NOW,
+        )
+        == 1
+    )
+    assert "Вторая" in client.messages[1]
+    assert "Первая" not in client.messages[1]
+
+
+def test_empty_input_touches_neither_network_nor_disk(tmp_path: Path) -> None:
+    """Иначе при interval_hours: 4 канал получал бы шесть пустых сводок в сутки."""
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([], NOW) == 0
+    assert not client.messages
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_failed_send_leaves_the_day_file_untouched(tmp_path: Path) -> None:
+    """Сперва отправка, потом запись (спека §5).
+
+    Обратный порядок означал бы: отправка упала, вакансии уже в файле,
+    следующий прогон их дедуплицирует и не отправит НИКОГДА.
+    """
+    client = FakeClient(fail_on="sendMessage")
+    with pytest.raises(TelegramError):
+        sink(tmp_path, client).emit([vacancy()], NOW)
+    assert not (tmp_path / "2026-07-29-new.html").exists()
+
+
+def test_retry_after_failure_sends_the_vacancy(tmp_path: Path) -> None:
+    """Продолжение предыдущего: следующий прогон обязан довезти."""
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendMessage")).emit([vacancy()], NOW)
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([vacancy()], NOW) == 1
+    assert len(client.messages) == 1
+
+
+def test_long_top_is_truncated_with_an_honest_tail(tmp_path: Path) -> None:
+    """Молчаливое обрезание запрещено: 5 позиций укладываются, 500 — нет."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия номер {index} " + "и" * 80, total=90.0)
+        for index in range(200)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    assert len(message) <= MESSAGE_LIMIT
+    assert "в файле" in message
+
+
+def test_message_escapes_dangerous_characters_in_the_title(tmp_path: Path) -> None:
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(title="R&D <b>", total=90.0)], NOW)
+    assert "R&amp;D &lt;b&gt;" in client.messages[0]
+
+
+def test_document_carries_the_whole_day_not_just_the_new_part(tmp_path: Path) -> None:
+    """Сообщение — «что нового», файл — «что есть» (спека §2)."""
+    client = FakeClient()
+    target = sink(tmp_path, client)
+    target.emit([vacancy(vacancy_id="1", title="Утренняя")], NOW)
+    target.emit([vacancy(vacancy_id="2", title="Вечерняя")], NOW)
+    content = client.documents[1][1].decode()
+    assert "Утренняя" in content
+    assert "Вечерняя" in content
