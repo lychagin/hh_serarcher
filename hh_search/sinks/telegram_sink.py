@@ -1,30 +1,15 @@
-"""Приёмник `telegram`: транспорт Bot API и отправка отчёта.
+"""Приёмник `telegram`: сборка отчёта поверх транспорта `telegram_client.py`.
 
-К `api.telegram.org` идёт обычный `httpx`, а НЕ вежливый клиент из
-`sources/http.py`: тот проверяет `robots.txt` и держит паузу
-`delay_between_requests_sec` под hh.ru. Применять его здесь означало бы и
-бессмысленную проверку чужого `robots.txt`, и паузу вежливости там, где
-вежливость измеряется иначе.
-
-Токен лежит в ПУТИ URL (`/bot<ТОКЕН>/sendMessage`), а `httpx` кладёт URL в
-текст своих исключений. Поэтому наружу они не выпускаются ни при каких
-обстоятельствах: ловятся и заменяются `TelegramError`, в которой стоит имя
-метода. Сторожат это тесты в `tests/test_telegram_sink.py`.
-
-Ловится `Exception`, а не `httpx.HTTPError`: `httpx.InvalidURL` (URL с
-управляющим символом — правдоподобно при кривом `.env`, где `.strip()` в
-`TelegramCredentials.from_env` чистит только края строки) наследует не
-`HTTPError`, а напрямую `Exception` — перечисление подклассов `httpx`
-пропустило бы его наружу вместе с URL, то есть токеном.
+Транспорт (учётные данные, `TelegramClient`, обработка отказов Bot API)
+вынесен в отдельный модуль намеренно: этот класс зовёт только два публичных
+метода `TelegramClient` и никогда не касается токена или URL — ровно так же,
+как приёмники `csv`/`markdown` зовут чистые функции `html_report.py`, не
+зная о транспорте вообще.
 """
 
-import logging
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-
-import httpx
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.html_report import (
@@ -33,127 +18,7 @@ from hh_search.sinks.html_report import (
     escape_html,
     render_section,
 )
-
-logger = logging.getLogger(__name__)
-
-API_ROOT = "https://api.telegram.org"
-# Потолок `sendMessage` у Bot API. Держим здесь, а не в конфиге: это не
-# наша настройка, а чужое ограничение, и менять его нам нечем.
-MESSAGE_LIMIT = 4096
-# Потолок подписи к документу — там же и по той же причине.
-CAPTION_LIMIT = 1024
-
-
-class TelegramError(RuntimeError):
-    """Отказ Bot API или транспорта. Текст НИКОГДА не содержит токена."""
-
-
-@dataclass(frozen=True)
-class TelegramCredentials:
-    token: str
-    chat_id: str
-
-    @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "TelegramCredentials":
-        """Секреты из окружения. Отсутствие любого — отказ на старте.
-
-        Пустая строка и пробелы отвергаются наравне с отсутствием: `.env` с
-        `TELEGRAM_CHAT_ID=` — самая частая форма недописанной настройки, и
-        отказ по ней обязан случиться до сети, а не 400-й от Telegram
-        посреди прогона.
-
-        В текст ошибки не подставляется ЗНАЧЕНИЕ переменной — только имя.
-        """
-        missing = [
-            name
-            for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
-            if not env.get(name, "").strip()
-        ]
-        if missing:
-            raise ValueError(
-                f"приёмник telegram включён, но не задано: {', '.join(missing)}. "
-                "Переменные читаются из окружения (в контейнер приезжают из .env)"
-            )
-        return cls(
-            token=env["TELEGRAM_BOT_TOKEN"].strip(),
-            chat_id=env["TELEGRAM_CHAT_ID"].strip(),
-        )
-
-
-class TelegramClient:
-    """Два метода Bot API и ни одного лишнего."""
-
-    def __init__(
-        self,
-        credentials: TelegramCredentials,
-        timeout_sec: float = 20.0,
-        transport: httpx.BaseTransport | None = None,
-    ) -> None:
-        self._credentials = credentials
-        self._timeout_sec = timeout_sec
-        self._transport = transport
-
-    def send_message(self, text: str) -> None:
-        self._call(
-            "sendMessage",
-            data={
-                "chat_id": self._credentials.chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": "true",
-            },
-        )
-
-    def send_document(self, filename: str, content: bytes, caption: str) -> None:
-        self._call(
-            "sendDocument",
-            data={"chat_id": self._credentials.chat_id, "caption": caption[:CAPTION_LIMIT]},
-            files={"document": (filename, content, "text/html")},
-        )
-
-    def _call(
-        self,
-        method: str,
-        data: dict[str, str],
-        files: dict[str, tuple[str, bytes, str]] | None = None,
-    ) -> None:
-        url = f"{API_ROOT}/bot{self._credentials.token}/{method}"
-        try:
-            with httpx.Client(timeout=self._timeout_sec, transport=self._transport) as http:
-                response = http.post(url, data=data, files=files)
-        except Exception as error:  # noqa: BLE001 — см. докстринг модуля: не
-            # только `httpx.HTTPError`, но и `httpx.InvalidURL` (отдельная
-            # ветка наследования от `Exception`) обязаны быть перехвачены,
-            # а перечисление конкретных подклассов `httpx` ненадёжно на
-            # будущее. `error` МОЖЕТ содержать URL, то есть токен — наружу
-            # уходит только тип исключения.
-            raise TelegramError(f"{method}: транспорт отказал ({type(error).__name__})") from None
-        payload = _payload(response)
-        if response.status_code != httpx.codes.OK or not _is_ok(payload):
-            # Bot API возвращает смысловой отказ (`{"ok": false, ...}`) и
-            # при HTTP 200 — статус один не решает успех, решает поле `ok`.
-            raise TelegramError(f"{method}: {response.status_code}, {_description(payload)}")
-
-
-def _payload(response: httpx.Response) -> object:
-    """Тело ответа Bot API как JSON, либо `None`, если оно не разобралось."""
-    try:
-        return response.json()
-    except ValueError:
-        return None
-
-
-def _is_ok(payload: object) -> bool:
-    """Успех решает поле `ok` в теле, а не HTTP-статус (см. `_call`)."""
-    return isinstance(payload, dict) and payload.get("ok") is True
-
-
-def _description(payload: object) -> str:
-    """Человеческая причина отказа из уже разобранного тела ответа Bot API."""
-    if payload is None:
-        return "тело ответа не разобрано"
-    description = payload.get("description") if isinstance(payload, dict) else None
-    return str(description) if description else "без описания"
+from hh_search.sinks.telegram_client import MESSAGE_LIMIT, TelegramClient
 
 
 class TelegramSink:
@@ -164,8 +29,26 @@ class TelegramSink:
     приёмника `report()` не помечает вакансии отправленными и они приезжают
     снова.
 
-    Порядок: СПЕРВА отправка, ПОТОМ запись файла. Обратный порядок при этой
-    дедупликации означал бы тихую потерю — см. спеку §5.
+    Порядок в `emit` — три шага, и запись файла стоит МЕЖДУ двумя отправками,
+    а не до или после обеих (спека §5, раунд ревью 1):
+
+    1. `send_message` — если падает, файл не тронут, следующий прогон
+       повторит всё целиком; дубля нет, потому что сообщение не ушло.
+    2. запись файла дня на диск.
+    3. `send_document` — если падает, файл уже на месте: следующий прогон
+       найдёт вакансии в файле дедупликацией, вернёт 0 и сообщение НЕ
+       повторит.
+
+    Файл до обеих отправок воспроизводил бы старую находку («сперва
+    отправка, потом запись») — отказ `send_message` оставлял бы вакансии
+    уже в файле, и следующий прогон не отправил бы их НИКОГДА. Файл после
+    обеих — новую: `send_message` уходит успешно, `send_document` падает,
+    файл остаётся пустым, и следующий прогон, не найдя вакансию в файле,
+    шлёт то же сообщение в канал ВТОРОЙ раз. Место между отправками —
+    единственное, где обе дыры закрыты одновременно: потеря на шаге 3
+    ограничена документом ОДНОГО прогона и самоизлечивается — файл дня
+    накопительный, и следующий вызов `send_document` в сутках довезёт его
+    целиком, уже со всеми записями.
     """
 
     name = "telegram"
@@ -189,10 +72,11 @@ class TelegramSink:
         document = (existing or document_header(now)) + section
 
         self._client.send_message(self._message(fresh))
-        self._client.send_document(path.name, document.encode("utf-8"), f"Отчёт за {now:%Y-%m-%d}")
 
         self._reports_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(document, encoding="utf-8")
+
+        self._client.send_document(path.name, document.encode("utf-8"), f"Отчёт за {now:%Y-%m-%d}")
         return len(fresh)
 
     def _message(self, fresh: Sequence[ScoredVacancy]) -> str:

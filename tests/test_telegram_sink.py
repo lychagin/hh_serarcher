@@ -12,13 +12,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from hh_search.sinks.telegram_sink import (
+from hh_search.sinks.telegram_client import (
     MESSAGE_LIMIT,
     TelegramClient,
     TelegramCredentials,
     TelegramError,
-    TelegramSink,
 )
+from hh_search.sinks.telegram_sink import TelegramSink
 from tests.test_html_report import NOW, vacancy
 
 TOKEN = "1234567890:AAHtestTOKENvalueMUSTneverLEAK"
@@ -254,11 +254,12 @@ def test_empty_input_touches_neither_network_nor_disk(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
-def test_failed_send_leaves_the_day_file_untouched(tmp_path: Path) -> None:
-    """Сперва отправка, потом запись (спека §5).
+def test_failed_send_message_leaves_the_day_file_untouched(tmp_path: Path) -> None:
+    """`send_message` — первый шаг (спека §5). Его отказ обязан оставить файл нетронутым.
 
-    Обратный порядок означал бы: отправка упала, вакансии уже в файле,
-    следующий прогон их дедуплицирует и не отправит НИКОГДА.
+    Обратный порядок (запись раньше `send_message`) означал бы: отправка
+    упала, вакансии уже в файле, следующий прогон их дедуплицирует и не
+    отправит НИКОГДА.
     """
     client = FakeClient(fail_on="sendMessage")
     with pytest.raises(TelegramError):
@@ -266,13 +267,46 @@ def test_failed_send_leaves_the_day_file_untouched(tmp_path: Path) -> None:
     assert not (tmp_path / "2026-07-29-new.html").exists()
 
 
-def test_retry_after_failure_sends_the_vacancy(tmp_path: Path) -> None:
+def test_retry_after_send_message_failure_sends_the_vacancy(tmp_path: Path) -> None:
     """Продолжение предыдущего: следующий прогон обязан довезти."""
     with pytest.raises(TelegramError):
         sink(tmp_path, FakeClient(fail_on="sendMessage")).emit([vacancy()], NOW)
     client = FakeClient()
     assert sink(tmp_path, client).emit([vacancy()], NOW) == 1
     assert len(client.messages) == 1
+
+
+def test_partial_failure_on_send_document_still_writes_the_day_file(tmp_path: Path) -> None:
+    """Файл дня пишется МЕЖДУ отправками, а не после обеих (спека §5, раунд 1).
+
+    `send_message` уже ушёл, когда падает `send_document`. Если бы запись
+    файла стояла после `send_document`, отказ оставлял бы файл пустым —
+    следующий прогон не находил бы вакансию в файле и слал бы то же
+    сообщение в канал повторно (находка ревью: дубль при частичном отказе).
+    Запись между отправками лечит это: файл на месте ДО того, как второй
+    вызов вообще может упасть.
+    """
+    client = FakeClient(fail_on="sendDocument")
+    with pytest.raises(TelegramError):
+        sink(tmp_path, client).emit([vacancy()], NOW)
+    assert (tmp_path / "2026-07-29-new.html").exists()
+    assert len(client.messages) == 1
+
+
+def test_retry_after_send_document_failure_does_not_resend_the_message(tmp_path: Path) -> None:
+    """Продолжение предыдущего: файл уже на месте, повторный прогон не шлёт сообщение снова.
+
+    Потеря одна и самоизлечивающаяся: документ за неудачный прогон не
+    пришёл, но файл дня накопительный, и следующий вызов `send_document`
+    (из следующего прогона суток) довезёт его целиком, уже со всеми
+    записями.
+    """
+    client = FakeClient(fail_on="sendDocument")
+    with pytest.raises(TelegramError):
+        sink(tmp_path, client).emit([vacancy()], NOW)
+    retry_client = FakeClient()
+    assert sink(tmp_path, retry_client).emit([vacancy()], NOW) == 0
+    assert not retry_client.messages
 
 
 def test_long_top_is_truncated_with_an_honest_tail(tmp_path: Path) -> None:
