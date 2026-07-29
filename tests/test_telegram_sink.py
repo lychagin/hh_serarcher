@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from hh_search.sinks import build_sinks
 from hh_search.sinks.telegram_client import (
     MESSAGE_LIMIT,
     TelegramClient,
@@ -337,3 +338,37 @@ def test_document_carries_the_whole_day_not_just_the_new_part(tmp_path: Path) ->
     content = client.documents[1][1].decode()
     assert "Утренняя" in content
     assert "Вечерняя" in content
+
+
+def test_build_sinks_creates_telegram_sink(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", CHAT_ID)
+    sinks = build_sinks(["telegram"], tmp_path, 60.0)
+    assert [item.name for item in sinks] == ["telegram"]
+
+
+def test_build_sinks_refuses_telegram_without_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Отказ на старте, до сети (спека §4): `build_sinks` зовётся из
+    `_sinks()` до `start_run()`, и его ValueError уже даёт EXIT_CONFIG."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    with pytest.raises(ValueError):
+        build_sinks(["telegram"], tmp_path, 60.0)
+
+
+def test_build_sinks_error_names_the_variables_not_their_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    with pytest.raises(ValueError) as caught:
+        build_sinks(["telegram"], tmp_path, 60.0)
+    assert "TELEGRAM_CHAT_ID" in str(caught.value)
+    assert TOKEN not in str(caught.value)
+
+
+def test_unknown_sink_still_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        build_sinks(["карандаш"], tmp_path, 60.0)
