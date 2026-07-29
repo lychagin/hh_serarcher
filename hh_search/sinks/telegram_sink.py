@@ -9,7 +9,13 @@
 Токен лежит в ПУТИ URL (`/bot<ТОКЕН>/sendMessage`), а `httpx` кладёт URL в
 текст своих исключений. Поэтому наружу они не выпускаются ни при каких
 обстоятельствах: ловятся и заменяются `TelegramError`, в которой стоит имя
-метода. Сторожат это три теста в `tests/test_telegram_sink.py`.
+метода. Сторожат это тесты в `tests/test_telegram_sink.py`.
+
+Ловится `Exception`, а не `httpx.HTTPError`: `httpx.InvalidURL` (URL с
+управляющим символом — правдоподобно при кривом `.env`, где `.strip()` в
+`TelegramCredentials.from_env` чистит только края строки) наследует не
+`HTTPError`, а напрямую `Exception` — перечисление подклассов `httpx`
+пропустило бы его наружу вместе с URL, то есть токеном.
 """
 
 import logging
@@ -105,18 +111,36 @@ class TelegramClient:
         try:
             with httpx.Client(timeout=self._timeout_sec, transport=self._transport) as http:
                 response = http.post(url, data=data, files=files)
-        except httpx.HTTPError as error:
-            # `error` СОДЕРЖИТ URL, то есть токен. Наружу уходит только тип.
+        except Exception as error:  # noqa: BLE001 — см. докстринг модуля: не
+            # только `httpx.HTTPError`, но и `httpx.InvalidURL` (отдельная
+            # ветка наследования от `Exception`) обязаны быть перехвачены,
+            # а перечисление конкретных подклассов `httpx` ненадёжно на
+            # будущее. `error` МОЖЕТ содержать URL, то есть токен — наружу
+            # уходит только тип исключения.
             raise TelegramError(f"{method}: транспорт отказал ({type(error).__name__})") from None
-        if response.status_code != httpx.codes.OK:
-            raise TelegramError(f"{method}: {response.status_code}, {_description(response)}")
+        payload = _payload(response)
+        if response.status_code != httpx.codes.OK or not _is_ok(payload):
+            # Bot API возвращает смысловой отказ (`{"ok": false, ...}`) и
+            # при HTTP 200 — статус один не решает успех, решает поле `ok`.
+            raise TelegramError(f"{method}: {response.status_code}, {_description(payload)}")
 
 
-def _description(response: httpx.Response) -> str:
-    """Человеческая причина отказа из тела ответа Bot API."""
+def _payload(response: httpx.Response) -> object:
+    """Тело ответа Bot API как JSON, либо `None`, если оно не разобралось."""
     try:
-        payload = response.json()
+        return response.json()
     except ValueError:
+        return None
+
+
+def _is_ok(payload: object) -> bool:
+    """Успех решает поле `ok` в теле, а не HTTP-статус (см. `_call`)."""
+    return isinstance(payload, dict) and payload.get("ok") is True
+
+
+def _description(payload: object) -> str:
+    """Человеческая причина отказа из уже разобранного тела ответа Bot API."""
+    if payload is None:
         return "тело ответа не разобрано"
     description = payload.get("description") if isinstance(payload, dict) else None
     return str(description) if description else "без описания"

@@ -132,3 +132,38 @@ def test_failure_does_not_write_the_token_to_the_log(
     with caplog.at_level(logging.DEBUG), pytest.raises(TelegramError):
         client(handler).send_message("привет")
     assert TOKEN not in caplog.text
+
+
+def test_invalid_url_becomes_telegram_error_without_the_token() -> None:
+    """`httpx.InvalidURL` не наследует `httpx.HTTPError` (`__mro__` —
+    `(InvalidURL, Exception, ...)`), поэтому перечисление `except httpx.HTTPError`
+    пропускает его мимо, и он вылетает наружу вместе с URL, то есть токеном.
+    Управляющий символ внутри токена правдоподобен при кривом `.env`: `.strip()`
+    в `from_env` чистит только края строки."""
+    broken_token = "1234567890:AAHtest\nTOKENvalueMUSTneverLEAK"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    broken_client = TelegramClient(
+        TelegramCredentials(token=broken_token, chat_id=CHAT_ID), transport=transport
+    )
+    with pytest.raises(TelegramError) as caught:
+        broken_client.send_message("привет")
+    assert broken_token not in str(caught.value)
+    assert "TOKENvalueMUSTneverLEAK" not in str(caught.value)
+
+
+def test_ok_false_in_200_body_becomes_telegram_error() -> None:
+    """Bot API отвечает статусом 200 даже на смысловой отказ — успех решает
+    поле `ok` в теле, а не HTTP-статус."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "description": "chat not found"})
+
+    with pytest.raises(TelegramError) as caught:
+        client(handler).send_message("привет")
+    message = str(caught.value)
+    assert TOKEN not in message
+    assert "chat not found" in message
