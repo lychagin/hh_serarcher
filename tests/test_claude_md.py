@@ -3,12 +3,16 @@
 Правило проекта «документ без сторожащего теста протухает» применяется и к
 самому CLAUDE.md. Здесь живут сторожа его утверждений — тех, которые дёшево
 сверить исполнением: пути существуют, состав ворот совпадает со скриптом, CI
-зовёт скрипт и только его, корневой документ знает все вложенные.
+зовёт скрипт и только его, корневой документ знает все вложенные, а сам
+скрипт действительно останавливается на первой красной проверке.
 
 Каждый сторож проверен мутацией: порча утверждения красит ровно один тест.
 """
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -19,10 +23,19 @@ CI = ROOT / ".github/workflows/ci.yml"
 
 
 def _ci_run_steps() -> list[str]:
-    """Тело каждого `run`-шага джобы CI."""
+    """Тело каждого `run`-шага КАЖДОЙ джобы CI.
+
+    Обход по всем джобам, а не по одной `check`: вторая джоба с прямым
+    вызовом `pytest` вернула бы состав ворот в два места, а сторож,
+    смотрящий в одну джобу, этого не увидел бы.
+    """
     workflow = yaml.safe_load(CI.read_text(encoding="utf-8"))
-    steps = workflow["jobs"]["check"]["steps"]
-    return [step["run"] for step in steps if "run" in step]
+    return [
+        step["run"]
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if "run" in step
+    ]
 
 
 def test_ci_runs_the_gate_and_no_check_beside_it() -> None:
@@ -124,12 +137,50 @@ def test_claude_md_gate_section_matches_the_gate_script() -> None:
     assert documented == _uv_commands(GATE.read_text(encoding="utf-8"))
 
 
+def test_gate_stops_on_the_first_red_check(tmp_path: Path) -> None:
+    """Ворота обязаны упасть на первой красной проверке, а не досчитать до конца.
+
+    Сторожа выше сверяют состав ворот по тексту и останутся зелёными, если из
+    `gate` пропадёт строка `set -eu`. Без неё красная первая проверка не
+    останавливает скрипт: он досчитывает до конца, печатает «Ворота зелёные» и
+    возвращает 0 — ровно тот класс отказа «прогнал не всё и сказал зелено»,
+    ради закрытия которого `gate` и заведён. Проверяется он только исполнением.
+
+    Настоящий `uv` не зовётся и сеть не задействуется: в `PATH` подставлен
+    фальшивый `uv`, который записывает свой вызов и падает ненулевым кодом.
+    """
+    script = tmp_path / "gate"
+    shutil.copy(GATE, script)
+    script.chmod(0o755)
+    calls = tmp_path / "uv-calls.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\nexit 1\n', encoding="utf-8")
+    fake_uv.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}
+
+    result = subprocess.run([str(script)], env=env, capture_output=True, text=True, check=False)
+
+    assert result.returncode != 0, f"ворота вернули 0 при красной проверке:\n{result.stdout}"
+    assert "Ворота зелёные" not in result.stdout + result.stderr
+    made = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+    assert made == ["run ruff check ."], f"ворота не встали на первой красной проверке: {made}"
+
+
 def test_root_claude_md_names_every_nested_file() -> None:
-    """Корневой документ обязан называть ровно те вложенные, что существуют.
+    """Корневой документ обязан называть ровно те вложенные, что существуют
+    внутри `hh_search/`.
 
     Приём тот же, что в §4.3 спеки: сторожится не число, а список. Третий
     вложенный файл, появившийся без строки в корневом, останется
     ненайденным для читателя, который в тот каталог не заходил.
+
+    Граница названа, как и дыра в `_looks_like_a_path`: обход идёт по
+    `_claude_md_files`, то есть только по пакету. `tests/CLAUDE.md` или
+    `docs/CLAUDE.md` не заметит ни этот сторож, ни сторож путей — вложенные
+    документы заведены как инварианты слоёв кода. Документ, заведённый вне
+    пакета и не упомянутый в корневом, пройдёт молча (спека §6.4).
     """
     text = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     documented = set(re.findall(r"`(hh_search/[^`\n]*CLAUDE\.md)`", text))
