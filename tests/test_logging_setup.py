@@ -25,14 +25,21 @@ from pathlib import Path
 
 import pytest
 
-from hh_search.logging_setup import ResilientFileHandler, setup_logging
+from hh_search import logging_setup
+from hh_search.logging_setup import ResilientFileHandler, redact_secret, setup_logging
 
 
 @pytest.fixture(autouse=True)
 def _restore_root_logger() -> Iterator[None]:
-    """`setup_logging` перенастраивает КОРНЕВОЙ логгер — вернём его на место."""
+    """`setup_logging` перенастраивает КОРНЕВОЙ логгер — вернём его на место.
+
+    Реестр секретов (`_secrets`) — тоже общее состояние, переживающее
+    отдельный тест: без сброса секрет, зарегистрированный здесь, утёк бы в
+    фильтры обработчиков, которые создаст следующий тест другого модуля.
+    """
     root = logging.getLogger()
     handlers, level = root.handlers[:], root.level
+    secrets = logging_setup._secrets[:]  # noqa: SLF001 — тестовый сброс общего реестра
     quiet = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
     yield
     for handler in root.handlers[:]:
@@ -40,6 +47,7 @@ def _restore_root_logger() -> Iterator[None]:
             handler.close()
     root.handlers[:] = handlers
     root.setLevel(level)
+    logging_setup._secrets[:] = secrets  # noqa: SLF001 — тестовый сброс общего реестра
     for name, value in quiet.items():
         logging.getLogger(name).setLevel(value)
 
@@ -171,6 +179,58 @@ def test_a_log_directory_that_breaks_later_disables_the_file_once(
     assert "отключён после первой же ошибки записи" in captured
     # Записи, шедшие после отказа, никуда не делись: stdout остался.
     assert captured.count("после аварии") == 5
+
+
+# --- item 5: секрет обязан вычищаться и из exc_info -------------------------
+
+
+def test_redact_secret_scrubs_a_leaked_exception_from_exc_info(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`_TokenFilter`/`TokenFilter` чистил только `record.getMessage()`.
+
+    Сегодня в `telegram_client.py` цепочка исключений обнулена намеренно
+    (`raise TelegramError(...)` вне блока `except`), поэтому секрет туда
+    попасть не может. Но `exc_info` форматируется ОТДЕЛЬНО и ЛЕНИВО —
+    внутри `Formatter.format()`, — и будущий `raise ... from error` вернул
+    бы исходное исключение httpx (а с ним и URL с токеном) в traceback
+    молча, без единого красного теста. Сторож проверяет фильтр напрямую,
+    не дожидаясь, пока это станет фактом в telegram_client.
+    """
+    secret = "/botSECRETTOKEN12345/"
+    setup_logging(tmp_path / "logs")
+    redact_secret(secret, "<СКРЫТО>")
+    try:
+        raise RuntimeError(f"боевой запрос упал: https://api.telegram.org{secret}sendMessage")
+    except RuntimeError:
+        logging.getLogger("hh_search.test").error("сетевая ошибка", exc_info=True)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    log = (tmp_path / "logs" / "hh.log").read_text(encoding="utf-8")
+    assert secret not in log, "секрет утёк через exc_info"
+    assert "<СКРЫТО>" in log
+    assert secret not in capsys.readouterr().out
+
+
+# --- item 6: защита не зависит от порядка «setup_logging → создание клиента» -
+
+
+def test_redact_secret_protects_handlers_created_after_registration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Секрет, зарегистрированный ДО `setup_logging`, обязан достать и до
+    обработчиков, которых ещё не существует: `setup_logging` заменяет
+    обработчики корня целиком (`root.handlers.clear()`), и клиент,
+    построенный раньше неё, без этого тихо терял бы защиту."""
+    secret = "/botEARLYTOKEN98765/"
+    redact_secret(secret, "<СКРЫТО>")
+    setup_logging(tmp_path / "logs")
+    logging.getLogger("hh_search.test").error("утечка через %s", secret)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    log = (tmp_path / "logs" / "hh.log").read_text(encoding="utf-8")
+    assert secret not in log
+    assert secret not in capsys.readouterr().out
 
 
 def test_the_broken_file_handler_stops_trying(tmp_path: Path) -> None:

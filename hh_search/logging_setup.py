@@ -15,11 +15,84 @@ FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 # Это ещё и защита секрета, а не только борьба с шумом: в строке httpx
 # лежит полный URL, а у Bot API токен стоит в ПУТИ URL
 # (`/bot<ТОКЕН>/sendMessage`). Второй, независимой защитой служит
-# `_TokenFilter` из `sinks/telegram_client.py`, и он висит на обработчиках
-# корня — потому что глушилка ниже снимается одной строкой в чужой отладке
+# `TokenFilter` (ниже в этом модуле), и он висит на обработчиках корня —
+# потому что глушилка ниже снимается одной строкой в чужой отладке
 # (`logging.getLogger("httpx").setLevel(logging.INFO)`), а защита пароля
 # бота не имеет права зависеть от чужого уровня логирования.
 QUIET_LOGGERS = ("httpx", "httpcore")
+
+# Секреты, зарегистрированные через `redact_secret`, — переживают порядок
+# вызовов. `TelegramClient` вешал фильтр на обработчики корня САМ, из
+# своего `__init__`, и это работало только потому, что в `__main__.py` он
+# сегодня строится ПОСЛЕ `setup_logging`. Порядок нигде не закреплён:
+# клиент, построенный раньше нее, добавил бы фильтр к обработчикам,
+# которые `setup_logging` тут же заменит (`root.handlers.clear()`), — и
+# токен тихо потёк бы в новые. Регистрация здесь избавляет защиту от этой
+# зависимости: `redact_secret` применяет фильтр к обработчикам, какие есть
+# СЕЙЧАС, а `setup_logging` — ко всем зарегистрированным секретам на
+# КАЖДЫЕ новые обработчики, которые создаёт, в любом порядке вызовов.
+_secrets: list[tuple[str, str]] = []
+
+
+class TokenFilter(logging.Filter):
+    """Вычищает секрет из записи, кто бы её ни сделал, — и из сообщения, и
+    из уже отформатированного `exc_info`.
+
+    Обе части чистятся отдельно, потому что формируются отдельно:
+    `record.getMessage()` ничего не знает про `exc_info` — тот
+    форматируется ЛЕНИВО, внутри `Formatter.format()`, и результат
+    кешируется в `record.exc_text`. Фильтр из первой редакции чистил
+    только сообщение; сегодня в `telegram_client.py` цепочка исключений
+    обнулена намеренно, и утечки через `exc_info` быть не может, но
+    будущий `raise ... from error` вернул бы её молча, без единого
+    красного теста, — поэтому вторая половина закрыта здесь и сейчас, а не
+    когда это станет фактом.
+    """
+
+    def __init__(self, secret: str, replacement: str) -> None:
+        super().__init__()
+        self.secret = secret
+        self.replacement = replacement
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if self.secret in message:
+            # Аргументы уже подставлены, поэтому их надо снять: иначе
+            # обработчик подставил бы их второй раз в уже готовый текст.
+            record.msg = message.replace(self.secret, self.replacement)
+            record.args = None
+        if record.exc_info:
+            text = record.exc_text or logging.Formatter().formatException(record.exc_info)
+            if self.secret in text:
+                record.exc_text = text.replace(self.secret, self.replacement)
+            elif record.exc_text is None:
+                # Досчитано один раз здесь — пусть `Formatter.format()` не
+                # считает то же самое ещё раз.
+                record.exc_text = text
+        return True
+
+
+def redact_secret(secret: str, replacement: str) -> None:
+    """Зарегистрировать секрет и вычистить его из ТЕКУЩИХ обработчиков корня.
+
+    Регистрация не зависит от момента вызова относительно `setup_logging`
+    (спека приёмника telegram §4, находка item 6): применяется сразу к
+    тому, что есть, а любой следующий `setup_logging` подхватит весь
+    список для обработчиков, которые создаст он сам.
+    """
+    if (secret, replacement) not in _secrets:
+        _secrets.append((secret, replacement))
+    _apply_secrets(logging.getLogger().handlers)
+
+
+def _apply_secrets(handlers: list[logging.Handler]) -> None:
+    for secret, replacement in _secrets:
+        for handler in handlers:
+            if not any(
+                isinstance(existing, TokenFilter) and existing.secret == secret
+                for existing in handler.filters
+            ):
+                handler.addFilter(TokenFilter(secret, replacement))
 
 
 class ResilientFileHandler(RotatingFileHandler):
@@ -101,6 +174,7 @@ def setup_logging(logs_dir: Path, level: int = logging.INFO) -> None:
     for handler in handlers:
         handler.setFormatter(formatter)
         root.addHandler(handler)
+    _apply_secrets(handlers)
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
     if file_error is not None:

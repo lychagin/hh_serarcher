@@ -23,11 +23,12 @@
 чистые функции `html_report.py`, не зная о транспорте вообще.
 """
 
-import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 import httpx
+
+from hh_search.logging_setup import redact_secret
 
 API_ROOT = "https://api.telegram.org"
 # Потолок `sendMessage` у Bot API. Держим здесь, а не в конфиге: это не
@@ -57,51 +58,19 @@ class TelegramError(RuntimeError):
     """Отказ Bot API или транспорта. Текст НИКОГДА не содержит токена."""
 
 
-class _TokenFilter(logging.Filter):
-    """Вычищает `/bot<токен>/` из записи, кто бы её ни сделал.
-
-    Нужен потому, что `httpx` пишет `HTTP Request: POST <URL> "200 OK"` на
-    КАЖДЫЙ успешный запрос, а токен лежит в ПУТИ URL. До появления фильтра
-    от утечки спасал только `QUIET_LOGGERS` в `logging_setup.py` — то есть
-    один вечер отладки запросов к hh.ru
-    (`logging.getLogger("httpx").setLevel(logging.INFO)`) выносил пароль
-    бота в `data/logs/hh.log`, файл, который человек первым делом
-    кому-нибудь показывает.
-    """
-
-    def __init__(self, secret: str) -> None:
-        super().__init__()
-        self.secret = secret
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        if self.secret in message:
-            # Аргументы уже подставлены, поэтому их надо снять: иначе
-            # обработчик подставил бы их второй раз в уже готовый текст.
-            record.msg = message.replace(self.secret, REDACTED)
-            record.args = None
-        return True
-
-
 def _guard_logs(token: str) -> None:
-    """Поставить фильтр на ОБРАБОТЧИКИ корневого логгера.
+    """Зарегистрировать токен как секрет, обязанный вычищаться из логов.
 
-    Именно на обработчики, а не на логгер `httpx`: фильтр логгера
-    применяется только к записям, сделанным через него, и не переживает ни
-    чужой `setLevel`, ни второй логгер (`httpcore`). Обработчик же видит
-    каждую запись, которая доходит до stdout или файла, — значит защита не
-    зависит от того, кому какой уровень выставили. Вызывается из
-    `TelegramClient.__init__`, а он строится в `build_sinks` — то есть
-    после `setup_logging` (`_config` в `__main__.py`), которая обработчики
-    корня и создаёт.
+    Сама фильтрация (`TokenFilter`) и её независимость от порядка вызовов
+    живут в `logging_setup.py` (спека §4, находка item 6): та же угроза,
+    защита нужна не только Telegram-клиенту, поэтому и живёт не здесь.
+    `httpx` пишет `HTTP Request: POST <URL> "200 OK"` на КАЖДЫЙ успешный
+    запрос, а токен лежит в ПУТИ URL — без фильтра на обработчиках один
+    вечер отладки (`logging.getLogger("httpx").setLevel(logging.INFO)`)
+    вынес бы пароль бота в `data/logs/hh.log`, файл, который человек первым
+    делом кому-нибудь показывает.
     """
-    secret = f"/bot{token}/"
-    for handler in logging.getLogger().handlers:
-        if not any(
-            isinstance(existing, _TokenFilter) and existing.secret == secret
-            for existing in handler.filters
-        ):
-            handler.addFilter(_TokenFilter(secret))
+    redact_secret(f"/bot{token}/", REDACTED)
 
 
 @dataclass(frozen=True)
