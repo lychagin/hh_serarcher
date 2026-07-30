@@ -38,3 +38,87 @@ def test_ci_runs_the_gate_and_no_check_beside_it() -> None:
     assert "./gate" in runs, f"CI не зовёт ./gate: {runs}"
     direct = [run for run in runs if re.search(r"\b(ruff|mypy|pytest)\b", run)]
     assert direct == [], f"проверка в CI идёт мимо ./gate: {direct}"
+
+
+# Расширения, по которым токен без слэша всё равно опознаётся как путь.
+# `.txt` здесь нет намеренно: `robots.txt` упоминается как имя файла на
+# стороне hh.ru, а не как файл репозитория.
+PATH_SUFFIXES = (".md", ".py", ".yaml", ".yml", ".sql", ".toml")
+
+# Пути, которых нет в свежем клоне: рабочий том и локальный .env оба под
+# .gitignore. Упомянуть их в CLAUDE.md нужно, а проверить существованием
+# нельзя — в CI проверка бы краснела на чистом checkout.
+RUNTIME_ONLY = frozenset({"data", ".env"})
+
+
+def _uv_commands(text: str) -> list[str]:
+    """Строки, начинающиеся с `uv run`, в порядке появления."""
+    return [line.strip() for line in text.splitlines() if line.strip().startswith("uv run ")]
+
+
+def _section(path: Path, heading: str) -> str:
+    """Текст раздела от заголовка до следующего заголовка того же уровня."""
+    text = path.read_text(encoding="utf-8")
+    rest = text[text.index(heading) + len(heading) :]
+    level = heading.split(" ")[0]
+    end = rest.find(f"\n{level} ")
+    return rest if end == -1 else rest[:end]
+
+
+def _claude_md_files() -> list[Path]:
+    """Корневой CLAUDE.md и все вложенные внутри пакета."""
+    return [ROOT / "CLAUDE.md", *sorted((ROOT / "hh_search").rglob("CLAUDE.md"))]
+
+
+def _looks_like_a_path(token: str) -> bool:
+    """Токен в обратных кавычках, который обязан существовать на диске.
+
+    Отброшено всё, что путём быть не может: URL-пути hh.ru (начинаются с
+    `/`), шаблоны и команды (содержат `?`, `{`, `*` или пробел). Из остатка
+    путём считается токен со слэшем или с известным расширением.
+
+    Токены без слэша и без расширения (`time_utils`, `gate`,
+    `WorkFormatBlockStats`) проверка пропускает сознательно: отличить имя
+    модуля от имени класса регуляркой нечем, а требовать расширения у
+    каждого упоминания значило бы портить текст ради сторожа. Дыра названа
+    в спеке §6.1 — опечатка в `time_utils` поймана не будет.
+
+    Голое расширение (`.py`, `.md`) — не путь, а упоминание расширения:
+    правила проекта говорят про файлы `.py` и `.sql`, и без этой отсечки
+    сторож требовал бы, чтобы в корне лежал файл с именем `.py`.
+    """
+    if token.startswith("/") or any(char in token for char in "?{* "):
+        return False
+    if token.rstrip("/") in RUNTIME_ONLY or token in PATH_SUFFIXES:
+        return False
+    return "/" in token or token.endswith(PATH_SUFFIXES)
+
+
+def test_every_path_in_claude_md_exists() -> None:
+    """Путь из CLAUDE.md обязан существовать — от корня или от своего каталога.
+
+    Два способа разрешения нужны оба: во вложенном документе естественно
+    писать `base.py` про сосед по каталогу и `hh_search/pipeline/enrichment.py`
+    про чужой пакет. Ловит переезды файлов и опечатки в ссылках.
+    """
+    missing: list[str] = []
+    for doc in _claude_md_files():
+        for token in re.findall(r"`([^`\n]+)`", doc.read_text(encoding="utf-8")):
+            if not _looks_like_a_path(token):
+                continue
+            candidate = token.rstrip("/")
+            if (ROOT / candidate).exists() or (doc.parent / candidate).exists():
+                continue
+            missing.append(f"{doc.relative_to(ROOT)}: {token}")
+    assert missing == [], f"путь из CLAUDE.md не найден: {missing}"
+
+
+def test_claude_md_gate_section_matches_the_gate_script() -> None:
+    """Перечень проверок в §Ворота — копия скрипта, а копии обязаны сверяться.
+
+    Перечень в документе нужен: в fix-loop гоняют одну проверку отдельно, и
+    её надо знать. Но именно копия и протухает первой, поэтому сверяется
+    буквально, включая порядок.
+    """
+    documented = _uv_commands(_section(ROOT / "CLAUDE.md", "## Ворота"))
+    assert documented == _uv_commands(GATE.read_text(encoding="utf-8"))
