@@ -7,23 +7,56 @@
 """
 
 import logging
+import os
+import stat
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
 
+from hh_search.logging_setup import setup_logging
 from hh_search.sinks import build_sinks
 from hh_search.sinks.telegram_client import (
     MESSAGE_LIMIT,
     TelegramClient,
     TelegramCredentials,
     TelegramError,
+    message_length,
 )
 from hh_search.sinks.telegram_sink import TelegramSink
 from tests.test_html_report import NOW, vacancy
 
 TOKEN = "1234567890:AAHtestTOKENvalueMUSTneverLEAK"
 CHAT_ID = "-1001234567890"
+# Вечер и утро по обе стороны полуночи UTC: ключ дедупликации — файл дня,
+# и он новый каждые сутки (находка I2).
+EVENING = datetime(2026, 7, 29, 23, 50, tzinfo=UTC)
+NEXT_MORNING = datetime(2026, 7, 30, 3, 50, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_logger() -> Iterator[None]:
+    """`setup_logging` перенастраивает КОРНЕВОЙ логгер — вернём его на место.
+
+    Здесь этого мало: `TelegramClient` вешает на обработчики корня фильтр,
+    вычищающий токен, и без снятия он переехал бы на обработчики pytest.
+    """
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    filters = {handler: handler.filters[:] for handler in handlers}
+    quiet = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
+    yield
+    for handler in root.handlers[:]:
+        if handler not in handlers:
+            handler.close()
+    root.handlers[:] = handlers
+    root.setLevel(level)
+    for handler, existing in filters.items():
+        handler.filters[:] = existing
+    for name, value in quiet.items():
+        logging.getLogger(name).setLevel(value)
 
 
 def credentials() -> TelegramCredentials:
@@ -137,6 +170,34 @@ def test_failure_does_not_write_the_token_to_the_log(
     with caplog.at_level(logging.DEBUG), pytest.raises(TelegramError):
         client(handler).send_message("привет")
     assert TOKEN not in caplog.text
+
+
+def test_successful_request_does_not_write_the_token_to_the_log(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Главный сторож §4, и прежний был зелен вакуумно.
+
+    `httpx` пишет `HTTP Request: POST <URL> "HTTP/1.1 200 OK"` на КАЖДЫЙ
+    успешный запрос, а токен лежит в пути URL. Прежний сторож гонял
+    `ConnectError`, при котором этой строки не существует вовсе: httpx
+    пишет её ПОСЛЕ получения ответа. Значит защита обязана держаться и на
+    успехе, и при чужом уровне логирования: один вечер отладки запросов к
+    hh.ru (`logging.getLogger("httpx").setLevel(logging.DEBUG)`) выносил
+    пароль бота в `data/logs/hh.log` — файл, который человек первым делом
+    кому-нибудь показывает.
+    """
+    setup_logging(tmp_path / "logs")
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    client(handler).send_message("привет")
+
+    log = (tmp_path / "logs" / "hh.log").read_text(encoding="utf-8")
+    assert "HTTP Request" in log, "httpx больше не пишет строку запроса — сторож ослеп"
+    assert TOKEN not in log
+    assert TOKEN not in capsys.readouterr().out
 
 
 def test_invalid_url_becomes_telegram_error_without_the_token() -> None:
@@ -310,6 +371,131 @@ def test_retry_after_send_document_failure_does_not_resend_the_message(tmp_path:
     assert not retry_client.messages
 
 
+# --- C1: отказ записи файла дня не имеет права оставить сообщение отправленным ---
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="от root каталог только для чтения не бывает")
+def test_read_only_reports_dir_sends_nothing_and_leaves_no_leftovers(tmp_path: Path) -> None:
+    """Права и место на диске проверяются ДО сети, иначе дубль КАЖДЫЙ прогон.
+
+    Воспроизведение ревью: каталог отчётов `chmod 0o500`, четыре подряд
+    `emit` — четыре одинаковых сообщения в канал, ноль документов. Вакансии
+    при отказе приёмника не помечаются отправленными, поэтому недоступный
+    том становился бесконечным источником дубля раз в четыре часа. Запись
+    во временный файл ДО `send_message` превращает это в отказ без
+    единого обращения к Telegram.
+    """
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    reports.chmod(0o500)
+    client = FakeClient()
+    try:
+        for _ in range(4):
+            with pytest.raises(OSError):
+                sink(reports, client).emit([vacancy()], NOW)
+        assert not client.messages, "сообщение ушло, а файла дня нет — это и есть дубль"
+        assert not client.documents
+        assert list(reports.iterdir()) == [], "в каталоге остался мусор от неудачной записи"
+    finally:
+        reports.chmod(0o700)
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="от root каталог только для чтения не бывает")
+def test_retry_after_the_reports_dir_is_fixed_sends_the_message_once(tmp_path: Path) -> None:
+    """Продолжение предыдущего: том починили — сообщение уходит РОВНО один раз."""
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    reports.chmod(0o500)
+    with pytest.raises(OSError):
+        sink(reports, FakeClient()).emit([vacancy()], NOW)
+    reports.chmod(0o700)
+
+    client = FakeClient()
+    assert sink(reports, client).emit([vacancy()], NOW) == 1
+    assert len(client.messages) == 1
+    assert len(client.documents) == 1
+
+
+def test_failed_send_message_leaves_no_temporary_file_behind(tmp_path: Path) -> None:
+    """Черновик убирается: иначе каталог отчётов зарастал бы обрывками.
+
+    Файл дня при этом обязан остаться нетронутым — следующий прогон
+    повторяет всё целиком.
+    """
+    client = FakeClient(fail_on="sendMessage")
+    with pytest.raises(TelegramError):
+        sink(tmp_path, client).emit([vacancy()], NOW)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_published_file_stays_readable_like_its_siblings(tmp_path: Path) -> None:
+    """`mkstemp` даёт 0600, а README отправляет открывать файл браузером.
+
+    Соседние `-new.md` и `-new.csv` пишутся обычным `open` и выходят 0644.
+    Атомарная публикация не имеет права молча сузить права файла дня до
+    «только владелец» — это тот сорт регрессии, которую замечают через
+    неделю и не связывают с правкой.
+    """
+    sink(tmp_path, FakeClient()).emit([vacancy()], NOW)
+    mode = stat.S_IMODE((tmp_path / "2026-07-29-new.html").stat().st_mode)
+    assert mode == 0o644, f"файл дня опубликован с правами {mode:o}"
+
+
+def test_the_published_file_is_byte_identical_to_the_sent_document(tmp_path: Path) -> None:
+    """Спека §5: отправляемое и записанное — одно и то же байт в байт."""
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy()], NOW)
+    assert (tmp_path / "2026-07-29-new.html").read_bytes() == client.documents[0][1]
+
+
+# --- I2: дедупликация не имеет права обнуляться на границе суток UTC -------
+
+
+def test_failure_before_midnight_does_not_repeat_the_message_after_it(tmp_path: Path) -> None:
+    """Ключ дедупликации — файл дня, и он новый каждые сутки (находка I2).
+
+    Прогон 23:50: `send_document` падает, сообщение уже ушло, вакансии не
+    помечены. Прогон 03:50 следующих суток видел их новыми, потому что
+    файла НОВОГО дня ещё нет, — и слал дословный повтор вчерашнего
+    сообщения. При `interval_hours: 4` это штатный исход любого отказа в
+    вечернем прогоне.
+    """
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([vacancy()], NEXT_MORNING) == 0
+    assert not client.messages
+
+
+def test_failure_of_a_neighbour_sink_does_not_repeat_the_message_after_midnight(
+    tmp_path: Path,
+) -> None:
+    """То же самое, когда telegram здоров, а падает СОСЕД (csv).
+
+    `report()` не помечает вакансии отправленными при отказе ЛЮБОГО
+    приёмника, поэтому здоровый telegram получает вчерашнюю пачку целиком.
+    """
+    assert sink(tmp_path, FakeClient()).emit([vacancy()], EVENING) == 1
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([vacancy()], NEXT_MORNING) == 0
+    assert not client.messages
+
+
+def test_the_previous_day_file_does_not_hide_a_genuinely_new_vacancy(tmp_path: Path) -> None:
+    """Проверка обратной стороны I2: вчерашний файл не глотает новое.
+
+    Вакансия, отправленная вчера и ПОМЕЧЕННАЯ, сегодня в выборку не
+    попадёт вовсе; непомеченная — ровно та, дубля которой мы избегаем. А
+    вакансия, которой вчера не было, обязана уехать в канал.
+    """
+    sink(tmp_path, FakeClient()).emit([vacancy(vacancy_id="1", title="Вчерашняя")], EVENING)
+    client = FakeClient()
+    fresh = vacancy(vacancy_id="2", title="Сегодняшняя")
+    assert sink(tmp_path, client).emit([fresh], NEXT_MORNING) == 1
+    assert "Сегодняшняя" in client.messages[0]
+    assert (tmp_path / "2026-07-30-new.html").exists()
+
+
 def test_long_top_is_truncated_with_an_honest_tail(tmp_path: Path) -> None:
     """Молчаливое обрезание запрещено: 5 позиций укладываются, 500 — нет."""
     client = FakeClient()
@@ -319,8 +505,36 @@ def test_long_top_is_truncated_with_an_honest_tail(tmp_path: Path) -> None:
     ]
     sink(tmp_path, client).emit(many, NOW)
     message = client.messages[0]
-    assert len(message) <= MESSAGE_LIMIT
+    assert message_length(message) <= MESSAGE_LIMIT
     assert "в файле" in message
+
+
+def test_message_length_counts_utf16_code_units_not_code_points() -> None:
+    """Telegram считает длину в кодовых единицах UTF-16, а не в кодовых точках."""
+    assert message_length("а") == 1
+    assert message_length("🚀") == 2
+
+
+def test_top_with_emoji_fits_the_limit_telegram_actually_counts(tmp_path: Path) -> None:
+    """Счёт в кодовых точках занижал длину: 300 вакансий с эмодзи дают
+    `len = 3994` при 5494 по счёту Telegram, и Bot API отвечает 400.
+
+    Дальше яд с самоподдержкой: `send_message` падает — файл не
+    публикуется — следующий прогон собирает то же сообщение — падает
+    снова, и канал не получает НИЧЕГО.
+
+    Длина здесь считается ВРУЧНУЮ, а не через `message_length`: сторож,
+    зовущий проверяемую функцию, порчу этой функции переживает — мутация
+    `message_length` до `len` красила только её собственный юнит-тест, а
+    этот оставался зелёным.
+    """
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title="🚀" * 40 + f" номер {index}", total=90.0)
+        for index in range(300)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    assert len(client.messages[0].encode("utf-16-le")) // 2 <= MESSAGE_LIMIT
 
 
 def test_message_escapes_dangerous_characters_in_the_title(tmp_path: Path) -> None:
@@ -370,5 +584,8 @@ def test_build_sinks_error_names_the_variables_not_their_values(
 
 
 def test_unknown_sink_still_refused(tmp_path: Path) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as caught:
         build_sinks(["карандаш"], tmp_path, 60.0)
+    # «sink» латиницей давало на выходе заикание «в app.yaml неизвестный
+    # приёмник: неизвестный sink: карандаш» (находка I4).
+    assert "неизвестный приёмник: карандаш" == str(caught.value)
