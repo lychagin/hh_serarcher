@@ -349,14 +349,13 @@ docker compose run --rm hh-search report --since 7d
 
 ```bash
 uv sync --frozen --extra dev
-uv run pytest                # без сети
+./gate                       # ворота: линтер, формат, типы, тесты без сети
 uv run pytest -m network     # контрактные тесты против живого hh.ru
-uv run ruff check . && uv run ruff format --check . && uv run mypy hh_search tests
 ```
 
 `uv pip install --system ".[dev]"` не сработает: системный интерпретатор Ubuntu
-помечен externally-managed (PEP 668). Тот же набор проверок гоняет CI
-(`.github/workflows/ci.yml`).
+помечен externally-managed (PEP 668). Этот же скрипт гоняет CI
+(`.github/workflows/ci.yml`) — состав ворот живёт в `gate` и больше нигде.
 
 Контрактные тесты — ранняя система оповещения: если hh.ru изменит разметку
 листинга, уберёт JSON-LD или перепишет `robots.txt`, они об этом скажут. В CI не

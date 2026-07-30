@@ -40,16 +40,12 @@ jobs:
       - name: Зависимости
         run: uv sync --frozen --extra dev --python 3.12
 
-      - name: Линтер
-        run: uv run ruff check .
-
-      - name: Форматирование
-        run: uv run ruff format --check .
-
-      - name: Типы
-        run: uv run mypy hh_search tests
-
+      # Состав ворот живёт в ./gate, а не здесь: до появления скрипта он
+      # существовал в README.md и в этом файле по отдельности. Разбивка по
+      # четырём шагам в интерфейсе GitHub — названная в спеке цена: какая
+      # проверка упала, видно из лога, а не из списка шагов.
+      #
       # Сеть не задействуется: контрактные тесты отсеиваются меткой
       # `network` через `addopts` в pyproject.toml.
-      - name: Тесты
-        run: uv run pytest -q
+      - name: Ворота
+        run: ./gate
