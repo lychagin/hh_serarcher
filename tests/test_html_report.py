@@ -16,6 +16,7 @@ from hh_search.domain.models import (
 from hh_search.sinks.html_report import (
     VACANCY_HREF_RE,
     document_header,
+    escape_attr,
     escape_html,
     render_section,
 )
@@ -152,6 +153,35 @@ def test_description_excerpt_is_escaped() -> None:
     section = render_section([vacancy(total=90.0, description="C++ <script>x</script>")], NOW, 60.0)
     assert "<script>" not in section
     assert "C++ &lt;script&gt;" in section
+
+
+# --- item 7: href не экранируется в атрибуте --------------------------------
+
+
+def test_escape_attr_neutralises_quotes_alongside_the_three_html_characters() -> None:
+    """`escape_attr` обязана обезвреживать кавычку сверх того, что уже
+    делает `escape_html`, — иначе значение атрибута обрывается раньше
+    времени."""
+    assert escape_attr('a"b&c<d>e') == "a&quot;b&amp;c&lt;d&gt;e"
+
+
+def test_href_with_a_quote_cannot_break_out_of_the_attribute() -> None:
+    """Сегодня недостижимо (`url` собран из `^/vacancy/([1-9][0-9]{0,14})$`),
+    но защита не должна зависеть от этого факта: владелец решил закрыть и
+    недостижимое сегодня (item 7)."""
+    malicious = vacancy(vacancy_id="1")
+    malicious.discovered.url = 'https://hh.ru/vacancy/1"><script>alert(1)</script>'
+    section = render_section([malicious], NOW, 60.0)
+    assert "<script>alert(1)</script>" not in section
+    assert "&quot;&gt;&lt;script&gt;" in section
+
+
+def test_href_regex_still_finds_a_normal_link_after_escaping() -> None:
+    """Сторож на оба свойства сразу: экранирование не имеет права испортить
+    `VACANCY_HREF_RE` — ложное несрабатывание означает дубль в канале,
+    потому что дедупликация читает ссылки этим же регэкспом."""
+    section = render_section([vacancy(vacancy_id="135501327")], NOW, 60.0)
+    assert set(VACANCY_HREF_RE.findall(section)) == {"https://hh.ru/vacancy/135501327"}
 
 
 def test_header_is_self_contained() -> None:
