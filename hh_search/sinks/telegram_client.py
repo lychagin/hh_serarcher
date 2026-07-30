@@ -29,18 +29,79 @@ from dataclasses import dataclass
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 API_ROOT = "https://api.telegram.org"
 # Потолок `sendMessage` у Bot API. Держим здесь, а не в конфиге: это не
 # наша настройка, а чужое ограничение, и менять его нам нечем.
 MESSAGE_LIMIT = 4096
 # Потолок подписи к документу — там же и по той же причине.
 CAPTION_LIMIT = 1024
+# Чем токен заменяется в записи лога. Не пустотой: человек, читающий лог,
+# обязан видеть, что здесь стояло и почему исчезло.
+REDACTED = "/bot<ТОКЕН СКРЫТ>/"
+
+
+def message_length(text: str) -> int:
+    """Длина так, как её считает Telegram: в кодовых единицах UTF-16.
+
+    Не в кодовых точках. Всё вне BMP — эмодзи в заголовке вакансии, а они
+    там встречаются, — занимает две единицы: 300 записей дали `len(text)`
+    = 3994 при 5494 по счёту Bot API, то есть 400 на запрос. Дальше яд с
+    самоподдержкой: `send_message` падает, файл дня не публикуется,
+    следующий прогон собирает то же сообщение и падает снова — и канал не
+    получает НИЧЕГО, пока порог не сдвинут руками.
+    """
+    return len(text.encode("utf-16-le")) // 2
 
 
 class TelegramError(RuntimeError):
     """Отказ Bot API или транспорта. Текст НИКОГДА не содержит токена."""
+
+
+class _TokenFilter(logging.Filter):
+    """Вычищает `/bot<токен>/` из записи, кто бы её ни сделал.
+
+    Нужен потому, что `httpx` пишет `HTTP Request: POST <URL> "200 OK"` на
+    КАЖДЫЙ успешный запрос, а токен лежит в ПУТИ URL. До появления фильтра
+    от утечки спасал только `QUIET_LOGGERS` в `logging_setup.py` — то есть
+    один вечер отладки запросов к hh.ru
+    (`logging.getLogger("httpx").setLevel(logging.INFO)`) выносил пароль
+    бота в `data/logs/hh.log`, файл, который человек первым делом
+    кому-нибудь показывает.
+    """
+
+    def __init__(self, secret: str) -> None:
+        super().__init__()
+        self.secret = secret
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if self.secret in message:
+            # Аргументы уже подставлены, поэтому их надо снять: иначе
+            # обработчик подставил бы их второй раз в уже готовый текст.
+            record.msg = message.replace(self.secret, REDACTED)
+            record.args = None
+        return True
+
+
+def _guard_logs(token: str) -> None:
+    """Поставить фильтр на ОБРАБОТЧИКИ корневого логгера.
+
+    Именно на обработчики, а не на логгер `httpx`: фильтр логгера
+    применяется только к записям, сделанным через него, и не переживает ни
+    чужой `setLevel`, ни второй логгер (`httpcore`). Обработчик же видит
+    каждую запись, которая доходит до stdout или файла, — значит защита не
+    зависит от того, кому какой уровень выставили. Вызывается из
+    `TelegramClient.__init__`, а он строится в `build_sinks` — то есть
+    после `setup_logging` (`_config` в `__main__.py`), которая обработчики
+    корня и создаёт.
+    """
+    secret = f"/bot{token}/"
+    for handler in logging.getLogger().handlers:
+        if not any(
+            isinstance(existing, _TokenFilter) and existing.secret == secret
+            for existing in handler.filters
+        ):
+            handler.addFilter(_TokenFilter(secret))
 
 
 @dataclass(frozen=True)
@@ -87,6 +148,7 @@ class TelegramClient:
         self._credentials = credentials
         self._timeout_sec = timeout_sec
         self._transport = transport
+        _guard_logs(credentials.token)
 
     def send_message(self, text: str) -> None:
         self._call(
@@ -113,6 +175,8 @@ class TelegramClient:
         files: dict[str, tuple[str, bytes, str]] | None = None,
     ) -> None:
         url = f"{API_ROOT}/bot{self._credentials.token}/{method}"
+        response: httpx.Response | None = None
+        failure = ""
         try:
             with httpx.Client(timeout=self._timeout_sec, transport=self._transport) as http:
                 response = http.post(url, data=data, files=files)
@@ -122,7 +186,14 @@ class TelegramClient:
             # а перечисление конкретных подклассов `httpx` ненадёжно на
             # будущее. `error` МОЖЕТ содержать URL, то есть токен — наружу
             # уходит только тип исключения.
-            raise TelegramError(f"{method}: транспорт отказал ({type(error).__name__})") from None
+            failure = type(error).__name__
+        if response is None:
+            # Поднимается ВНЕ блока `except` намеренно: внутри него
+            # `__context__` новой ошибки держал бы исходное исключение
+            # httpx вместе с URL, то есть с токеном, и `exc_info=True` в
+            # `emit_to_sinks` вывел бы его в лог. `from None` гасит только
+            # показ цепочки, а ссылка остаётся; здесь её нет вовсе.
+            raise TelegramError(f"{method}: транспорт отказал ({failure})")
         payload = _payload(response)
         if response.status_code != httpx.codes.OK or not _is_ok(payload):
             # Bot API возвращает смысловой отказ (`{"ok": false, ...}`) и
