@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from hh_search.config.loader import load_config
-from hh_search.config.models import QuerySpec
+from hh_search.config.models import QueriesConfig, QuerySpec
 
 APP_YAML = """
 contact_email: "me@lychagin-hh.ru"
@@ -551,6 +551,64 @@ def test_limits_that_do_not_fit_the_interval_are_a_config_error(tmp_path: Path) 
     )
     with pytest.raises(ValidationError, match="не помещается в интервал"):
         load_config(write_config(tmp_path, **{"app.yaml": app_yaml}))
+
+
+def test_two_streams_over_one_slug_are_legal() -> None:
+    """Один листинг двумя потоками — законный конфиг, а не опечатка.
+
+    Прежний валидатор бил по одному `slug` и отверг бы это. Ключ
+    уникальности — пара `(slug, work_format)`.
+    """
+    config = QueriesConfig.model_validate(
+        {
+            "queries": [
+                {"slug": "programmist", "cluster": "backend"},
+                {"slug": "programmist", "cluster": "remote", "work_format": "REMOTE"},
+            ]
+        }
+    )
+    assert len(config.queries) == 2
+
+
+def test_fully_duplicate_pair_is_still_rejected() -> None:
+    """Мотивация прежнего валидатора сохраняется дословно: полный повтор
+    удваивает запросы к hh.ru молча."""
+    with pytest.raises(ValidationError):
+        QueriesConfig.model_validate(
+            {
+                "queries": [
+                    {"slug": "programmist", "cluster": "a", "work_format": "REMOTE"},
+                    {"slug": "programmist", "cluster": "b", "work_format": "REMOTE"},
+                ]
+            }
+        )
+
+
+def test_duplicate_slug_without_format_is_still_rejected() -> None:
+    with pytest.raises(ValidationError):
+        QueriesConfig.model_validate(
+            {
+                "queries": [
+                    {"slug": "programmist", "cluster": "a"},
+                    {"slug": "programmist", "cluster": "b"},
+                ]
+            }
+        )
+
+
+def test_unknown_work_format_is_rejected() -> None:
+    """Перечисление, а не свободная строка: опечатка обязана падать на старте,
+    а не уезжать в query-строку к hh.ru."""
+    with pytest.raises(ValidationError):
+        QueriesConfig.model_validate(
+            {"queries": [{"slug": "programmist", "cluster": "a", "work_format": "УДАЛЁННО"}]}
+        )
+
+
+def test_slug_still_rejects_url_syntax() -> None:
+    """Появление законного параметра ничего не разрешает в самом slug."""
+    with pytest.raises(ValidationError):
+        QueriesConfig.model_validate({"queries": [{"slug": "programmist?area=66", "cluster": "a"}]})
 
 
 def test_default_limits_leave_the_normal_run_untouched(tmp_path: Path) -> None:

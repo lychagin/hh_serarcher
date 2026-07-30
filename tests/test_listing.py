@@ -6,9 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from hh_search.config.models import QuerySpec
+from hh_search.config.models import QuerySpec, WorkFormat
 from hh_search.domain.models import DiscoveredVacancy
 from hh_search.errors import FetchFailed
+from hh_search.sources.http import Robots
 from hh_search.sources.listing import build_listing_url, parse_listing
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -88,6 +89,60 @@ def test_build_listing_url_uses_page_parameter_for_later_pages() -> None:
 def test_build_listing_url_rejects_negative_page() -> None:
     with pytest.raises(ValueError, match="страниц"):
         build_listing_url(QuerySpec(slug="programmist", cluster="dev"), page=-1)
+
+
+# --- второй поток: листинг с фильтром work_format -------------------------
+
+
+def test_listing_url_without_work_format_is_unchanged() -> None:
+    """Первый поток обязан остаться байт в байт прежним."""
+    query = QuerySpec(slug="programmist", cluster="backend")
+    assert build_listing_url(query, 0) == "https://hh.ru/vacancies/programmist"
+    assert build_listing_url(query, 2) == "https://hh.ru/vacancies/programmist?page=2"
+
+
+def test_listing_url_with_work_format_always_carries_page() -> None:
+    """Первая страница второго потока идёт с `&page=0`, а не голым параметром.
+
+    Без `&page=` правило `Allow: /vacancies/*?*&page=` не срабатывает, и URL
+    попадает под `Disallow: *?*` — то есть голый `?work_format=REMOTE` наш
+    матчер обязан отвергнуть (сторож ниже это и проверяет).
+    """
+    query = QuerySpec(slug="programmist", cluster="remote", work_format=WorkFormat.REMOTE)
+    assert build_listing_url(query, 0) == (
+        "https://hh.ru/vacancies/programmist?work_format=REMOTE&page=0"
+    )
+    assert build_listing_url(query, 3) == (
+        "https://hh.ru/vacancies/programmist?work_format=REMOTE&page=3"
+    )
+
+
+def test_every_generated_url_is_allowed_by_the_live_robots_rules() -> None:
+    """Сторож главного требования проекта: в сеть не уходит запрещённый URL.
+
+    Правила берутся с живой фикстуры, а не выдумываются: именно на выдуманных
+    правилах прежняя редакция спеки утверждала неверное.
+    """
+    robots = Robots.parse((FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"))
+    plain = QuerySpec(slug="programmist", cluster="backend")
+    remote = QuerySpec(slug="programmist", cluster="remote", work_format=WorkFormat.REMOTE)
+    for query in (plain, remote):
+        for page in (0, 1, 5):
+            url = build_listing_url(query, page)
+            assert robots.can_fetch("hh-search/0.1", url), url
+
+
+def test_work_format_without_page_would_be_forbidden() -> None:
+    """Премисса предыдущего теста, проверенная явно.
+
+    Если однажды кто-то «упростит» форму до голого `?work_format=REMOTE`,
+    этот тест объяснит, почему так нельзя, — вместо того чтобы дать в сеть
+    уйти запрещённому URL.
+    """
+    robots = Robots.parse((FIXTURES / "robots_hh.txt").read_text(encoding="utf-8"))
+    assert not robots.can_fetch(
+        "hh-search/0.1", "https://hh.ru/vacancies/programmist?work_format=REMOTE"
+    )
 
 
 # --- разбор живой страницы -----------------------------------------------

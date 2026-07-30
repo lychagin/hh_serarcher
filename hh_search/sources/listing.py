@@ -56,15 +56,24 @@ _HEAD_RE = re.compile(r"<head\b[^>]*>(.*?)</head>", re.DOTALL | re.IGNORECASE)
 def build_listing_url(query: QuerySpec, page: int = 0) -> str:
     """URL страницы листинга. Нумерация страниц у hh.ru с нуля.
 
-    Первая страница — голый путь без query-строки: `?page=0` попал бы под
-    `Disallow: *?*`, не получив защиты от `Allow: /vacancies/*?page=`...
-    точнее, получив её, но заплатив за это лишним query-параметром там,
-    где он не нужен. Голый путь не совпадает вообще ни с одним правилом.
+    Первый поток (`work_format` не задан) — голый путь без query-строки на
+    первой странице: `?page=0` попал бы под `Disallow: *?*`, не получив
+    защиты от `Allow: /vacancies/*?page=`... точнее, получив её, но
+    заплатив за это лишним query-параметром там, где он не нужен. Голый
+    путь не совпадает вообще ни с одним правилом.
+
+    Второй поток (`work_format` задан) — тот же путь с параметром
+    `work_format`, и на нём `&page=` обязателен на ВСЕХ страницах, включая
+    первую: правило `Allow: /vacancies/*?*&page=` требует его наличия, и
+    без него URL запрещён `Disallow: *?*`. Проверено матчером на живой
+    фикстуре правил (`tests/fixtures/robots_hh.txt`).
     """
     if page < 0:
         raise ValueError(f"номер страниц не может быть отрицательным: {page}")
     base = f"{LISTING_BASE_URL}/{query.slug}"
-    return base if page == 0 else f"{base}?page={page}"
+    if query.work_format is None:
+        return base if page == 0 else f"{base}?page={page}"
+    return f"{base}?work_format={query.work_format.value}&page={page}"
 
 
 def _is_own_host(url_parts: SplitResult) -> bool:

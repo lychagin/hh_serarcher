@@ -1,4 +1,5 @@
 import re
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -368,6 +369,22 @@ def _reject_url_syntax(value: str) -> str:
 Slug = Annotated[str, Field(min_length=1), AfterValidator(_reject_url_syntax)]
 
 
+class WorkFormat(StrEnum):
+    """Формат работы в терминах hh.ru — значения их перечисления.
+
+    Именно перечисление, а не свободная строка: значение уезжает в
+    query-строку запроса к hh.ru, и опечатка обязана падать на старте, а не
+    превращаться в бессмысленный фильтр после похода в сеть. Значения взяты
+    с живой страницы вакансии (`workFormatsElement`), а не из документации:
+    документации на этот ключ нет.
+    """
+
+    REMOTE = "REMOTE"
+    HYBRID = "HYBRID"
+    ON_SITE = "ON_SITE"
+    FIELD_WORK = "FIELD_WORK"
+
+
 class QuerySpec(Base):
     """Один курируемый листинг hh.ru.
 
@@ -384,33 +401,42 @@ class QuerySpec(Base):
     # Верхняя граница — вежливость, а не вкус: одна страница это один
     # запрос к hh.ru, и опечатка `pages: 500` превращает прогон в обстрел.
     pages: int = Field(default=1, ge=1, le=20)
+    # Не задано — листинг берётся голым путём, как и раньше. Задано — тем же
+    # путём с параметром и ОБЯЗАТЕЛЬНЫМ `&page=` (см. build_listing_url:
+    # без него URL запрещён robots.txt).
+    work_format: WorkFormat | None = None
 
 
 class QueriesConfig(Base):
     queries: list[QuerySpec] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def reject_duplicate_slugs(self) -> "QueriesConfig":
-        """Один и тот же slug дважды — всегда опечатка, и тихая.
+    def reject_duplicate_slug_and_work_format_pairs(self) -> "QueriesConfig":
+        """Одна и та же пара `(slug, work_format)` дважды — всегда опечатка, и тихая.
 
-        Мотивация та же, что у `_reject_duplicate_signals`: имя
-        правильное, значение законное, результат испорчен молча. hh.ru
-        получает одни и те же страницы дважды (при `pages: 20` — сорок
-        лишних запросов), `stats.discovered` удваивается, а кластер
-        достаётся тому из двух описаний, у которого больше `weight`, —
-        то есть человек, аккуратно расписавший два разных кластера,
-        получает один и не узнаёт об этом ниоткуда.
+        Ключ уникальности — пара, а не голый `slug`: второй поток discovery
+        (§ конфиг листинга и форма URL) описывает тот же листинг ещё раз, с
+        фильтром `work_format`, и это законный конфиг из двух разных
+        запросов к hh.ru, а не дубликат. Дубликатом является только полное
+        совпадение пары — тогда мотивация прежнего валидатора применяется
+        дословно: hh.ru получает одни и те же страницы дважды (при
+        `pages: 20` — сорок лишних запросов), `stats.discovered`
+        удваивается, а кластер достаётся тому из двух описаний, у которого
+        больше `weight`, — то есть человек, аккуратно расписавший два
+        разных кластера, получает один и не узнаёт об этом ниоткуда.
         """
-        seen: dict[str, str] = {}
+        seen: dict[tuple[str, WorkFormat | None], str] = {}
         for query in self.queries:
-            previous = seen.get(query.slug)
+            key = (query.slug, query.work_format)
+            previous = seen.get(key)
             if previous is not None:
                 raise ValueError(
-                    f"листинг {query.slug!r} описан дважды (кластеры {previous!r} и "
-                    f"{query.cluster!r}): hh.ru получит одни и те же страницы по два раза, "
-                    "а кластер достанется тому описанию, у которого больше weight"
+                    f"листинг {query.slug!r} с work_format={query.work_format!r} описан дважды "
+                    f"(кластеры {previous!r} и {query.cluster!r}): hh.ru получит одни и те же "
+                    "страницы по два раза, а кластер достанется тому описанию, у которого "
+                    "больше weight"
                 )
-            seen[query.slug] = query.cluster
+            seen[key] = query.cluster
         return self
 
     @property
