@@ -281,6 +281,45 @@ def test_readme_names_the_real_report_headings() -> None:
         assert f"`{heading}`" in section, f"README не называет раздел {heading}"
 
 
+# --- Раунд исправлений 1 (2026-07-30): отменённые утверждения об `area` ---
+#
+# Ревью Task 1 нашло, что докстринг МОДУЛЯ `sources/listing.py` утверждал
+# ровно то, что задача 2026-07-30 обязана была снять: (1) параметр `area` на
+# `/vacancies/{slug}` не «формально проходит и отвергается из принципа» — он
+# ИГНОРИРУЕТСЯ hh.ru (замер 2026-07-30: `?area=2&page=0` с нижегородского
+# хоста дал нижегородскую выдачу, 0 пересечений из 20 с петербургской;
+# регион задаёт поддомен, на который редиректит IP, а не параметр пути);
+# (2) форма с `&page=` — не «обход духа запрета», а сознательно разрешённое
+# правило `Allow: /vacancies/*?*&page=`, никакого духа запрета вокруг него
+# нет. Обе отмены зафиксированы в
+# `docs/superpowers/specs/2026-07-30-region-and-work-format-design.md` §0 и
+# `docs/superpowers/specs/2026-07-27-hh-autosearch-design.md` §3.2, §3.5.
+
+_DUKH_ZAPRETA_RE = re.compile(r"дух\w*\s+запрет", re.IGNORECASE)
+_AREA_FILTERS_CLAIM_RE = re.compile(r"area[^\n]{0,80}фильтр\w*\s+по\s+регион", re.IGNORECASE)
+
+
+def test_no_module_repeats_the_retracted_claims_about_area_and_page_parameter() -> None:
+    """Формулировка уже возвращалась в этот проект трижды — сторож ловит её код-стороной.
+
+    Проверка не про спеку (её уже поправили), а про `hh_search/`: именно там
+    докстринг `listing.py` разошёлся с фактами и с самой спекой, которую эта
+    задача исполняет.
+    """
+    for path in PACKAGE.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(PACKAGE.parent)
+        assert not _DUKH_ZAPRETA_RE.search(text), (
+            f"{rel}: снова «обход духа запрета» — `Allow: /vacancies/*?*&page=` "
+            "разрешает такие параметры сознательно, обхода тут нет (design §0, spec §3.2)"
+        )
+        claims_area_filters = _AREA_FILTERS_CLAIM_RE.search(text) is not None
+        assert not (claims_area_filters and "игнориру" not in text.lower()), (
+            f"{rel}: утверждает, что `area` фильтрует по региону — измерение 2026-07-30 "
+            "показало обратное: `area` игнорируется, регион задаёт поддомен (design §0)"
+        )
+
+
 # --- README §«Отчёт в Telegram» --------------------------------------------
 
 
