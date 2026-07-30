@@ -312,6 +312,22 @@ def test_readme_names_the_real_sink_name() -> None:
     assert f"`{TelegramSink.name}`" in section
 
 
+def test_readme_recipe_for_a_repeat_delivery_matches_the_real_lookback_window() -> None:
+    """README (item 4) обязано называть НАСТОЯЩЕЕ окно дедупликации.
+
+    Прежняя редакция советовала «уберите файл дня» — после починки item 1
+    это не помогает: подавление найдёт вакансию в файле одних из
+    `LOOKBACK_DAYS` предыдущих суток. Число здесь не переписывается руками,
+    иначе разошлось бы на следующей же правке константы.
+    """
+    from hh_search.sinks.telegram_sink import LOOKBACK_DAYS
+
+    section = readme_section("## Отчёт в Telegram", "## Разработка")
+    assert "LOOKBACK_DAYS" in section
+    assert f"{LOOKBACK_DAYS} предыдущих суток" in section
+    assert "недостаточно" in section, "README больше не предупреждает, что удаления файла мало"
+
+
 # --- спека приёмника telegram: ссылки на код ------------------------------
 
 
