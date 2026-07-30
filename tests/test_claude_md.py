@@ -122,3 +122,16 @@ def test_claude_md_gate_section_matches_the_gate_script() -> None:
     """
     documented = _uv_commands(_section(ROOT / "CLAUDE.md", "## Ворота"))
     assert documented == _uv_commands(GATE.read_text(encoding="utf-8"))
+
+
+def test_root_claude_md_names_every_nested_file() -> None:
+    """Корневой документ обязан называть ровно те вложенные, что существуют.
+
+    Приём тот же, что в §4.3 спеки: сторожится не число, а список. Третий
+    вложенный файл, появившийся без строки в корневом, останется
+    ненайденным для читателя, который в тот каталог не заходил.
+    """
+    text = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r"`(hh_search/[^`\n]*CLAUDE\.md)`", text))
+    nested = {str(path.relative_to(ROOT)) for path in _claude_md_files()[1:]}
+    assert documented == nested
