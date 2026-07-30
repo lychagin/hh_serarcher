@@ -15,7 +15,8 @@ from hh_search.domain.models import (
 )
 from hh_search.sinks import build_sinks
 from hh_search.sinks.csv_sink import COLUMNS, CsvSink
-from hh_search.sinks.markdown_sink import SNIPPET_LENGTH, MarkdownSink
+from hh_search.sinks.markdown_sink import MarkdownSink
+from hh_search.sinks.text import SNIPPET_LENGTH
 
 # Данные тестов повторяют то, что приходит из хранилища: даты — aware UTC с
 # микросекундами (`storage/time_utils.py`), а зарплата и дата публикации

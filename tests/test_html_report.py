@@ -19,6 +19,7 @@ from hh_search.sinks.html_report import (
     escape_html,
     render_section,
 )
+from hh_search.sinks.text import SNIPPET_LENGTH
 
 NOW = datetime(2026, 7, 29, 10, 15, tzinfo=UTC)
 
@@ -29,6 +30,7 @@ def vacancy(
     company: str | None = "Р-Софт",
     total: float = 80.0,
     cluster: str = "backend",
+    description: str = "Описание вакансии",
 ) -> ScoredVacancy:
     return ScoredVacancy(
         discovered=DiscoveredVacancy(
@@ -42,7 +44,7 @@ def vacancy(
             found_by_query="programmist",
         ),
         details=VacancyDetails(
-            description="Описание вакансии",
+            description=description,
             valid_through=None,
             published_at=NOW,
             company=company,
@@ -110,6 +112,46 @@ def test_href_regex_finds_written_links_for_deduplication() -> None:
         "https://hh.ru/vacancy/1",
         "https://hh.ru/vacancy/2",
     }
+
+
+def test_top_entry_carries_the_beginning_of_the_description() -> None:
+    """§6: «структура повторяет markdown-отчёт», а тот кладёт начало описания.
+
+    Обещание §6 и файл разошлись: HTML — это ТОТ отчёт, который владелец
+    читает с телефона вместо markdown, и без выжимки он был строго беднее
+    того, что заменяет. Ради кликабельности ссылок выжимку не выбрасывали.
+    """
+    section = render_section([vacancy(total=90.0)], NOW, 60.0)
+    assert "Описание вакансии" in section
+
+
+def test_rest_entry_stays_a_one_liner_like_in_markdown() -> None:
+    """Выжимка идёт только в «Топ» — ровно как `_full_entry` против
+    `_short_entry` в markdown-отчёте. Порог меняет подробность показа."""
+    section = render_section([vacancy(total=12.0)], NOW, 60.0)
+    assert "Описание вакансии" not in section
+
+
+def test_description_excerpt_is_cut_and_collapsed() -> None:
+    """Описание с hh.ru — килобайты многострочного текста.
+
+    Обрезка той же длины, что в markdown (общий `SNIPPET_LENGTH`), и
+    переводы строк складываются в одну строку: `html_to_text` ставит их на
+    месте блочных тегов, а в HTML они всё равно не видны — зато мешают
+    grep'у по файлу.
+    """
+    section = render_section(
+        [vacancy(total=90.0, description="раз.\n\nдва." + "я" * 500)], NOW, 60.0
+    )
+    assert "раз. два." in section
+    assert "я" * (SNIPPET_LENGTH + 1) not in section
+
+
+def test_description_excerpt_is_escaped() -> None:
+    """Описание пишет работодатель — значит в нём есть что угодно."""
+    section = render_section([vacancy(total=90.0, description="C++ <script>x</script>")], NOW, 60.0)
+    assert "<script>" not in section
+    assert "C++ &lt;script&gt;" in section
 
 
 def test_header_is_self_contained() -> None:

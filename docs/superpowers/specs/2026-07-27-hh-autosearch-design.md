@@ -372,6 +372,7 @@ hh_search/
     markdown_sink.py    Markdown-отчёт: «Топ» по порогу и «Остальное»
     telegram_client.py  транспорт Bot API: sendMessage/sendDocument, токен не течёт в ошибки
     telegram_sink.py    приёмник telegram: дедупликация по файлу дня, лимит сообщения
+    text.py             общая нормализация текста работодателя: выжимка описания, управляющие символы
   sources/
     http.py             вежливый клиент плюс матчер robots.txt по RFC 9309
     listing.py          шаг 1: URL листинга, разбор ld+json ItemList, сторож canonical

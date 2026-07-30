@@ -6,8 +6,7 @@ from pathlib import Path
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.base import REPORT_DATE_FORMAT
-
-SNIPPET_LENGTH = 200
+from hh_search.sinks.text import collapse, snippet
 
 # Заголовок и описание пишет работодатель. `[Удалённо] Инженер` в начале
 # названия на hh.ru встречается, а `**[Ссылка](https://evil/) конец]
@@ -18,16 +17,6 @@ SNIPPET_LENGTH = 200
 # markdown по умолчанию. Обе неотличимы в отчёте от нашей ссылки на hh.ru,
 # а отчёт открывают именно затем, чтобы кликать.
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_\[\]<>])")
-
-# Управляющие символы, которые не несут текста, но доезжают до файла:
-# нулевой байт и прочие C0/C1 ломают grep и часть редакторов, а
-# двунаправленные управляющие (U+202A..U+202E, U+2066..U+2069 и метки
-# U+200E/U+200F) переворачивают показ остатка строки — заголовок пишет
-# работодатель, и отчёт читают глазами. Пробельные из диапазона не
-# перечислены: их убирает `_collapse`.
-_CONTROL = re.compile(
-    r"[\x00-\x08\x0e-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]"
-)
 
 # Ссылки, уже вписанные в отчёт текущего дня. Экранированные скобки в счёт
 # не идут: заголовок вида `Инженер](https://hh.ru/vacancy/2)` пишет
@@ -40,18 +29,12 @@ _CONTROL = re.compile(
 _WRITTEN_LINK_RE = re.compile(r"(?<!\\)(?:\\\\)*\]\((https?://[^\s)]+)\)")
 
 
-def _collapse(text: str) -> str:
-    """Одна строка вместо любого числа: перевод строки внутри пункта списка
-    ломает разметку не хуже скобки."""
-    return " ".join(_CONTROL.sub("", text).split())
-
-
 def _escape(text: str) -> str:
     return _MARKDOWN_SPECIAL.sub(r"\\\1", text)
 
 
 def _plain(text: str | None, fallback: str = "—") -> str:
-    return _escape(_collapse(text)) if text else fallback
+    return _escape(collapse(text)) if text else fallback
 
 
 class MarkdownSink:
@@ -143,13 +126,13 @@ class MarkdownSink:
         published = (
             "дата неизвестна" if published_at is None else format(published_at, REPORT_DATE_FORMAT)
         )
-        snippet = _escape(_collapse(item.details.description)[:SNIPPET_LENGTH])
+        excerpt = _escape(snippet(item.details.description))
         return (
             f"**[{_plain(discovered.title)}]({discovered.url})** — {item.score.total:.1f}\n\n"
             f"{_plain(discovered.company)} · {_plain(discovered.area)} · "
             f"{_plain(discovered.salary.raw, fallback='зарплата не указана')} · "
             f"{published}\n\n"
-            f"{snippet}…\n"
+            f"{excerpt}…\n"
         )
 
     def _short_entry(self, item: ScoredVacancy) -> str:
