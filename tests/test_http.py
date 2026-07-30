@@ -1,7 +1,8 @@
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from email.utils import format_datetime
 from pathlib import Path
+from typing import Self
 
 import httpx
 import pytest
@@ -175,9 +176,32 @@ def test_robots_network_error_means_disallowed_by_default() -> None:
 
 
 @respx.mock
-def test_retry_after_accepts_http_date() -> None:
-    """Находка 2 (Important): Retry-After в формате HTTP-date (RFC 9110)."""
-    target = datetime.now(UTC) + timedelta(seconds=5)
+def test_retry_after_accepts_http_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Находка 2 (Important): Retry-After в формате HTTP-date (RFC 9110).
+
+    Премисса прежней редакции была неверной, а не среда: тест вычислял
+    `target = datetime.now(UTC) + 5s` один раз, а `_parse_retry_after`
+    зовёт `datetime.now(UTC)` ВТОРОЙ раз, отдельно, — и между этими двумя
+    вызовами проходит реальное время выполнения (диспетчеризация respx,
+    работа Python). `format_datetime` вдобавок округляет цель ВНИЗ до целой
+    секунды, поэтому граница `>= 4.0` была ДОСТИЖИМА, а не «около неё»:
+    прогон 2026-07-28 упал именно на `abs(4.0 - 5.0) < 1.0`, когда
+    реального времени между двумя `now()` набежало достаточно, чтобы
+    задержка ушла ниже 4.0. Часы, гоняющиеся сами за собой, — плохая
+    премисса для теста; часы, остановленные монки-патчем, гонки не имеют
+    вовсе, и ожидаемая задержка становится точным числом, а не диапазоном,
+    достижимым лишь иногда.
+    """
+    frozen = datetime(2026, 7, 28, 12, 0, 0, 700_000, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            value = frozen if tz is None else frozen.astimezone(tz)
+            return cls.fromtimestamp(value.timestamp(), tz=value.tzinfo)
+
+    monkeypatch.setattr(http, "datetime", _FrozenDatetime)
+    target = frozen + timedelta(seconds=5)
     retry_after = format_datetime(target, usegmt=True)
     route = respx.get(URL).mock(
         side_effect=[
@@ -190,13 +214,13 @@ def test_retry_after_accepts_http_date() -> None:
         response = client.get(URL)
     assert response.status_code == 200
     assert route.call_count == 2
-    # Полуинтервал, а не «около пяти»: `format_datetime` округляет дату
-    # ВНИЗ до целой секунды, поэтому ожидание — это (4.0, 5.0], причём
-    # ровно 4.0 достижимо и наблюдалось (прогон 2026-07-28 упал на
-    # `abs(4.0 - 5.0) < 1.0`). Различающая сила от этого не страдает:
-    # запасной путь (Retry-After не разобран) дал бы 1.0 — паузу между
-    # запросами, умноженную на 2**0.
-    assert any(4.0 <= delay <= 5.0 for delay in slept)
+    # `frozen` стоит на X.7 секунды; `format_datetime` роняет дробную часть
+    # цели («X+5.7» превращается в «X+5»), поэтому код видит цель на 0.7с
+    # раньше задуманного — задержка ровно 4.3с, детерминированно, часы не
+    # тикают. `slept[0]` — это именно retry-бэкофф: `_throttle()` на первой
+    # попытке ничего не спит (первый запрос всегда без паузы), а второй его
+    # вызов (перед повторной попыткой) идёт уже ПОСЛЕ этого сна.
+    assert slept[0] == pytest.approx(4.3)
 
 
 @respx.mock
