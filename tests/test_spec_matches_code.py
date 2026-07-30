@@ -249,9 +249,14 @@ def test_readme_names_the_real_report_files() -> None:
     Секция описывает, куда человек идёт смотреть выдачу, — то есть ровно то
     утверждение, которое ломается тихо: переименование файла оставит README
     правдоподобным, а читателя отправит в пустой каталог.
+
+    Сверяется ТАБЛИЦА, поэтому конец секции — заголовок «Отчёт в Telegram», а
+    не «Разработка»: ниже HTML-файл упомянут ещё раз, в разборе повторного
+    `report --since`, и с широкой границей порча строки таблицы оставалась
+    зелёной (проверено мутацией).
     """
-    section = readme_section("## Где смотреть результаты", "## Разработка")
-    for module, suffix in (("csv_sink", "csv"), ("markdown_sink", "md")):
+    section = readme_section("## Где смотреть результаты", "## Отчёт в Telegram")
+    for module, suffix in (("csv_sink", "csv"), ("markdown_sink", "md"), ("telegram_sink", "html")):
         source = (PACKAGE / "sinks" / f"{module}.py").read_text(encoding="utf-8")
         assert f'-new.{suffix}"' in source, f"{module} больше не пишет файл `-new.{suffix}`"
         assert f"-new.{suffix}`" in section, f"README не называет файл `-new.{suffix}`"
@@ -305,3 +310,40 @@ def test_readme_names_the_real_sink_name() -> None:
 
     section = readme_section("## Отчёт в Telegram", "## Разработка")
     assert f"`{TelegramSink.name}`" in section
+
+
+# --- спека приёмника telegram: ссылки на код ------------------------------
+
+
+TELEGRAM_SPEC = ROOT / "docs/superpowers/specs/2026-07-29-telegram-sink-design.md"
+
+# Ссылка на код номером строки: `__main__.py:458`, «на строке 55». Обе формы
+# протухают молча — от любой правки выше по файлу, и без единого красного
+# теста.
+_LINE_REFERENCE_RE = re.compile(r"\.py:\d+|на строке \d+")
+
+
+def test_telegram_spec_does_not_point_at_code_by_line_number() -> None:
+    """Ссылка номером строки — утверждение, обязанное протухать.
+
+    §8 указывала на `__main__.py:458`, §5 — на «ранний возврат на строке
+    55» в `pipeline/reporting.py`. Ни то, ни другое не сторожится ничем, а
+    съезжает от любой вставки выше по файлу. Ссылка по имени функции
+    съезжает только вместе с переименованием — и его видно.
+    """
+    text = TELEGRAM_SPEC.read_text(encoding="utf-8")
+    found = _LINE_REFERENCE_RE.findall(text)
+    assert found == [], f"в спеке снова ссылка номером строки: {found}"
+
+
+def test_telegram_spec_names_functions_that_exist() -> None:
+    """Имена, которыми спека заменила номера строк, обязаны существовать."""
+    text = TELEGRAM_SPEC.read_text(encoding="utf-8")
+    for name, module in (
+        ("report_command", PACKAGE / "__main__.py"),
+        ("_complain", PACKAGE / "pipeline/reporting.py"),
+    ):
+        assert f"`{name}`" in text, f"спека больше не ссылается на `{name}`"
+        assert f"def {name}(" in module.read_text(encoding="utf-8"), (
+            f"{module.name} больше не содержит `{name}`, а спека на него ссылается"
+        )
