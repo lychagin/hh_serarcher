@@ -10,12 +10,13 @@ import logging
 import os
 import stat
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 
+from hh_search import logging_setup
 from hh_search.logging_setup import setup_logging
 from hh_search.sinks import build_sinks
 from hh_search.sinks.telegram_client import (
@@ -25,7 +26,7 @@ from hh_search.sinks.telegram_client import (
     TelegramError,
     message_length,
 )
-from hh_search.sinks.telegram_sink import TelegramSink
+from hh_search.sinks.telegram_sink import LOOKBACK_DAYS, TelegramSink
 from tests.test_html_report import NOW, vacancy
 
 TOKEN = "1234567890:AAHtestTOKENvalueMUSTneverLEAK"
@@ -40,12 +41,15 @@ NEXT_MORNING = datetime(2026, 7, 30, 3, 50, tzinfo=UTC)
 def _restore_root_logger() -> Iterator[None]:
     """`setup_logging` перенастраивает КОРНЕВОЙ логгер — вернём его на место.
 
-    Здесь этого мало: `TelegramClient` вешает на обработчики корня фильтр,
-    вычищающий токен, и без снятия он переехал бы на обработчики pytest.
+    Здесь этого мало: `TelegramClient` регистрирует токен как секрет
+    (`logging_setup.redact_secret`), а реестр — общее состояние модуля,
+    переживающее отдельный тест. Без сброса токен переехал бы на
+    обработчики pytest и на реестр, который увидит следующий тест.
     """
     root = logging.getLogger()
     handlers, level = root.handlers[:], root.level
     filters = {handler: handler.filters[:] for handler in handlers}
+    secrets = logging_setup._secrets[:]  # noqa: SLF001 — тестовый сброс общего реестра
     quiet = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
     yield
     for handler in root.handlers[:]:
@@ -55,6 +59,7 @@ def _restore_root_logger() -> Iterator[None]:
     root.setLevel(level)
     for handler, existing in filters.items():
         handler.filters[:] = existing
+    logging_setup._secrets[:] = secrets  # noqa: SLF001 — тестовый сброс общего реестра
     for name, value in quiet.items():
         logging.getLogger(name).setLevel(value)
 
@@ -494,6 +499,179 @@ def test_the_previous_day_file_does_not_hide_a_genuinely_new_vacancy(tmp_path: P
     assert sink(tmp_path, client).emit([fresh], NEXT_MORNING) == 1
     assert "Сегодняшняя" in client.messages[0]
     assert (tmp_path / "2026-07-30-new.html").exists()
+
+
+# --- item 1: документ прошлых суток обязан довозиться, если сообщение уже ушло ---
+
+
+def test_document_is_redelivered_when_suppressed_only_by_the_previous_day_file(
+    tmp_path: Path,
+) -> None:
+    """`send_document` упал вечером — сообщение ушло, файл написан, но не
+    доставлен. Следующий прогон обязан довезти именно ЭТОТ файл, а не
+    молчать (спека §5, item 1): сообщение при этом не повторяется — оно
+    уже ушло, и повтор был бы ровно тем дублем, которого избегает дедуп.
+    """
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([vacancy()], NEXT_MORNING) == 0
+    assert not client.messages
+    assert len(client.documents) == 1
+    filename, content, caption = client.documents[0]
+    assert filename == "2026-07-29-new.html"
+    assert "2026-07-29" in caption
+    assert content == (tmp_path / "2026-07-29-new.html").read_bytes()
+
+
+def test_redelivery_raises_when_send_document_fails_again(tmp_path: Path) -> None:
+    """Продолжение: вторая неудача не имеет права молчать — следующий
+    прогон обязан попробовать ещё раз (спека §5, item 1)."""
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], NEXT_MORNING)
+    # Файл вчерашних суток остался на месте — есть, что довозить дальше.
+    assert (tmp_path / "2026-07-29-new.html").exists()
+    assert not (tmp_path / "2026-07-30-new.html").exists()
+
+
+def test_no_redelivery_when_fresh_is_empty_only_because_of_todays_own_file(
+    tmp_path: Path,
+) -> None:
+    """Обычное молчание при повторе В ТОТ ЖЕ день не должно превращаться в
+    повторную отправку документа: подавление сегодняшним файлом — не
+    повод довозить что-либо (иначе второй `emit` того же прогона слал бы
+    документ второй раз)."""
+    client = FakeClient()
+    target = sink(tmp_path, client)
+    target.emit([vacancy(vacancy_id="1")], NOW)
+    assert target.emit([vacancy(vacancy_id="1")], NOW) == 0
+    assert len(client.documents) == 1
+
+
+# --- item 2: черновики `.part` не имеют права оставаться в каталоге --------
+
+
+def test_os_replace_failure_removes_the_draft_and_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Каталог стал недоступен ПОСЛЕ `send_message`, но ДО `os.replace`:
+    черновик обязан исчезнуть, а не остаться мусором (item 2)."""
+
+    def _broken_replace(_src: object, _dst: object) -> None:
+        raise OSError("каталог отчётов стал недоступен")
+
+    monkeypatch.setattr("os.replace", _broken_replace)
+    with pytest.raises(OSError):
+        sink(tmp_path, FakeClient()).emit([vacancy()], NOW)
+    assert list(tmp_path.iterdir()) == [], "черновик остался после отказа os.replace"
+
+
+def test_orphaned_draft_from_a_killed_process_is_swept_on_the_next_emit(
+    tmp_path: Path,
+) -> None:
+    """`SIGKILL` между `mkstemp` и `os.replace` предыдущего прогона
+    оставляет черновик навсегда — уборка обязана случиться на следующем
+    `emit`, а не ждать человека (item 2)."""
+    tmp_path.mkdir(exist_ok=True)
+    orphan = tmp_path / "2026-07-28-new.htmlDEADBEEF.part"
+    orphan.write_text("<html>обрывок прошлого прогона</html>", encoding="utf-8")
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy()], NOW)
+    assert not orphan.exists()
+    assert (tmp_path / "2026-07-29-new.html").exists()
+
+
+def test_sweep_does_not_touch_a_published_day_file(tmp_path: Path) -> None:
+    """Уборка обязана трогать только `.part`, а не опубликованные файлы дня."""
+    client = FakeClient()
+    target = sink(tmp_path, client)
+    target.emit([vacancy(vacancy_id="1")], NOW)
+    target.emit([vacancy(vacancy_id="2")], NOW)
+    assert (tmp_path / "2026-07-29-new.html").exists()
+
+
+# --- item 3: окно дедупликации — именованная константа в несколько суток ---
+
+
+def test_two_consecutive_failed_midnights_still_do_not_repeat_the_message(
+    tmp_path: Path,
+) -> None:
+    """Отказ 29-го, отказ 30-го (повторная неудачная довозка), прогон
+    31-го обязан довезти документ 29-го и не повторить сообщение (item 3:
+    окно в одни сутки этого не переживало бы — воспроизведение находки)."""
+    day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], NEXT_MORNING)
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([vacancy()], day31) == 0
+    assert not client.messages
+    assert len(client.documents) == 1
+    assert client.documents[0][0] == "2026-07-29-new.html"
+
+
+def test_vacancy_outside_the_lookback_window_is_not_suppressed(tmp_path: Path) -> None:
+    """Обязательный сторож item 3: окно узкое НАМЕРЕННО. Ссылка вакансии,
+    легально вернувшейся в работу (`mark <id> new`), может случайно
+    совпасть с файлом ЗА ПРЕДЕЛАМИ окна — и такая вакансия не имеет права
+    подавиться."""
+    too_old = NOW.date() - timedelta(days=LOOKBACK_DAYS + 1)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / f"{too_old:%Y-%m-%d}-new.html").write_text(
+        '<a href="https://hh.ru/vacancy/1">старое упоминание</a>', encoding="utf-8"
+    )
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([vacancy(vacancy_id="1")], NOW) == 1
+    assert len(client.messages) == 1
+
+
+# --- item 8: дедупликация внутри одной пачки --------------------------------
+
+
+def test_duplicate_url_within_one_batch_is_written_once(tmp_path: Path) -> None:
+    """Как у `CsvSink.emit` («дубль может прийти и внутри одной пачки»):
+    два элемента с одним `url` в одном вызове обязаны дать `written == 1`."""
+    client = FakeClient()
+    same = vacancy(vacancy_id="7", title="Дубль")
+    written = sink(tmp_path, client).emit([same, same], NOW)
+    assert written == 1
+    assert client.messages[0].count("Дубль") == 1
+    assert client.documents[0][1].decode().count("Дубль") == 1
+
+
+# --- item 9: одинокая запись, не влезающая в 4096 целиком -------------------
+
+
+def test_a_single_oversized_entry_falls_back_to_a_minimal_link(tmp_path: Path) -> None:
+    """Одна вакансия, чей полный рендер сам не влезает в лимит: сообщение
+    обязано показать хотя бы ссылку с усечённым заголовком, а не ноль
+    записей при честном «…ещё 1» (item 9)."""
+    client = FakeClient()
+    huge = vacancy(vacancy_id="1", title="Заголовок " * 800, total=90.0)
+    sink(tmp_path, client).emit([huge], NOW)
+    message = client.messages[0]
+    assert message_length(message) <= MESSAGE_LIMIT
+    assert '<a href="https://hh.ru/vacancy/1">' in message
+    assert "</a>" in message
+    assert "Заголовок " * 800 not in message
+    assert "…ещё" not in message, "запись показана — хвост про остаток не нужен"
+
+
+def test_minimal_fallback_survives_a_title_that_expands_five_times_on_escape(
+    tmp_path: Path,
+) -> None:
+    """Заголовок из одних `&` разбухает впятеро при экранировании —
+    двоичный поиск обязан ужаться до безопасной длины, а не переполнить
+    лимит вместе с ней."""
+    client = FakeClient()
+    adversarial = vacancy(vacancy_id="1", title="&" * 4000, total=90.0)
+    sink(tmp_path, client).emit([adversarial], NOW)
+    message = client.messages[0]
+    assert message_length(message) <= MESSAGE_LIMIT
+    assert '<a href="https://hh.ru/vacancy/1">' in message
 
 
 def test_long_top_is_truncated_with_an_honest_tail(tmp_path: Path) -> None:

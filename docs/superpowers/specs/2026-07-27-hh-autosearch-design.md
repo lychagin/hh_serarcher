@@ -371,7 +371,8 @@ hh_search/
     html_report.py      рендер HTML-отчёта: экранирование, «Топ» и «Остальное», кликабельные ссылки
     markdown_sink.py    Markdown-отчёт: «Топ» по порогу и «Остальное»
     telegram_client.py  транспорт Bot API: sendMessage/sendDocument, токен не течёт в ошибки
-    telegram_sink.py    приёмник telegram: дедупликация по файлу дня, лимит сообщения
+    telegram_message.py сборка текста sendMessage: шапка, «Топ», безопасный запасной вариант
+    telegram_sink.py    приёмник telegram: дедупликация по нескольким суткам, довозка документа
     text.py             общая нормализация текста работодателя: выжимка описания, управляющие символы
   sources/
     http.py             вежливый клиент плюс матчер robots.txt по RFC 9309

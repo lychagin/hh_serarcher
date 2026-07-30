@@ -4,7 +4,9 @@
 вынесен в отдельный модуль намеренно: этот класс зовёт только два публичных
 метода `TelegramClient` и никогда не касается токена или URL — ровно так же,
 как приёмники `csv`/`markdown` зовут чистые функции `html_report.py`, не
-зная о транспорте вообще.
+зная о транспорте вообще. Сборка текста сообщения — в `telegram_message.py`
+(тот же принцип, применённый к бюджету §4.3: `emit()` здесь и так занят
+дедупликацией по нескольким суткам, черновиком и повторной доставкой).
 """
 
 import os
@@ -14,22 +16,41 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from hh_search.domain.models import ScoredVacancy
-from hh_search.sinks.html_report import (
-    VACANCY_HREF_RE,
-    document_header,
-    escape_html,
-    render_section,
-)
-from hh_search.sinks.telegram_client import MESSAGE_LIMIT, TelegramClient, message_length
+from hh_search.sinks.html_report import VACANCY_HREF_RE, document_header, render_section
+from hh_search.sinks.telegram_client import TelegramClient
+from hh_search.sinks.telegram_message import render_message
+
+# Сколько СУТОК назад читать файлы отчёта ради дедупликации, помимо
+# сегодняшнего (спека §5, item 3). Одних вчерашних было мало: отказ
+# `send_document` вечером 29-го и повторный отказ ДОВОЗКИ (item 1) утром
+# 30-го оставляют вакансию непомеченной ещё одни сутки, и прогон 31-го,
+# заглянув только на день назад (в пустой файл 30-го — довозка ничего не
+# пишет), не находит её нигде и повторяет вечернее сообщение дословно.
+# Двух суток достаточно ровно для этого сценария: прогон 31-го видит файлы
+# 30-го И 29-го.
+#
+# Шире — не значит безопаснее. `mark <id> new` возвращает вакансию в
+# очередь, обнулив счётчик попыток, и если её ссылка совпадёт с файлом
+# ПЯТИДНЕВНОЙ давности, широкое окно молча проглотит вручную возвращённую
+# вакансию — находка ревью, которую сторожит
+# `test_vacancy_outside_the_lookback_window_is_not_suppressed`. Окно
+# намеренно узкое: ровно столько, сколько нужно для воспроизведённого
+# сценария, и ни днём больше.
+LOOKBACK_DAYS = 2
+
+# Шаблон черновиков, которые эмиттер мог оставить сам: тот же суффикс, что
+# и у `tempfile.mkstemp(..., suffix=".part")` в `_draft`, плюс общий для
+# всех дней хвост имени файла дня. Уборка орфанов ищет РОВНО этот шаблон.
+_DRAFT_GLOB = "*-new.html*.part"
 
 
 class TelegramSink:
     """Отчёт в приватный канал: «Топ» сообщением, файл дня документом.
 
-    Дедупликация — по файлу дня, тем же приёмом, что у `csv` и `markdown`:
-    доставка сюда at-least-once по построению, потому что при отказе ЛЮБОГО
-    приёмника `report()` не помечает вакансии отправленными и они приезжают
-    снова.
+    Дедупликация — по файлам дня текущих и `LOOKBACK_DAYS` предыдущих
+    суток, тем же приёмом, что у `csv` и `markdown`: доставка сюда
+    at-least-once по построению, потому что при отказе ЛЮБОГО приёмника
+    `report()` не помечает вакансии отправленными и они приезжают снова.
 
     Публикация файла дня АТОМАРНА и стоит МЕЖДУ двумя отправками (спека §5,
     редакция 4). Четыре шага:
@@ -40,9 +61,15 @@ class TelegramSink:
        тронут, следующий прогон повторит всё целиком; дубля нет, потому
        что сообщение не ушло;
     3. `os.replace` — публикация одним шагом, рваного файла дня не бывает;
+       падение самого `os.replace` тоже убирает черновик и поднимает
+       исключение (item 2) — каталог мог стать недоступен уже ПОСЛЕ
+       `send_message`;
     4. `send_document` — если падает, файл уже опубликован: следующий
-       прогон найдёт вакансии в файле дедупликацией, вернёт 0 и сообщение
-       НЕ повторит.
+       прогон найдёт вакансии в файле дедупликацией и вернёт 0. Если при
+       этом хоть одна пришедшая вакансия нашлась ТОЛЬКО в файле одних из
+       предыдущих суток (а не сегодняшних), это и есть след той самой
+       непровезённой отправки — `emit` довозит именно её документ, не
+       трогая сообщение (item 1): оно уже ушло, повтор был бы дублем.
 
     Порядок «сообщение, потом запись» (редакция 3) воспроизводил критическую
     находку: запись сама может упасть. Каталог отчётов `chmod 0o500` — и
@@ -57,8 +84,8 @@ class TelegramSink:
     `send_message` уходит успешно, `send_document` падает, файла нет, и
     следующий прогон шлёт то же сообщение ВТОРОЙ раз. Публикация между
     отправками — единственное место, где закрыты обе: потеря на шаге 4
-    ограничена документом ОДНОГО прогона и самоизлечивается, потому что
-    файл дня накопительный.
+    ограничена документом ОДНОГО прогона и самоизлечивается через
+    довозку (item 1), а не только «файл накопительный, подождём».
     """
 
     name = "telegram"
@@ -69,33 +96,113 @@ class TelegramSink:
         self._client = client
 
     def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
+        self._sweep_orphaned_drafts()
         if not vacancies:
             return 0
         path = self._day_file(now.date())
         existing = self._read_day_file(path)
-        already = self._already(now, existing)
-        fresh = [item for item in vacancies if item.discovered.url not in already]
+        today_hrefs = set(VACANCY_HREF_RE.findall(existing))
+        previous = self._previous_days(now.date())
+        previous_hrefs: set[str] = set()
+        for _, _, hrefs in previous:
+            previous_hrefs |= hrefs
+
+        already = set(today_hrefs)
+        fresh: list[ScoredVacancy] = []
+        for item in vacancies:
+            url = item.discovered.url
+            if url in already or url in previous_hrefs:
+                continue
+            # Пополняем на ходу: дубль может прийти и внутри одной пачки
+            # (см. `CsvSink.emit` — тот же приём и та же причина).
+            already.add(url)
+            fresh.append(item)
         if not fresh:
-            return 0
+            return self._redeliver(vacancies, today_hrefs, previous)
 
         document = (existing or document_header(now)) + render_section(fresh, now, self._threshold)
         payload = document.encode("utf-8")
         draft = self._draft(path, payload)
         try:
-            self._client.send_message(self._message(fresh))
+            self._client.send_message(render_message(fresh, self._threshold))
         except BaseException:
             # Черновик не имеет права остаться: каталог отчётов зарос бы
             # обрывками, а файл дня обязан дождаться повторного прогона
             # нетронутым.
             draft.unlink(missing_ok=True)
             raise
-        os.replace(draft, path)
+        try:
+            os.replace(draft, path)
+        except OSError:
+            # Каталог мог стать недоступен уже ПОСЛЕ `send_message`
+            # (item 2): черновик всё равно не имеет права остаться.
+            draft.unlink(missing_ok=True)
+            raise
 
         self._client.send_document(path.name, payload, f"Отчёт за {now:%Y-%m-%d}")
         return len(fresh)
 
+    def _redeliver(
+        self,
+        vacancies: Sequence[ScoredVacancy],
+        today_hrefs: set[str],
+        previous: Sequence[tuple[date, str, set[str]]],
+    ) -> int:
+        """Довезти документ ОДНИХ предыдущих суток, если он застрял (item 1).
+
+        Свежих вакансий нет — обычно это либо пустой прогон, либо повтор
+        того же дня, и путь молчит, как раньше. Но если хоть одна ПРИШЕДШАЯ
+        вакансия нашлась ТОЛЬКО в файле одних из `previous` суток (а не в
+        сегодняшнем), значит тот прогон отправил сообщение и упал именно на
+        `send_document` — и до сих пор не был повторён. Редоставка шлёт
+        РОВНО тот файл, ничего не пишет и не трогает `send_message`: он уже
+        ушёл, повтор был бы тем самым дублем, которого избегает дедуп.
+
+        Если `send_document` падает снова — исключение поднимается как
+        есть: следующий прогон обязан попробовать ещё раз, а не смолчать.
+        """
+        incoming = {item.discovered.url for item in vacancies}
+        for day, content, hrefs in previous:
+            stuck = (incoming & hrefs) - today_hrefs
+            if content and stuck:
+                self._client.send_document(
+                    self._day_file(day).name, content.encode("utf-8"), f"Отчёт за {day:%Y-%m-%d}"
+                )
+                return 0
+        return 0
+
+    def _previous_days(self, today: date) -> list[tuple[date, str, set[str]]]:
+        """Файлы `LOOKBACK_DAYS` предыдущих суток: (дата, содержимое, ссылки).
+
+        Ближайший день — первым: `_redeliver` останавливается на первом
+        совпадении, а застрять чаще всего может именно вчерашний файл.
+        """
+        result: list[tuple[date, str, set[str]]] = []
+        for offset in range(1, LOOKBACK_DAYS + 1):
+            day = today - timedelta(days=offset)
+            content = self._read_day_file(self._day_file(day))
+            result.append((day, content, set(VACANCY_HREF_RE.findall(content))))
+        return result
+
     def _day_file(self, day: date) -> Path:
         return self._reports_dir / f"{day:%Y-%m-%d}-new.html"
+
+    def _sweep_orphaned_drafts(self) -> None:
+        """Убрать черновики, осиротевшие убийством процесса между
+        `mkstemp` и `os.replace` предыдущего прогона (item 2).
+
+        Безопасно ровно потому, что `emit` вызывается под общим замком
+        прогона (`single_run`, `hh_search/__main__.py`): пока этот вызов
+        идёт, другой процесс с тем же каталогом отчётов не работает, а
+        значит черновик, уже лежащий здесь В НАЧАЛЕ вызова, не может
+        принадлежать работающему соседу — только мёртвому. Свежий
+        черновик ЭТОГО вызова создаётся позже, самим `_draft`, и сюда не
+        попадает.
+        """
+        if not self._reports_dir.exists():
+            return
+        for draft in self._reports_dir.glob(_DRAFT_GLOB):
+            draft.unlink(missing_ok=True)
 
     def _draft(self, path: Path, payload: bytes) -> Path:
         """Черновик файла дня — в том же каталоге и ДО первой отправки.
@@ -121,78 +228,6 @@ class TelegramSink:
             draft.unlink(missing_ok=True)
             raise
         return draft
-
-    def _already(self, now: datetime, existing: str) -> set[str]:
-        """Ссылки, уже уехавшие в канал, — за сегодня И за вчера.
-
-        Вчерашний файл подмешивается потому, что ключ дедупликации — файл
-        `<дата>-new.html`, то есть он новый каждые сутки, а `mark_reported`
-        при отказе ЛЮБОГО приёмника не вызывался. Прогон 23:50 с упавшим
-        `send_document` (или упавшим соседом-`csv`) оставлял вакансии
-        непомеченными, и прогон 03:50 следующих суток, не найдя файла новых
-        суток, дословно повторял вечернее сообщение. При `interval_hours: 4`
-        это штатный исход любого вечернего отказа.
-
-        Законно новые вакансии этим не глотаются, и это проверяется
-        рассуждением, а не надеждой: вакансия, отправленная вчера и
-        ПОМЕЧЕННАЯ, сегодня не придёт из `unreported()` вовсе; непомеченная
-        же — ровно та, дубля которой мы избегаем. Вчерашний файл при этом
-        только читается: документ дня собирается из `existing`, то есть из
-        сегодняшнего.
-        """
-        yesterday = self._read_day_file(self._day_file(now.date() - timedelta(days=1)))
-        return set(VACANCY_HREF_RE.findall(existing)) | set(VACANCY_HREF_RE.findall(yesterday))
-
-    def _message(self, fresh: Sequence[ScoredVacancy]) -> str:
-        """Шапка и «Топ» со ссылками, гарантированно короче `MESSAGE_LIMIT`.
-
-        Счётчики здесь — отчёта, а не прогона: `Sink.emit` не получает
-        `RunStats` и получать не должен, иначе ради одной строки текста
-        пришлось бы менять интерфейс, общий с `csv` и `markdown` (спека §2).
-        """
-        top = sorted(
-            (item for item in fresh if item.score.total >= self._threshold),
-            key=lambda item: item.score.total,
-            reverse=True,
-        )
-        head = f"<b>Новых вакансий: {len(fresh)}</b>, выше порога: {len(top)}"
-        lines = [head]
-        shown = 0
-        for item in top:
-            entry = self._entry(item)
-            # Хвост объявляется честно, поэтому место под него резервируется
-            # ДО того, как строка перестанет влезать.
-            tail = f"\n\n…ещё {len(top) - shown} — в файле"
-            # Длина считается так, как её считает Telegram, — в кодовых
-            # единицах UTF-16 (`message_length`). Счёт в кодовых точках
-            # занижал её на каждом эмодзи в заголовке, и Bot API отвечал
-            # 400 на сообщение, которое по нашему счёту влезало.
-            if message_length("\n\n".join([*lines, entry]) + tail) > MESSAGE_LIMIT:
-                break
-            lines.append(entry)
-            shown += 1
-        if shown < len(top):
-            lines.append(f"…ещё {len(top) - shown} — в файле")
-        elif not top:
-            lines.append("<i>ничего выше порога — подробности в файле</i>")
-        return "\n\n".join(lines)
-
-    @staticmethod
-    def _entry(item: ScoredVacancy) -> str:
-        discovered = item.discovered
-        meta = " · ".join(
-            part
-            for part in (
-                escape_html(discovered.company) if discovered.company else None,
-                escape_html(discovered.area) if discovered.area else None,
-                escape_html(discovered.salary.raw) if discovered.salary.raw else None,
-            )
-            if part
-        )
-        return (
-            f'<a href="{discovered.url}">{escape_html(discovered.title)}</a> — '
-            f"<b>{item.score.total:.1f}</b>\n{meta}"
-        )
 
     def _read_day_file(self, path: Path) -> str:
         """Содержимое файла дня; пусто, если файла нет.

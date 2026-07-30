@@ -21,6 +21,7 @@ from hh_search.pipeline.stats import RunCounters
 from hh_search.scoring.base import Scorer
 from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sinks.base import Sink
+from hh_search.sinks.telegram_sink import TelegramSink
 from hh_search.sources.http import PoliteClient
 from hh_search.storage.base import (
     REJECT_CODE_ENRICH_FAILED,
@@ -33,6 +34,7 @@ from hh_search.storage.base import (
 from hh_search.storage.repository import SqliteRepository
 from hh_search.storage.run_log import ALLOWED_RUN_COUNTERS
 from tests.test_config import APP_YAML, PROFILE_YAML, write_config
+from tests.test_telegram_sink import FakeClient
 
 FIXTURES = Path(__file__).parent / "fixtures"
 NOW = datetime(2026, 7, 28, 10, 0, tzinfo=UTC)
@@ -709,6 +711,53 @@ def test_partial_sink_failure_keeps_everything_unreported(
     second = run(config, repo, [both])
     assert (second.status, second.reported) == ("ok", 1)
     assert both.seen == ["111"]
+
+
+# --- item 1: довозка застрявшего документа Telegram случается РОВНО один раз ---
+
+
+@respx.mock
+def test_telegram_redelivers_the_stuck_document_exactly_once(
+    config: Config, repo: SqliteRepository, tmp_path: Path
+) -> None:
+    """Прогон целиком, а не сборка `TelegramSink` в изоляции: только тут
+    видно, что `mark_reported` (вызываемый `report()` после УСПЕХА всех
+    приёмников) действительно останавливает довозку — а не то, что сам
+    приёмник "помнит" о ней сам по себе.
+
+    Вечер: `send_document` падает, сообщение ушло, вакансия НЕ помечена
+    (частичный отказ). Утро: здоровый `telegram` обязан довезти именно
+    тот документ и, раз ВСЕ приёмники этого прогона успешны, вакансия
+    наконец помечается — поэтому третий прогон не находит, что довозить.
+    """
+
+    def telegram(client: FakeClient) -> TelegramSink:
+        return TelegramSink(tmp_path, config.profile.report_threshold, client)  # type: ignore[arg-type]
+
+    mock_source()
+    evening = datetime(2026, 7, 29, 23, 50, tzinfo=UTC)
+    morning = datetime(2026, 7, 30, 3, 50, tzinfo=UTC)
+    afternoon = datetime(2026, 7, 30, 7, 50, tzinfo=UTC)
+
+    failing = FakeClient(fail_on="sendDocument")
+    stats1 = run(config, repo, [RecordingSink("csv"), telegram(failing)], now=evening)
+    assert stats1.status == "partial"
+    assert [vacancy.discovered.id for vacancy in repo.unreported()] == ["111"]
+    assert len(failing.messages) == 1
+    assert not failing.documents
+
+    healthy = FakeClient()
+    stats2 = run(config, repo, [RecordingSink("csv"), telegram(healthy)], now=morning)
+    assert (stats2.status, stats2.reported) == ("ok", 1)
+    assert not healthy.messages, "сообщение уже ушло вечером — повтор был бы дублем"
+    assert len(healthy.documents) == 1, "документ вечерних суток обязан довезтись"
+    assert repo.unreported() == []
+
+    third = FakeClient()
+    stats3 = run(config, repo, [RecordingSink("csv"), telegram(third)], now=afternoon)
+    assert (stats3.status, stats3.reported) == ("ok", 0)
+    assert not third.messages
+    assert not third.documents, "вакансия уже помечена — довозить нечего"
 
 
 @respx.mock
