@@ -37,6 +37,7 @@ from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
 from hh_search.sources.http import PoliteClient
 from hh_search.sources.vacancy_page import SalaryBlockStats, parse_vacancy_page, vacancy_url
+from hh_search.sources.work_format import WorkFormatBlockStats
 from hh_search.storage.base import Repository
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,11 @@ def enrich(
         config.app.enrich.max_attempts, config.app.limits.enrich_per_run
     )
     salary_stats = SalaryBlockStats()
+    # Симметрично salary_stats: второе отступление от «структурированные
+    # данные, а не вёрстка» разрешено владельцем под тем же условием — дрейф
+    # обязан быть заметным. Сторож, который существует классом, но никогда
+    # не создаётся в проде, — мёртвый код и невыполненное условие разом.
+    work_format_stats = WorkFormatBlockStats()
     # Отказы копятся, а не печатаются по одному: при аварии источника они
     # отличаются только URL (см. pipeline/failures.py).
     skipped = FailureDigest()
@@ -96,7 +102,7 @@ def enrich(
             continue
         answered += 1
         try:
-            details = parse_vacancy_page(response.text, salary_stats)
+            details = parse_vacancy_page(response.text, salary_stats, work_format_stats)
         except FetchFailed as error:
             _burn_attempt(config, repo, stats, vacancy.id, str(error), retried, exhausted)
             continue
@@ -107,6 +113,7 @@ def enrich(
             # пятнадцать, а не ноль.
             stats.enriched += 1
     salary_stats.log_summary()
+    work_format_stats.log_summary()
     skipped.log_summary("страниц вакансий не получено, попытки не израсходованы")
     retried.log_summary(
         f"вакансий не обогащено, попытка израсходована (лимит {config.app.enrich.max_attempts})"

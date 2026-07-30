@@ -912,6 +912,25 @@ def test_salary_drift_guard_is_wired_into_enrichment(
 
 
 @respx.mock
+def test_work_format_drift_guard_is_wired_into_enrichment(
+    config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`WorkFormatBlockStats` обязан получать каждую страницу прогона.
+
+    Симметрично `test_salary_drift_guard_is_wired_into_enrichment`: не
+    передать сторож в `parse_vacancy_page` — значит выключить сторож
+    переименованного ключа `workFormatsElement`, оставив его в коде мёртвым.
+    Модульный тест на сам `WorkFormatBlockStats` эту дыру не ловит по
+    построению — он не проверяет, что сторож вообще создан и подключён в
+    `enrichment.py`. Проверяется на страницах без блока формата (страница
+    по умолчанию `page_html()` его не содержит)."""
+    mock_source()
+    with caplog.at_level(logging.WARNING):
+        run(config, repo, [RecordingSink()])
+    assert "workFormatsElement" in caplog.text
+
+
+@respx.mock
 def test_vacancy_page_drift_makes_the_run_failed(
     config: Config, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
 ) -> None:
