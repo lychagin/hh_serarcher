@@ -197,7 +197,13 @@ def _sinks(config: Config) -> list[Sink]:
             config.app.sinks, config.app.paths.reports, config.profile.report_threshold
         )
     except ValueError as error:
-        _die(f"в app.yaml неизвестный приёмник: {error}", EXIT_CONFIG)
+        # Текст ошибки уходит как есть, без префикса: `build_sinks`
+        # отказывает и по неизвестному имени, и по незаданным секретам
+        # приёмника, а прежний префикс называл единственную причину —
+        # «в app.yaml неизвестный приёмник» — и на второй из них врал
+        # дважды. Приёмник известен, `app.yaml` ни при чём, переменные
+        # читаются из окружения; человек шёл править не тот файл.
+        _die(str(error), EXIT_CONFIG)
 
 
 def _open(config: Config) -> SqliteRepository:

@@ -36,5 +36,8 @@ def build_sinks(names: Sequence[str], reports_dir: Path, threshold: float) -> li
             credentials = TelegramCredentials.from_env(os.environ)
             sinks.append(TelegramSink(reports_dir, threshold, TelegramClient(credentials)))
         else:
-            raise ValueError(f"неизвестный sink: {name}")
+            # По-русски и без префикса от вызывающего: текст уходит человеку
+            # как есть, а «неизвестный sink» внутри «неизвестный приёмник:»
+            # давало заикание (находка I4).
+            raise ValueError(f"неизвестный приёмник: {name}")
     return sinks

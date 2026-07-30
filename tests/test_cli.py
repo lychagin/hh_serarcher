@@ -852,6 +852,30 @@ def test_serve_builds_sinks_before_the_loop_and_not_inside_the_run(
     assert not (tmp_path / "state" / "hh.db").exists()
 
 
+@pytest.mark.parametrize("command", ["run", "report"])
+def test_missing_telegram_secrets_do_not_blame_app_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """Сообщение об отказе обязано называть причину, которая есть.
+
+    Прежний текст — «в app.yaml неизвестный приёмник: приёмник telegram
+    включён, но не задано: TELEGRAM_CHAT_ID» — врал дважды: приёмник
+    известен, и `app.yaml` тут ни при чём. Человек шёл править не тот
+    файл. Ошибка `build_sinks` объясняет себя сама, префикс ей не нужен.
+    """
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    broken = APP_YAML.replace("sinks: [csv, markdown]", "sinks: [csv, telegram]")
+    config_dir = prepare(tmp_path, **{"app.yaml": broken})
+
+    result = invoke(config_dir, command)
+
+    assert result.exit_code == 2
+    assert "TELEGRAM_BOT_TOKEN" in result.output
+    assert "app.yaml" not in result.output
+    assert "неизвестный приёмник" not in result.output
+
+
 # --- C2: маркер обязан останавливать и `run`, а не только `serve` ----------
 
 
