@@ -1,6 +1,32 @@
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
+
+
+class WorkFormat(StrEnum):
+    """Формат работы в терминах hh.ru — значения их перечисления.
+
+    Именно перечисление, а не свободная строка: значение уезжает в
+    query-строку запроса к hh.ru, и опечатка обязана падать на старте, а не
+    превращаться в бессмысленный фильтр после похода в сеть. Значения взяты
+    с живой страницы вакансии (`workFormatsElement`), а не из документации:
+    документации на этот ключ нет.
+
+    Живёт в domain, а не в config, хотя первым потребителем (Task 1) был
+    именно конфиг (`QuerySpec.work_format`): `config/models.py` уже
+    зависит от `domain/models.py` транзитивно, через
+    `storage/base.DEFAULT_BATCH_LIMIT`, а обратная зависимость домена от
+    конфига дала бы цикл импорта (проверено исполнением: `ImportError:
+    cannot import name 'DiscoveredVacancy' from partially initialized
+    module`). `config/models.py` импортирует перечисление отсюда, поэтому
+    второго объявления по-прежнему нет.
+    """
+
+    REMOTE = "REMOTE"
+    HYBRID = "HYBRID"
+    ON_SITE = "ON_SITE"
+    FIELD_WORK = "FIELD_WORK"
 
 
 class Salary(BaseModel):
@@ -45,6 +71,14 @@ class VacancyDetails(BaseModel):
     company: str | None = None
     area: str | None = None
     salary: Salary = Salary()
+    # Множество, не одно значение: живой пример — Team Lead Go из Москвы
+    # предлагает ON_SITE, REMOTE и HYBRID одновременно. Правило дальше —
+    # «REMOTE присутствует среди форматов», а не «формат равен REMOTE»;
+    # обратное выкинуло бы вакансию, которая удалёнку допускает. Пустое
+    # множество — блока на странице не нашлось (см. `extract_work_formats`)
+    # или вакансия ещё не обогащена; в обоих случаях это не штраф в
+    # скоринге (§3 design).
+    work_formats: frozenset[WorkFormat] = frozenset()
 
 
 class ScoreBreakdown(BaseModel):

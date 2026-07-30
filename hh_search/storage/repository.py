@@ -324,7 +324,8 @@ class SqliteRepository:
         "salary_raw = COALESCE(:salary_raw, salary_raw), "
         "salary_from = COALESCE(:salary_from, salary_from), "
         "salary_to = COALESCE(:salary_to, salary_to), "
-        "salary_currency = COALESCE(:salary_currency, salary_currency)"
+        "salary_currency = COALESCE(:salary_currency, salary_currency), "
+        "work_formats = COALESCE(:work_formats, work_formats)"
     )
 
     @staticmethod
@@ -341,6 +342,15 @@ class SqliteRepository:
             "salary_from": details.salary.amount_from,
             "salary_to": details.salary.amount_to,
             "salary_currency": details.salary.currency,
+            # Отсортированный список через запятую — чтобы одно и то же
+            # множество всегда давало один и тот же текст (иначе круговой
+            # тест хранения и score_detail стали бы недетерминированными).
+            # Пустое множество сериализуется в NULL, а не в "": колонка и
+            # так уже различает «не обогащено» и «обогащено, форматов
+            # нет» одинаково (§3 design — неизвестный формат штрафа не
+            # даёт), а COALESCE выше не переписал бы существующее значение
+            # пустой строкой, только NULL-ом.
+            "work_formats": ",".join(sorted(details.work_formats)) or None,
         }
 
     def save_description(self, vacancy_id: str, details: VacancyDetails) -> None:
@@ -580,7 +590,8 @@ class SqliteRepository:
         """
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
-            "CAST(valid_through AS BLOB) AS valid_through "
+            "CAST(valid_through AS BLOB) AS valid_through, "
+            "CAST(work_formats AS BLOB) AS work_formats "
             "FROM vacancy WHERE status = ? AND description IS NOT NULL "
             "AND score_detail IS NULL ORDER BY COALESCE(published_at, first_seen_at) DESC "
             "LIMIT ?",
@@ -648,7 +659,8 @@ class SqliteRepository:
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
             "CAST(valid_through AS BLOB) AS valid_through, "
-            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
+            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail, "
+            "CAST(work_formats AS BLOB) AS work_formats "
             "FROM vacancy WHERE status = ? AND description IS NOT NULL "
             "AND score_detail IS NOT NULL ORDER BY score DESC LIMIT ?",
             (STATUS_NEW, limit),
@@ -679,7 +691,8 @@ class SqliteRepository:
         rows = self._connection.execute(
             f"SELECT {_DISCOVERED_COLUMNS_SQL}, CAST(description AS BLOB) AS description, "
             "CAST(valid_through AS BLOB) AS valid_through, "
-            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail "
+            "CAST(cluster AS BLOB) AS cluster, CAST(score_detail AS BLOB) AS score_detail, "
+            "CAST(work_formats AS BLOB) AS work_formats "
             "FROM vacancy WHERE status = ? AND reported_at >= ? "
             "AND description IS NOT NULL AND score_detail IS NOT NULL "
             "ORDER BY score DESC LIMIT ?",

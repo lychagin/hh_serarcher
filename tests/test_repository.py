@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from hh_search.domain.models import DiscoveredVacancy, Salary, ScoreBreakdown, VacancyDetails
+from hh_search.domain.models import (
+    DiscoveredVacancy,
+    Salary,
+    ScoreBreakdown,
+    VacancyDetails,
+    WorkFormat,
+)
 from hh_search.storage.base import DEFAULT_BATCH_LIMIT
 from hh_search.storage.migrations import ADDED_COLUMNS
 from hh_search.storage.quarantine import STATUS_CORRUPT
@@ -2396,3 +2402,45 @@ def test_rebuild_returns_the_freed_pages_to_the_file(tmp_path: Path) -> None:
     raw.close()
     assert rows == 2000, "перелив обязан сохранить все строки"
     assert free == 0, f"после перестроения в файле осталось {free} свободных страниц"
+
+
+# --- «регион и формат работы»: множество форматов переживает хранение ------
+
+
+def test_work_formats_survive_a_round_trip(repo: SqliteRepository) -> None:
+    """Множество, а не одно значение: сохранённое обязано читаться обратно
+    ровно тем же множеством — через ту же выборку, которой пользуется отчёт."""
+    repo.add_discovered(make_vacancy(), "embedded", 9)
+    saved = frozenset({WorkFormat.ON_SITE, WorkFormat.REMOTE})
+    repo.save_enriched("1", VacancyDetails(description="Yocto", work_formats=saved), make_score())
+    assert repo.unreported()[0].details.work_formats == saved
+
+
+def test_vacancy_without_work_formats_reads_back_as_empty_set(tmp_path: object) -> None:
+    """Так лежат 189 вакансий, собранных до этой колонки: NULL в базе,
+    `frozenset()` при чтении — не `None` и не исключение."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    assert read_column(db_path, "work_formats", "1") is None
+    assert repository.unreported()[0].details.work_formats == frozenset()
+    repository.close()
+
+
+def test_unknown_stored_value_is_ignored_on_read(tmp_path: object) -> None:
+    """Порча базы сырым SQL — приём, которым в этом проекте уже находили
+    Critical. Незнакомый токен отбрасывается, известный рядом с ним — нет."""
+    db_path = str(tmp_path) + "/test.db"
+    repository = SqliteRepository(db_path)
+    repository.init_schema()
+    repository.add_discovered(make_vacancy("1"), "embedded", 9)
+    repository.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repository.close()
+
+    corrupt(db_path, "UPDATE vacancy SET work_formats = ? WHERE id = ?", "REMOTE,TELEPORT", "1")
+
+    repository = SqliteRepository(db_path)
+    assert repository.unreported()[0].details.work_formats == frozenset({WorkFormat.REMOTE})
+    repository.close()

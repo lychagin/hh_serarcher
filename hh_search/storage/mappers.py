@@ -22,6 +22,7 @@ from hh_search.domain.models import (
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
+    WorkFormat,
 )
 from hh_search.storage.quarantine import CORRUPTION_EXCEPTIONS, ScoreUnreadable
 from hh_search.storage.time_utils import parse_utc
@@ -91,6 +92,28 @@ def to_id_and_title(row: sqlite3.Row) -> tuple[str, str]:
     return decode_text(row["id"]), decode_text(row["title"])
 
 
+def decode_work_formats(value: bytes | str | None) -> frozenset[WorkFormat]:
+    """CSV колонки → множество. NULL и незнакомое значение — не порча.
+
+    NULL — так лежат вакансии, обогащённые до появления этой колонки, и
+    страницы без блока формата; отличать эти случаи друг от друга смысла
+    нет (§3 design: неизвестный формат штрафа не даёт). Незнакомый токен
+    (hh.ru завёл значение раньше, чем мы о нём узнали) отбрасывается сам
+    по себе, не роняя строку целиком — тот же приём, что в
+    `extract_work_formats`.
+    """
+    text = decode_optional_text(value)
+    if not text:
+        return frozenset()
+    formats: set[WorkFormat] = set()
+    for token in text.split(","):
+        try:
+            formats.add(WorkFormat(token))
+        except ValueError:
+            continue
+    return frozenset(formats)
+
+
 def to_details(row: sqlite3.Row) -> VacancyDetails:
     """Поля страницы вакансии, прочитанные обратно — ВСЕ до единого.
 
@@ -117,6 +140,7 @@ def to_details(row: sqlite3.Row) -> VacancyDetails:
             amount_to=decode_optional_int(row["salary_to"]),
             currency=decode_optional_text(row["salary_currency"]),
         ),
+        work_formats=decode_work_formats(row["work_formats"]),
     )
 
 

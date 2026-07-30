@@ -1,5 +1,4 @@
 import re
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -11,6 +10,14 @@ from pydantic import (
     Field,
     model_validator,
 )
+
+# Перечисление живёт в domain, не здесь: этот модуль уже зависит от
+# domain/models.py транзитивно (см. импорт storage.base ниже), а обратная
+# зависимость домена от конфига дала бы цикл импорта. Импорт, а не второе
+# объявление — см. докстринг WorkFormat в domain/models.py. `as WorkFormat`
+# делает реэкспорт явным: `mypy --strict` запрещает неявный (test_listing.py
+# по-прежнему делает `from hh_search.config.models import WorkFormat`).
+from hh_search.domain.models import WorkFormat as WorkFormat
 
 # Нормализация берётся у матчера, а не пишется здесь заново: уникальность
 # сигналов обязана проверяться в той же форме, в которую они компилируются,
@@ -367,22 +374,6 @@ def _reject_url_syntax(value: str) -> str:
 
 
 Slug = Annotated[str, Field(min_length=1), AfterValidator(_reject_url_syntax)]
-
-
-class WorkFormat(StrEnum):
-    """Формат работы в терминах hh.ru — значения их перечисления.
-
-    Именно перечисление, а не свободная строка: значение уезжает в
-    query-строку запроса к hh.ru, и опечатка обязана падать на старте, а не
-    превращаться в бессмысленный фильтр после похода в сеть. Значения взяты
-    с живой страницы вакансии (`workFormatsElement`), а не из документации:
-    документации на этот ключ нет.
-    """
-
-    REMOTE = "REMOTE"
-    HYBRID = "HYBRID"
-    ON_SITE = "ON_SITE"
-    FIELD_WORK = "FIELD_WORK"
 
 
 class QuerySpec(Base):

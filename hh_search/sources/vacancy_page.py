@@ -10,6 +10,7 @@ from typing import Any
 from hh_search.domain.models import Salary, VacancyDetails
 from hh_search.errors import FetchFailed
 from hh_search.sources.salary import parse_salary
+from hh_search.sources.work_format import WorkFormatBlockStats, extract_work_formats
 
 logger = logging.getLogger(__name__)
 
@@ -245,12 +246,16 @@ class SalaryBlockStats:
             )
 
 
-def parse_vacancy_page(html: str, stats: SalaryBlockStats | None = None) -> VacancyDetails:
+def parse_vacancy_page(
+    html: str,
+    stats: SalaryBlockStats | None = None,
+    work_format_stats: WorkFormatBlockStats | None = None,
+) -> VacancyDetails:
     """Всё, что даёт страница вакансии, — за один разбор.
 
     После переезда discovery на листинг это единственный источник
-    компании, региона, зарплаты и даты публикации: листинг отдаёт только
-    id, url и заголовок.
+    компании, региона, зарплаты, формата работы и даты публикации:
+    листинг отдаёт только id, url и заголовок.
     """
     posting = extract_job_posting(html)
     if posting is None:
@@ -258,6 +263,9 @@ def parse_vacancy_page(html: str, stats: SalaryBlockStats | None = None) -> Vaca
     salary = extract_salary(html)
     if stats is not None:
         stats.record(salary)
+    work_formats = extract_work_formats(html)
+    if work_format_stats is not None:
+        work_format_stats.record(work_formats)
     return VacancyDetails(
         description=_extract_description(posting),
         valid_through=_parse_datetime(posting.get("validThrough")),
@@ -265,4 +273,5 @@ def parse_vacancy_page(html: str, stats: SalaryBlockStats | None = None) -> Vaca
         company=_extract_organization(posting),
         area=_extract_locality(posting),
         salary=salary or Salary(),
+        work_formats=work_formats,
     )

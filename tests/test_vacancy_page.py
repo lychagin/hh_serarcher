@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from hh_search.domain.models import WorkFormat
 from hh_search.errors import FetchFailed
 from hh_search.sources.vacancy_page import (
     SalaryBlockStats,
@@ -14,6 +15,7 @@ from hh_search.sources.vacancy_page import (
     parse_vacancy_page,
     vacancy_url,
 )
+from hh_search.sources.work_format import WorkFormatBlockStats, extract_work_formats
 
 FIXTURE = Path(__file__).parent / "fixtures" / "vacancy.html.gz"
 # Живая страница вакансии С УКАЗАННОЙ зарплатой. Нужна отдельно: у
@@ -275,3 +277,83 @@ def test_type_given_as_a_list_is_still_a_job_posting() -> None:
     )
     details = parse_vacancy_page(html)
     assert details.description == "Опыт Buildroot"
+
+
+# --- Раунд «регион и формат работы»: формат работы со страницы вакансии ---
+
+
+def test_work_formats_read_from_the_on_site_fixture() -> None:
+    """Живая фикстура, а не синтетика: в этом проекте все Critical нашлись
+    живыми данными."""
+    assert extract_work_formats(load_fixture()) == frozenset({WorkFormat.ON_SITE})
+
+
+def test_work_formats_read_from_the_remote_fixture() -> None:
+    assert extract_work_formats(load_salary_fixture()) == frozenset({WorkFormat.REMOTE})
+
+
+def test_several_formats_are_all_kept() -> None:
+    """Вакансия может предлагать несколько форматов, и REMOTE не должен
+    потеряться среди них (живой пример: Team Lead Go, три формата)."""
+    html = (
+        "&#34;workFormats&#34;:[{&#34;workFormatsElement&#34;:"
+        "[&#34;ON_SITE&#34;,&#34;REMOTE&#34;,&#34;HYBRID&#34;]}]"
+    )
+    assert extract_work_formats(html) == frozenset(
+        {WorkFormat.ON_SITE, WorkFormat.REMOTE, WorkFormat.HYBRID}
+    )
+
+
+def test_missing_block_gives_empty_set_not_an_error() -> None:
+    """Отсутствие блока — не отказ страницы: формат необязателен, а дрейф
+    ловится агрегатом, не одной страницей."""
+    assert extract_work_formats("<html></html>") == frozenset()
+
+
+def test_unknown_format_value_is_ignored_and_does_not_crash() -> None:
+    """hh.ru может завести новое значение перечисления. Неизвестное
+    отбрасывается, известные из того же списка сохраняются."""
+    html = (
+        "&#34;workFormats&#34;:[{&#34;workFormatsElement&#34;:"
+        "[&#34;REMOTE&#34;,&#34;TELEPORT&#34;]}]"
+    )
+    assert extract_work_formats(html) == frozenset({WorkFormat.REMOTE})
+
+
+def test_block_stats_shout_when_no_page_had_formats(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Сторож дрейфа: молчит на отдельной пустой странице, кричит на прогоне,
+    где не нашлось ни одной. Тот же приём, что у SalaryBlockStats."""
+    stats = WorkFormatBlockStats()
+    for _ in range(5):
+        stats.record(frozenset())
+    with caplog.at_level(logging.WARNING):
+        stats.log_summary()
+    assert "ни с одной" in caplog.text
+
+
+def test_block_stats_stay_quiet_when_some_pages_had_formats(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stats = WorkFormatBlockStats()
+    stats.record(frozenset({WorkFormat.REMOTE}))
+    stats.record(frozenset())
+    with caplog.at_level(logging.WARNING):
+        stats.log_summary()
+    assert "ни с одной" not in caplog.text
+
+
+def test_parse_vacancy_page_extracts_work_formats() -> None:
+    """Формат — из того же разбора страницы, что и всё остальное: шаг
+    обогащения получает его без отдельного похода в сеть."""
+    assert parse_vacancy_page(load_fixture()).work_formats == frozenset({WorkFormat.ON_SITE})
+    assert parse_vacancy_page(load_salary_fixture()).work_formats == frozenset({WorkFormat.REMOTE})
+
+
+def test_work_format_stats_record_through_parse_vacancy_page() -> None:
+    """Проводка до сторожа — по образцу salary_stats в той же функции."""
+    stats = WorkFormatBlockStats()
+    parse_vacancy_page(load_fixture(), work_format_stats=stats)
+    parse_vacancy_page(load_salary_fixture(), work_format_stats=stats)
+    assert (stats.pages, stats.without_formats) == (2, 0)

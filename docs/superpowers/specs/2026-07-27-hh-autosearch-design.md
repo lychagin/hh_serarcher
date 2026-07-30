@@ -372,7 +372,7 @@ hh_search/
     loader.py           чтение YAML с запретом дублирующихся ключей + валидация
     models.py           pydantic-схема трёх конфигов, границы всех числовых полей, потолки прогона
   domain/
-    models.py           Salary, DiscoveredVacancy, VacancyDetails, ScoreBreakdown, ScoredVacancy
+    models.py           Salary, WorkFormat, DiscoveredVacancy, VacancyDetails, ScoreBreakdown, ScoredVacancy
   filtering/
     matching.py         нормализация и сопоставление слов
     prefilter.py        шаг 3: отсев по заголовку — единственный барьер перед сетью
@@ -402,7 +402,8 @@ hh_search/
     listing.py          шаг 1: URL листинга, разбор ld+json ItemList, сторож canonical
     rss.py              прежний источник, ВЫКЛЮЧЕН запретом robots.txt (см. §3.5)
     salary.py           разбор строки «от 100 000 до 150 000 ₽» в Salary
-    vacancy_page.py     шаг 4: JSON-LD страницы, зарплата из разметки, сторож дрейфа
+    vacancy_page.py     шаг 4: JSON-LD страницы, зарплата и формат работы из разметки, сторож дрейфа
+    work_format.py      разбор workFormatsElement во множество WorkFormat, сторож дрейфа блока
   storage/
     base.py             протокол Repository (§4.2), коды статусов и причин отказа
     mappers.py          sqlite3.Row → доменные модели, по одному построителю на выборку
@@ -467,6 +468,16 @@ CREATE TABLE IF NOT EXISTS vacancy (
     title           TEXT NOT NULL,
     company         TEXT,
     area            TEXT,
+    -- Множество форматов работы (REMOTE/HYBRID/ON_SITE/FIELD_WORK),
+    -- отсортированный список через запятую в одной колонке, а не
+    -- отдельная таблица: значений всего четыре, выборок по ним нет (штраф
+    -- в скоринге читает всю строку и проверяет вхождение в Python), и
+    -- нормализация дала бы join ради ничего. Сортировка перед склейкой —
+    -- чтобы одно и то же множество всегда давало один и тот же текст
+    -- (иначе круговой тест хранения и score_detail стали бы недетерминированными).
+    -- NULL — вакансия ещё не обогащена (либо обогащена до этой колонки:
+    -- 189 живых записей) или страница не содержала блока формата.
+    work_formats    TEXT,
     salary_raw      TEXT,
     salary_from     INTEGER,
     salary_to       INTEGER,
