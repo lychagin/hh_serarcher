@@ -28,6 +28,7 @@ from pathlib import Path
 
 import yaml
 
+from hh_search.config.models import LocationConfig
 from hh_search.domain.models import WorkFormat
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -211,6 +212,130 @@ def test_spec_discovery_volume_matches_the_sample_config() -> None:
     assert ceiling == pages * 20
 
 
+# --- §4.1 — единственное место, где это число вообще написано --------------
+#
+# Оно копировалось четырежды: README, §7 спеки, докстринг `LimitsConfig` и
+# комментарий `config.example/app.yaml`. Второй поток discovery сдвинул
+# образец с пяти листингов и девяти страниц на шесть и двенадцать — и все
+# четыре копии соврали разом, а сторож был только у §4.1. Тест ниже держит
+# инвариант «копий нет», а не «копии совпадают»: сверять копию с оригиналом
+# дороже, чем не заводить копию.
+
+# Обе формы, в которых число уже появлялось: «9 запросов к листингам» и
+# «(5 листингов, 9 страниц)». Обычные иллюстрации («50 листингов по 20
+# страниц» в README, «20 вакансий на страницу») под них не попадают — они не
+# про образцовый конфиг и не протухают от его правки.
+_VOLUME_CLAIM_RES = (
+    re.compile(r"\d+\s+запрос\w*\s+к\s+листинг", re.IGNORECASE),
+    re.compile(r"\(\d+\s+листинг\w*,\s*(?:суммарно\s+)?\d+\s+страниц", re.IGNORECASE),
+)
+
+
+def _texts_that_must_not_repeat_the_volume() -> list[tuple[str, str]]:
+    """Пары «имя, текст», в которых копии быть не должно.
+
+    Основная спека входит сюда тоже — с ВЫРЕЗАННОЙ §4.1: одна из четырёх
+    копий жила именно в ней, в §7, и сторож, пропускающий весь файл целиком
+    ради одного законного вхождения, был бы мёртв ровно там, где нужен.
+    Приём тот же, что у окна вокруг совпадения в
+    `test_no_module_repeats_the_retracted_claims_about_area_and_page_parameter`.
+    """
+    spec = SPEC.read_text(encoding="utf-8")
+    guarded = spec_section("### 4.1", "### 4.2")
+    texts = [
+        ("спека без §4.1", spec.replace(guarded, "")),
+        ("README.md", README.read_text(encoding="utf-8")),
+    ]
+    for path in [*sorted((ROOT / "config.example").glob("*.yaml")), *sorted(PACKAGE.rglob("*.py"))]:
+        texts.append((str(path.relative_to(ROOT)), path.read_text(encoding="utf-8")))
+    return texts
+
+
+def test_only_the_guarded_section_states_the_discovery_volume() -> None:
+    """Число запросов шага discovery не копируется за пределы §4.1."""
+    for name, text in _texts_that_must_not_repeat_the_volume():
+        for pattern in _VOLUME_CLAIM_RES:
+            found = pattern.search(text)
+            assert found is None, (
+                f"{name}: снова копия объёма шага discovery ({found.group(0)!r}). "
+                "Она протухает от любой правки `config.example/queries.yaml`; число "
+                "живёт в §4.1 спеки, где его сторожит "
+                "`test_spec_discovery_volume_matches_the_sample_config`"
+            )
+
+
+# --- §6: региональный штраф -----------------------------------------------
+#
+# §6 — единственное прозаическое описание формулы, и ветка «регион и формат
+# работы» его забыла: §4.1, §4.3 и §5.1 обновились, а §6 продолжала говорить
+# «penalty вычитается — каждый негативный сигнал стоит ~15 очков», не зная о
+# втором слагаемом. Читатель, настраивающий веса по §6, не узнавал, что у
+# оценки появился штраф за регион. Сторож заводится сразу, потому что
+# закономерность этого проекта известна: разошлись ровно те разделы, которых
+# не сторожил ни один тест.
+
+
+def _scoring_section() -> str:
+    return spec_section("## 6. Скоринг", "### 6.1")
+
+
+def test_spec_scoring_states_the_region_rule_in_execution_order() -> None:
+    """Три правила §6 — в том порядке, в каком их исполняет `_region_penalty`.
+
+    Имена берутся из кода (`LocationConfig`, `WorkFormat`), а не переписываются
+    руками: переименование поля обязано красить документ вместе с конфигом.
+    """
+    section = _scoring_section()
+    rules = re.findall(r"^\d+\. (.+)$", section, re.M)
+    assert len(rules) == 3, f"в §6 пропал нумерованный список правил региона: {rules}"
+    home_areas, penalty_field = LocationConfig.model_fields
+    assert home_areas in rules[0], "первое правило §6 обязано говорить про домашний регион"
+    assert WorkFormat.REMOTE.value in rules[1], "второе правило §6 обязано говорить про REMOTE"
+    assert penalty_field in rules[2], "третье правило §6 обязано называть поле штрафа"
+    # §6 обещает «в том порядке, в каком оно исполняется», — значит порядок
+    # сверяется с кодом. Сравниваются ПРОВЕРКИ, а не имена: `self._home_areas`
+    # встречается в `__init__` выше по файлу, и по нему сторож был бы зелен
+    # при любой перестановке (проверено мутацией). Сама перестановка сегодня
+    # не меняет ни одного вердикта — все ветки замыкаются на `return 0.0`, —
+    # поэтому её ловит только документ-сторож, а не тесты скоринга.
+    source = (PACKAGE / "scoring/keyword.py").read_text(encoding="utf-8")
+    assert source.index(" in self._home_areas:") < source.index("WorkFormat.REMOTE in work_formats")
+
+
+def test_spec_scoring_states_both_defaults_of_the_region_penalty() -> None:
+    """Оба умолчания «не штрафовать» названы: без них §6 описывает правило,
+    которое штрафует вакансию за сбой разбора страницы.
+
+    Первое — раздела `location` нет вовсе; второе — регион неизвестен либо
+    множество форматов пусто. Поведение сторожат `test_scoring.py`
+    (`test_profile_without_location_section_scores_as_before`,
+    `test_unknown_area_is_not_penalised`, `test_unknown_format_is_not_penalised`),
+    здесь сторожится то, что документ о них говорит.
+    """
+    section = _scoring_section()
+    assert re.search(r"Раздела `location`[^.]*нет[^.]*штрафа нет", section), (
+        "§6 больше не говорит, что без раздела `location` штрафа нет вовсе"
+    )
+    assert re.search(r"неизвестен[^.]*форматов пусто[^.]*штрафа тоже нет", section, re.S), (
+        "§6 больше не говорит, что неизвестный регион и пустое множество форматов штрафа не несут"
+    )
+
+
+def test_spec_scoring_does_not_promise_a_separate_score_detail_entry() -> None:
+    """Штраф за регион складывается в общее поле `penalty`, отдельной записи нет.
+
+    Решение принято планом и закреплено `test_penalty_lands_in_score_detail`;
+    документ, обещающий отдельную запись, обещает отчёт, которого не будет.
+    """
+    from hh_search.domain.models import ScoreBreakdown
+
+    assert "penalty" in ScoreBreakdown.model_fields, "в разбивке пропало поле `penalty`"
+    assert not [name for name in ScoreBreakdown.model_fields if "region" in name], (
+        "в разбивке появилось отдельное поле региона — §6 надо переписать"
+    )
+    assert "Отдельной записи в `score_detail` региональный штраф не получает" in _scoring_section()
+
+
 # --- §10: таблица фикстур -------------------------------------------------
 
 
@@ -368,11 +493,19 @@ def test_no_module_repeats_the_retracted_claims_about_area_and_page_parameter() 
             f"{rel}: снова «обход духа запрета» — `Allow: /vacancies/*?*&page=` "
             "разрешает такие параметры сознательно, обхода тут нет (design §0, spec §3.2)"
         )
-        claims_area_filters = _AREA_FILTERS_CLAIM_RE.search(text) is not None
-        assert not (claims_area_filters and "игнориру" not in text.lower()), (
-            f"{rel}: утверждает, что `area` фильтрует по региону — измерение 2026-07-30 "
-            "показало обратное: `area` игнорируется, регион задаёт поддомен (design §0)"
-        )
+        # Освобождающее «игнориру» ищется В ОКНЕ вокруг совпадения, а не по
+        # всему файлу. По файлу сторож был мёртв ровно там, ради чего заведён:
+        # в `listing.py` уже стоит честное «а потому что игнорируется hh.ru»,
+        # и одно это слово обезвреживало проверку на весь модуль — фраза
+        # «Параметр area даёт фильтр по региону» вписывалась в тот же файл, и
+        # сторож оставался зелёным (проверено мутацией). Окно ±120 символов
+        # накрывает предложение целиком, но не соседний абзац.
+        for match in _AREA_FILTERS_CLAIM_RE.finditer(text):
+            window = text[max(0, match.start() - 120) : match.end() + 120]
+            assert "игнориру" in window.lower(), (
+                f"{rel}: утверждает, что `area` фильтрует по региону — измерение 2026-07-30 "
+                "показало обратное: `area` игнорируется, регион задаёт поддомен (design §0)"
+            )
 
 
 # --- README §«Отчёт в Telegram» --------------------------------------------
