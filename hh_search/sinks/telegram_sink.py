@@ -9,6 +9,7 @@
 дедупликацией по нескольким суткам, черновиком и повторной доставкой).
 """
 
+import contextlib
 import os
 import tempfile
 from collections.abc import Sequence
@@ -198,11 +199,18 @@ class TelegramSink:
         принадлежать работающему соседу — только мёртвому. Свежий
         черновик ЭТОГО вызова создаётся позже, самим `_draft`, и сюда не
         попадает.
+
+        Отказ самой уборки глушится: черновик — мусор, а не данные, и
+        недоступный на запись каталог отчётов не имеет права ронять
+        прогон, который без уборки вернул бы 0 (каталог `0o500` с
+        осиротевшим `.part` внутри давал новый класс отказа, лечимый
+        только руками). Не убранный черновик подберёт следующий прогон.
         """
         if not self._reports_dir.exists():
             return
         for draft in self._reports_dir.glob(_DRAFT_GLOB):
-            draft.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                draft.unlink(missing_ok=True)
 
     def _draft(self, path: Path, payload: bytes) -> Path:
         """Черновик файла дня — в том же каталоге и ДО первой отправки.

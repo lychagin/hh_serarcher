@@ -583,6 +583,29 @@ def test_orphaned_draft_from_a_killed_process_is_swept_on_the_next_emit(
     assert (tmp_path / "2026-07-29-new.html").exists()
 
 
+@pytest.mark.skipif(os.getuid() == 0, reason="от root каталог только для чтения не бывает")
+def test_unremovable_draft_does_not_break_an_otherwise_empty_run(tmp_path: Path) -> None:
+    """Уборка черновиков стоит ДО `if not vacancies` и не имеет права
+    ронять прогон, который без неё вернул бы 0.
+
+    Каталог отчётов `0o500` с осиротевшим `.part` внутри: `unlink` даёт
+    `PermissionError`, и пустой прогон — тот, что раньше не касался ни
+    сети, ни диска, — падал новым классом отказа, который лечится только
+    руками. Черновик подождёт следующего прогона, это мусор, а не данные.
+    """
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "2026-07-28-new.htmlDEADBEEF.part").write_text("обрывок", encoding="utf-8")
+    reports.chmod(0o500)
+    client = FakeClient()
+    try:
+        assert sink(reports, client).emit([], NOW) == 0
+    finally:
+        reports.chmod(0o700)
+    assert not client.messages
+    assert not client.documents
+
+
 def test_sweep_does_not_touch_a_published_day_file(tmp_path: Path) -> None:
     """Уборка обязана трогать только `.part`, а не опубликованные файлы дня."""
     client = FakeClient()
