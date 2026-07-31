@@ -1439,6 +1439,7 @@ python -m hh_search mark <id> applied # пометить статус вручн
 | `listing_programmist.html.gz` | Живая страница `/vacancies/programmist`: существующий листинг, 20 элементов `ItemList` |
 | `listing_unknown_slug.html.gz` | Живой ответ на `/vacancies/yocto` — общий индекс со статусом 200. Главный случай переезда: без сторожа `canonical` эти 20 посторонних вакансий попали бы в базу |
 | `listing_regional_redirect.html.gz` | Живая страница, отданная на `/vacancies/programmist` **после редиректа на региональный поддомен**: `canonical` и все 20 ссылок ведут на `nn.hh.ru`. Без неё «свой хост = ровно hh.ru» выглядел бы рабочим на всех остальных фикстурах |
+| `listing_remote_programmist.html.gz` | Живая страница второго потока — `/vacancies/programmist?work_format=REMOTE&page=0`, снятая 2026-07-31 с нижегородского выхода (тот же региональный редирект, что и у `listing_regional_redirect.html.gz`). У неё `canonical` ведёт на `nn.hh.ru/vacancies/programmist?page=0` — **без `work_format`**; фикстура сторожит, что `_check_slug` это переживает, сравнивая путь, а не URL целиком |
 | `vacancy.html.gz` | Живая страница вакансии **без** указанной зарплаты |
 | `vacancy_salary.html.gz` | Живая страница вакансии **с** зарплатой «от 100 000 до 150 000 ₽». Нужна отдельно: на первой невозможно отличить «блока нет» от «блок не разбирается», и именно здесь проверено отсутствие `baseSalary` |
 | `rss_yocto.xml` | Живая RSS-лента. Модуль выключен, но фикстура сохранена вместе с ним: она понадобится в день, когда запрет уйдёт |

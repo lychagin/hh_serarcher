@@ -460,3 +460,61 @@ def test_regional_index_instead_of_the_requested_slug_is_still_refused() -> None
     html = page("programmist", [item("1")], canonical="https://nn.hh.ru/vacancies")
     with pytest.raises(FetchFailed, match="programmist"):
         parse_listing(html, "programmist")
+
+
+# --- второй поток: живая страница `?work_format=REMOTE&page=0` -----------
+
+# Живой ответ на `/vacancies/programmist?work_format=REMOTE&page=0`, снят
+# 2026-07-31 одним ручным GET с нижегородского выхода (см. §0 спеки
+# `2026-07-30-region-and-work-format-design.md`). До этой фикстуры разбор
+# страницы второго потока не проверялся ни на одном живом ответе.
+LIVE_REMOTE_LISTING = "listing_remote_programmist.html.gz"
+
+
+def test_the_remote_fixture_has_a_canonical_without_work_format() -> None:
+    """Сторож самой фикстуры и одновременно замеренный факт 2026-07-31.
+
+    Второй поток пришёл после того же регионального редиректа, что и
+    `listing_regional_redirect.html.gz` (canonical на `nn.hh.ru`), но
+    вдобавок его canonical **не несёт** `work_format` — hh.ru его туда не
+    кладёт. Если это когда-нибудь изменится, следующий тест
+    (`test_live_remote_listing_parses_despite_canonical_without_work_format`)
+    останется зелёным просто потому, что `_check_slug` сравнивает путь, а
+    не докажет уже ничего интересного, — а вот этот тест покраснеет первым
+    и объяснит, что именно изменилось."""
+    html = load(LIVE_REMOTE_LISTING)
+    assert (
+        '<link data-rh="" rel="canonical" href="https://nn.hh.ru/vacancies/programmist?page=0">'
+        in html
+    )
+    assert "work_format" not in html.split("<head", 1)[1].split("</head>", 1)[0]
+
+
+def test_live_remote_listing_parses_despite_canonical_without_work_format() -> None:
+    """Главное, что доказывает эта фикстура: страница второго потока
+    разбирается, хотя её canonical не содержит `work_format` (см. тест
+    выше). `_check_slug` строит ожидаемый путь как `/vacancies/{slug}` и
+    сравнивает с ПУТЁМ canonical (`_canonical_targets`), а query-строка в
+    сравнение не входит вовсе — поэтому отсутствие `work_format` в
+    canonical не может его провалить ни при каких условиях."""
+    found = parse_listing(load(LIVE_REMOTE_LISTING), "programmist")
+    assert len(found) == 20
+    assert len({v.id for v in found}) == 20
+    assert all(v.id.isdigit() for v in found)
+    assert all(v.title.strip() for v in found)
+    assert all(v.url == f"https://hh.ru/vacancy/{v.id}" for v in found)
+    assert all(v.found_by_query == "programmist" for v in found)
+
+
+def test_live_remote_listing_state_actually_carries_the_remote_format() -> None:
+    """Фильтр `work_format=REMOTE` не просто принят hh.ru молча — он и
+    правда виден в выдаче. Встроенное состояние страницы несёт 50 блоков
+    `workFormatsElement` (не 20 — блоков в состоянии больше, чем вакансий,
+    разобранных `parse_listing`, это данные страницы, а не список вакансий),
+    и REMOTE присутствует во ВСЕХ пятидесяти (замер 2026-07-31, тот же
+    ручной GET). У голого листинга той же страницы REMOTE встречается лишь
+    в части блоков — см. спеку §0."""
+    html = load(LIVE_REMOTE_LISTING)
+    blocks = re.findall(r"&#34;workFormatsElement&#34;:\[([^\]]*)\]", html)
+    assert len(blocks) == 50
+    assert all("REMOTE" in block for block in blocks)
