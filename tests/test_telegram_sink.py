@@ -19,6 +19,7 @@ import pytest
 from hh_search import logging_setup
 from hh_search.logging_setup import setup_logging
 from hh_search.sinks import build_sinks
+from hh_search.sinks.html_report import VACANCY_HREF_RE
 from hh_search.sinks.telegram_client import (
     MESSAGE_LIMIT,
     TelegramClient,
@@ -742,6 +743,44 @@ def test_message_escapes_dangerous_characters_in_the_title(tmp_path: Path) -> No
     client = FakeClient()
     sink(tmp_path, client).emit([vacancy(title="R&D <b>", total=90.0)], NOW)
     assert "R&amp;D &lt;b&gt;" in client.messages[0]
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        pytest.param("Backend-разработчик", id="полная-запись"),
+        pytest.param("Заголовок " * 800, id="запасная-усечённая-запись"),
+    ],
+)
+def test_message_href_with_a_quote_cannot_break_out_of_the_attribute(
+    tmp_path: Path, title: str
+) -> None:
+    """Item 9 на пути СООБЩЕНИЯ, а не файла: `escape_attr` в `_entry`.
+
+    Живые тесты про экранирование `href` сторожили `render_section`, то есть
+    путь файла; мутация «в `telegram_message._entry` вместо `escape_attr`
+    стоит `escape_html`» не красила ни одного теста из всего набора. Цена
+    мутации не косметическая: кавычка обрывает атрибут, `VACANCY_HREF_RE`
+    читает из него огрызок — а этим же регэкспом идёт дедупликация, то
+    есть ложное несрабатывание означает дубль в канале.
+
+    Оба свойства проверяются здесь одним тестом: разметка сообщения цела И
+    регэксп находит ссылку целиком. Второй заголовок — длиннее лимита: он
+    уводит сборку в запасной `_minimal_entry`, где тот же `href` строится
+    вторым, отдельным выражением, и та же мутация в нём иначе осталась бы
+    незамеченной.
+    """
+    malicious = vacancy(vacancy_id="1", title=title, total=90.0)
+    malicious.discovered.url = 'https://hh.ru/vacancy/1"><script>alert(1)</script>'
+    client = FakeClient()
+    sink(tmp_path, client).emit([malicious], NOW)
+
+    message = client.messages[0]
+    assert "<script>alert(1)</script>" not in message
+    assert '"><script>' not in message, "кавычка оборвала атрибут href"
+    assert VACANCY_HREF_RE.findall(message) == [
+        "https://hh.ru/vacancy/1&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"
+    ]
 
 
 def test_document_carries_the_whole_day_not_just_the_new_part(tmp_path: Path) -> None:
