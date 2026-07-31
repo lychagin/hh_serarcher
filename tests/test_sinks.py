@@ -570,6 +570,20 @@ def test_several_formats_are_shown_together() -> None:
     assert "гибрид" in shown
 
 
+def test_work_format_labels_contain_no_html_metacharacters() -> None:
+    """`html_report._entry` пропускает эту строку через `escape_html`, но
+    сегодняшние подписи не содержат ни одного символа, на который
+    `escape_html` реагирует, — значит сам факт вызова ничего не ловит:
+    убери `escape_html` из `_entry`, и ни один тест не покраснеет (проверено
+    ревьюером на всех 16 достижимых выводах `format_work_formats`). Сторожит
+    от реальной причины будущей утечки — правки словаря подписей, которая
+    впишет вроде `"офис (R&D)"`: этот тест обязан покраснеть раньше, чем
+    небезопасная подпись доедет до HTML-отчёта."""
+    for value in WorkFormat:
+        label = format_work_formats(frozenset({value}))
+        assert not set(label) & set("<>&"), label
+
+
 def test_csv_has_a_work_format_column(tmp_path: Path) -> None:
     assert "work_formats" in COLUMNS
     CsvSink(tmp_path).emit([make_scored(work_formats=frozenset({WorkFormat.REMOTE}))], NOW)
@@ -577,12 +591,67 @@ def test_csv_has_a_work_format_column(tmp_path: Path) -> None:
     assert row["work_formats"] == "удалённо"
 
 
+def test_new_column_does_not_shift_a_file_started_before_the_upgrade(tmp_path: Path) -> None:
+    """`work_formats` дописана ПОСЛЕДНЕЙ в `COLUMNS`, а не вставлена в середину.
+
+    Файл дня, начатый предыдущей версией (12 колонок, без `work_formats`),
+    получает от апгрейженного `CsvSink` 13-польные строки в тот же файл —
+    заголовок дописывается только для нового файла (`csv_sink.py`, `emit`).
+    Если бы новая колонка стояла между `area` и `salary_from`, лишнее поле
+    сдвигало бы ВСЁ, что после него, — `DictReader`, читающий по старому
+    12-польному заголовку, положил бы значение `work_formats` в колонку
+    `salary_from`, а `url` потерял бы последнее поле. Колонка в хвосте
+    сдвига не даёт: 12 старых имён остаются на местах, а лишнее 13-е поле
+    `DictReader` кладёт в `restkey` (`None`), которого этот тест не читает.
+    """
+    path = tmp_path / "2026-07-27-new.csv"
+    old_header = (
+        "id;score;cluster;title;company;area;salary_from;salary_to;"
+        "currency;published_at;listing;url\r\n"
+    )
+    path.write_bytes(b"\xef\xbb\xbf" + old_header.encode("utf-8"))
+    CsvSink(tmp_path).emit(
+        [make_scored(vacancy_id="1", work_formats=frozenset({WorkFormat.ON_SITE}))], NOW
+    )
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter=";"))
+    assert rows[0]["salary_from"] == "200000"
+    assert rows[0]["currency"] == "₽"
+    assert rows[0]["url"] == "https://hh.ru/vacancy/1"
+
+
 def test_markdown_entry_shows_the_work_format(tmp_path: Path) -> None:
+    """Формат — в строке «Топа»: `_full_entry` кладёт его после даты
+    публикации. Проверка сужена до раздела «Топ» (`partition`), а не по
+    всему файлу: формат теперь виден и в «Остальном» тоже (Important 2), и
+    ассерт по всему тексту перестал бы различать разделы — то есть красный
+    `_full_entry` он бы не заметил, пока красен `_short_entry`.
+    """
     MarkdownSink(tmp_path, threshold=60.0).emit(
         [make_scored(work_formats=frozenset({WorkFormat.REMOTE}))], NOW
     )
     text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
-    assert "удалённо" in text
+    top, _, _rest = text.partition("## Остальное")
+    assert "удалённо" in top
+
+
+def test_markdown_short_entry_shows_the_work_format(tmp_path: Path) -> None:
+    """Решение владельца: «Остальное» тоже штрафуется форматом (спека §3),
+    значит и здесь подпись обязана быть видна. Регион в короткую строку не
+    добавляется — владелец выбрал именно формат, минимализм «Остального»
+    сохраняется."""
+    MarkdownSink(tmp_path, threshold=60.0).emit(
+        [
+            make_scored(
+                title="Так себе вакансия",
+                total=42.0,
+                work_formats=frozenset({WorkFormat.ON_SITE}),
+            )
+        ],
+        NOW,
+    )
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert "- [Так себе вакансия](https://hh.ru/vacancy/1) — 42.0 · ООО Ромашка · офис" in text
 
 
 # --- фабрика и пустой вход ------------------------------------------------

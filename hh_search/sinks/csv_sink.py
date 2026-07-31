@@ -10,8 +10,15 @@ from hh_search.sinks.text import format_work_formats
 
 # `listing`, а не `found_by_query`: после переезда discovery на листинги в
 # этом поле лежит slug (`programmist`), а не текст поискового запроса.
-# `work_formats` стоит рядом с `area`: обе колонки описывают, ГДЕ по факту
-# нужно быть, чтобы работать над вакансией.
+# `work_formats` — ПОСЛЕДНЕЙ, а не рядом с `area`: `CsvSink.emit` дописывает
+# в файл дня, начатый предыдущей версией, и пишет заголовок только для
+# нового файла. Колонка в середине сдвинула бы все старые поля после себя
+# для `DictReader`, читающего файл по старому заголовку (`salary_from`
+# получил бы значение формата, `url` потерял бы последнее поле) — молча,
+# без исключения. В хвосте новая колонка просто не совпадает со старым
+# заголовком и уходит `DictReader`'у в `restkey`, а 12 прежних имён остаются
+# на местах. Проверено регрессионным тестом
+# `test_new_column_does_not_shift_a_file_started_before_the_upgrade`.
 COLUMNS = [
     "id",
     "score",
@@ -19,13 +26,13 @@ COLUMNS = [
     "title",
     "company",
     "area",
-    "work_formats",
     "salary_from",
     "salary_to",
     "currency",
     "published_at",
     "listing",
     "url",
+    "work_formats",
 ]
 
 # Excel и LibreOffice исполняют содержимое ячейки, начинающееся с этих
@@ -137,7 +144,6 @@ class CsvSink:
             "title": _cell(discovered.title),
             "company": _cell(discovered.company),
             "area": _cell(discovered.area),
-            "work_formats": _cell(format_work_formats(item.details.work_formats)),
             "salary_from": _amount(salary.amount_from),
             "salary_to": _amount(salary.amount_to),
             "currency": _cell(salary.currency),
@@ -148,6 +154,7 @@ class CsvSink:
             ),
             "listing": _cell(discovered.found_by_query),
             "url": _cell(discovered.url),
+            "work_formats": _cell(format_work_formats(item.details.work_formats)),
         }
 
 

@@ -141,7 +141,13 @@ class MarkdownSink:
 
     def _short_entry(self, item: ScoredVacancy) -> str:
         discovered = item.discovered
+        # Формат виден и здесь (решение владельца): «Остальное» — обратная
+        # связь по качеству скоринга, и штраф за формат без него выглядел
+        # бы произволом так же, как и в «Топе» (спека §3). Регион в короткую
+        # строку сознательно не добавлен — владелец выбрал минимализм
+        # «Остального» и именно формат, а не оба поля сразу.
+        work_format = format_work_formats(item.details.work_formats)
         return (
             f"- [{_plain(discovered.title)}]({discovered.url}) — "
-            f"{item.score.total:.1f} · {_plain(discovered.company)}"
+            f"{item.score.total:.1f} · {_plain(discovered.company)} · {work_format}"
         )

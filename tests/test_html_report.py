@@ -188,23 +188,19 @@ def test_href_regex_still_finds_a_normal_link_after_escaping() -> None:
 
 
 def test_html_entry_shows_the_work_format() -> None:
-    """Формат — константа из нашего словаря, а не текст с hh.ru, но
-    рендерится в той же строке `meta`, что и остальные поля: появление
-    нового поля не должно ослаблять экранирование заголовка рядом с ним."""
+    """Формат виден в HTML-записи, как и в CSV/markdown.
+
+    Экранирование заголовка рядом с этим полем уже проверяет
+    `test_rendered_title_does_not_leak_markup` — второй такой ассерт здесь
+    был бы про заголовок, а не про формат, и не мог покраснеть от порчи
+    именно этого поля. Экранирование САМОГО значения формата сторожит
+    `test_work_format_labels_contain_no_html_metacharacters`
+    (`tests/test_sinks.py`) — сегодняшние подписи не содержат `<`, `>`, `&`,
+    и утверждать здесь их экранирование нечем."""
     section = render_section(
-        [
-            vacancy(
-                total=90.0,
-                title="C++ <script>alert(1)</script>",
-                work_formats=frozenset({WorkFormat.REMOTE}),
-            )
-        ],
-        NOW,
-        60.0,
+        [vacancy(total=90.0, work_formats=frozenset({WorkFormat.REMOTE}))], NOW, 60.0
     )
     assert "удалённо" in section
-    assert "<script>" not in section
-    assert "&lt;script&gt;" in section
 
 
 def test_header_is_self_contained() -> None:
