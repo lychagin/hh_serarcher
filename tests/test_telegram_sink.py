@@ -27,7 +27,7 @@ from hh_search.sinks.telegram_client import (
     TelegramError,
     message_length,
 )
-from hh_search.sinks.telegram_sink import LOOKBACK_DAYS, TelegramSink
+from hh_search.sinks.telegram_sink import TelegramSink
 from tests.test_html_report import NOW, vacancy
 
 TOKEN = "1234567890:AAHtestTOKENvalueMUSTneverLEAK"
@@ -608,12 +608,25 @@ def test_unremovable_draft_does_not_break_an_otherwise_empty_run(tmp_path: Path)
 
 
 def test_sweep_does_not_touch_a_published_day_file(tmp_path: Path) -> None:
-    """Уборка обязана трогать только `.part`, а не опубликованные файлы дня."""
+    """Уборка обязана трогать только `.part`, а не опубликованные файлы дня.
+
+    Сравнивается СОДЕРЖИМОЕ, а не `exists()`: снесённый файл дня второй
+    `emit` создаёт заново, поэтому прежняя редакция оставалась зелёной и
+    при `_DRAFT_GLOB = "*"`, и при `"*-new.html"` — то есть не видела ровно
+    той поломки, ради которой написана. Видна она только по накопительности:
+    вторая запись обязана ДОПОЛНИТЬ первую, а не переписать её.
+    """
+    day_file = tmp_path / "2026-07-29-new.html"
     client = FakeClient()
     target = sink(tmp_path, client)
-    target.emit([vacancy(vacancy_id="1")], NOW)
-    target.emit([vacancy(vacancy_id="2")], NOW)
-    assert (tmp_path / "2026-07-29-new.html").exists()
+    target.emit([vacancy(vacancy_id="1", title="Утренняя")], NOW)
+    after_first = day_file.read_bytes()
+    target.emit([vacancy(vacancy_id="2", title="Вечерняя")], NOW)
+
+    after_second = day_file.read_bytes()
+    assert after_second.startswith(after_first), "файл дня переписан заново — уборка снесла его"
+    assert "Утренняя" in after_second.decode()
+    assert "Вечерняя" in after_second.decode()
 
 
 # --- item 3: окно дедупликации — именованная константа в несколько суток ---
@@ -641,14 +654,27 @@ def test_vacancy_outside_the_lookback_window_is_not_suppressed(tmp_path: Path) -
     """Обязательный сторож item 3: окно узкое НАМЕРЕННО. Ссылка вакансии,
     легально вернувшейся в работу (`mark <id> new`), может случайно
     совпасть с файлом ЗА ПРЕДЕЛАМИ окна — и такая вакансия не имеет права
-    подавиться."""
-    too_old = NOW.date() - timedelta(days=LOOKBACK_DAYS + 1)
+    подавиться.
+
+    Дистанция прибита ЛИТЕРАЛОМ, а не `LOOKBACK_DAYS + 1`. Прежняя
+    редакция импортировала ту самую константу, которую сторожила, и была
+    истинна по построению: расширяя окно, вы отодвигали и файл. Проверено —
+    при `LOOKBACK_DAYS = 30` она оставалась зелёной, а во всём наборе
+    краснел ровно один сторож ТЕКСТА README, который лечится правкой
+    строки документа. Поведенческого сторожа у решения «окно намеренно
+    узкое» не было вовсе. Литерал делает расширение окна видимым: тот, кто
+    его расширяет, обязан прийти сюда и объяснить, почему это безопасно.
+    """
+    too_old = NOW.date() - timedelta(days=3)
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / f"{too_old:%Y-%m-%d}-new.html").write_text(
         '<a href="https://hh.ru/vacancy/1">старое упоминание</a>', encoding="utf-8"
     )
     client = FakeClient()
-    assert sink(tmp_path, client).emit([vacancy(vacancy_id="1")], NOW) == 1
+    assert sink(tmp_path, client).emit([vacancy(vacancy_id="1")], NOW) == 1, (
+        "окно дедупликации доросло до трёх суток и проглотило вручную "
+        "возвращённую вакансию — расширение окна обязано быть осознанным"
+    )
     assert len(client.messages) == 1
 
 
