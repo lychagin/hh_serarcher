@@ -374,6 +374,55 @@ def test_work_format_forged_in_the_employer_description_does_not_win(
     assert extract_work_formats(spoiled) == expected
 
 
+# --- Пере-ревью волны: подделать можно и саму ГРАНИЦУ доверенной области ---
+#
+# Первая починка расэкранировала ВСЮ страницу, а потом искала в ней состояние.
+# Значит работодателю оставалось вписать в описание не ключ, а экранированный
+# `<template id="HH-Lux-InitialState">`: после `unescape` он становится
+# настоящим тегом, встаёт раньше настоящего состояния и забирает вердикт
+# целиком (замер: 60.0 → 100.0 на `vacancy.html.gz`). Тем же приёмом
+# экранированный `&lt;/template&gt;` усекает настоящее состояние. Тесты выше
+# этого не ловят: они бьют по ключу, а не по границе.
+
+
+def escaped_state(payload: str) -> str:
+    """Экранированный `<template>` — тот же, что hh.ru отдал бы, если бы
+    работодатель написал теги в тексте описания."""
+    return "&lt;template id=&#34;HH-Lux-InitialState&#34;&gt;" + payload + "&lt;/template&gt;"
+
+
+@pytest.mark.parametrize(("fixture", "expected", "forged"), FORGERY_CASES)
+def test_state_template_forged_in_the_description_does_not_become_the_state(
+    fixture: Path, expected: frozenset[WorkFormat], forged: str
+) -> None:
+    """Границы состояния ищутся по СЫРОМУ html, поэтому экранированный
+    `<template>` в описании остаётся текстом, а не становится состоянием."""
+    with gzip.open(fixture, "rt", encoding="utf-8") as handle:
+        html = handle.read()
+    index = html.index(DESCRIPTION_MARKER)
+    assert index < html.index("HH-Lux-InitialState"), (
+        "описание больше не стоит ДО настоящего состояния — подделанный "
+        "<template> перестал его опережать, и тест ничего не проверяет"
+    )
+    spoiled = html[:index] + escaped_state(work_formats_block(forged)) + html[index:]
+    assert extract_work_formats(spoiled) == expected
+
+
+def test_escaped_closing_tag_does_not_truncate_the_state() -> None:
+    """Вторая половина той же дыры: `&lt;/template&gt;`, вписанный в состояние
+    ДО ключа, обрывал бы его и оставлял разбор без формата.
+
+    На живых фикстурах описание внутри состояния стоит ПОСЛЕ ключа, поэтому
+    сегодня это не стреляло бы само; тест не полагается на такую удачу и
+    вставляет обрыв в самое начало состояния.
+    """
+    with gzip.open(FIXTURE, "rt", encoding="utf-8") as handle:
+        html = handle.read()
+    opening_end = html.index(">", html.index("HH-Lux-InitialState")) + 1
+    spoiled = html[:opening_end] + "&lt;/template&gt;" + html[opening_end:]
+    assert extract_work_formats(spoiled) == frozenset({WorkFormat.ON_SITE})
+
+
 def test_conflicting_blocks_inside_the_state_refuse_to_guess() -> None:
     """Описание вакансии лежит и внутри состояния тоже, поэтому одной границы
     мало: два несогласных вхождения — это отказ в пользу неведения.
