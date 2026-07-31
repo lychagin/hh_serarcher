@@ -25,7 +25,7 @@ from typer.testing import CliRunner
 from hh_search.__main__ import app
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config, Signals
-from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown
+from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, WorkFormat
 from hh_search.filtering.matching import SignalMatcher
 from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sources.http import PoliteClient
@@ -140,6 +140,19 @@ def test_example_config_loads(example_config: Config) -> None:
     assert example_config.app.sinks == ["csv", "markdown"]
 
 
+def test_example_queries_show_both_streams(example_config: Config) -> None:
+    """Образец обязан показывать два потока по одному slug — иначе человек не
+    узнает, что так можно, и продолжит искать только в своём городе."""
+    by_slug: dict[str, list[WorkFormat | None]] = {}
+    for query in example_config.queries.queries:
+        by_slug.setdefault(query.slug, []).append(query.work_format)
+    dual_stream_formats = [formats for formats in by_slug.values() if len(formats) > 1]
+    assert dual_stream_formats, "ни один slug образца не запрошен двумя потоками"
+    assert any(
+        None in formats and WorkFormat.REMOTE in formats for formats in dual_stream_formats
+    ), "второй поток обязан быть именно REMOTE-фильтром того же листинга"
+
+
 def test_example_config_demands_a_real_contact_email() -> None:
     """Незаполненный образец обязан ронять процесс на старте, а не уезжать к hh.ru.
 
@@ -213,8 +226,14 @@ def test_example_stop_words_do_not_reject_the_target(example_config: Config, tit
 # а не со страницы вакансии, поэтому в скорер подаётся отдельно.
 TARGET_TITLE = "Старший инженер-разработчик Embedded Linux (BSP, ARM64, i.MX 8M Plus)"
 OFF_TARGET_TITLE = "Младший программист/разработчик 1С"
+# `vacancy.html.gz` — Москва, work_formats={ON_SITE}: вне `location.home_areas`
+# образца (Нижний Новгород, Дзержинск) и без REMOTE среди форматов, поэтому с
+# появлением раздела `location` (Task 5 плана) она несёт полный штраф
+# `penalty_not_remote_elsewhere` (40) и 100.0 превращается в 60.0.
+# `vacancy_salary.html.gz` штрафа не получает: там REMOTE среди форматов, но
+# итог и так нулевой из-за нецелевого заголовка.
 LIVE_SCORES = [
-    ("vacancy.html.gz", TARGET_TITLE, 100.0),
+    ("vacancy.html.gz", TARGET_TITLE, 60.0),
     ("vacancy_salary.html.gz", OFF_TARGET_TITLE, 0.0),
 ]
 

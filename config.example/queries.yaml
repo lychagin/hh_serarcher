@@ -8,6 +8,11 @@ queries:
     cluster: backend
     weight: 8
     pages: 3
+  - slug: programmist        # тот же листинг вторым потоком: только удалёнка
+    cluster: remote
+    weight: 9
+    pages: 3
+    work_format: REMOTE
   - slug: razrabotchik
     cluster: backend
     weight: 8

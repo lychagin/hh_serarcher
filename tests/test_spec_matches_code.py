@@ -28,6 +28,8 @@ from pathlib import Path
 
 import yaml
 
+from hh_search.domain.models import WorkFormat
+
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "docs/superpowers/specs/2026-07-27-hh-autosearch-design.md"
 PACKAGE = ROOT / "hh_search"
@@ -239,8 +241,19 @@ README = ROOT / "README.md"
 
 
 def readme_section(start: str, end: str) -> str:
+    """Срез README от заголовка `start` до следующего вхождения `end`.
+
+    `end` ищется НАЧИНАЯ с конца `start`, а не с начала файла: иначе общий
+    маркер уровня заголовка (`"## "`, а не конкретный следующий раздел) находил
+    бы самый первый `## ` во всём файле — как правило, раньше самого `start` —
+    и давал пустой (или неправильный) срез вместо секции. Для четырёх прежних
+    вызовов с уникальным по всему файлу `end` результат не меняется: там
+    первое вхождение `end` и так лежит после `start`.
+    """
     text = README.read_text(encoding="utf-8")
-    return text[text.index(start) : text.index(end)]
+    start_index = text.index(start)
+    end_index = text.index(end, start_index + len(start))
+    return text[start_index:end_index]
 
 
 def test_readme_names_the_real_report_files() -> None:
@@ -279,6 +292,25 @@ def test_readme_names_the_real_report_headings() -> None:
     for heading in ("## Топ", "## Остальное"):
         assert f'"{heading}"' in source, f"markdown_sink больше не пишет раздел {heading}"
         assert f"`{heading}`" in section, f"README не называет раздел {heading}"
+
+
+# --- README §«Два потока discovery» ----------------------------------------
+
+
+def test_readme_explains_both_discovery_streams() -> None:
+    """Раздел про два потока обязан называть настоящее имя поля и настоящее
+    значение перечисления — оба берутся из кода."""
+    section = readme_section("## Два потока discovery", "## ")
+    assert "work_format" in section
+    assert WorkFormat.REMOTE.value in section
+
+
+def test_readme_lists_the_location_penalty_field() -> None:
+    """Штраф за неудалённую работу вне дома обязан быть виден в README, а не
+    только в спеке: это раздел `profile.yaml`, который человек правит руками."""
+    section = README.read_text(encoding="utf-8")
+    assert "penalty_not_remote_elsewhere" in section
+    assert "home_areas" in section
 
 
 # --- Раунд исправлений 1 (2026-07-30): отменённые утверждения об `area` ---
