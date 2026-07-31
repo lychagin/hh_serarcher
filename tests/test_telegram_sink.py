@@ -244,10 +244,15 @@ def test_ok_false_in_200_body_becomes_telegram_error() -> None:
 class FakeClient:
     """Подставной транспорт: считает вызовы и запоминает отправленное."""
 
-    def __init__(self, fail_on: str | None = None) -> None:
+    def __init__(self, fail_on: str | None = None, fail_document_after: int | None = None) -> None:
         self.messages: list[str] = []
         self.documents: list[tuple[str, bytes, str]] = []
         self._fail_on = fail_on
+        # Довозка идёт по нескольким дням ПОДРЯД в одном вызове — этот флаг
+        # роняет ровно тот `send_document`, что идёт после уже стольких
+        # успешных (нужно проверить частичный отказ довозки: первый день
+        # доехал, второй упал в том же прогоне).
+        self._fail_document_after = fail_document_after
 
     def send_message(self, text: str) -> None:
         if self._fail_on == "sendMessage":
@@ -255,7 +260,8 @@ class FakeClient:
         self.messages.append(text)
 
     def send_document(self, filename: str, content: bytes, caption: str) -> None:
-        if self._fail_on == "sendDocument":
+        after = self._fail_document_after
+        if self._fail_on == "sendDocument" or (after is not None and len(self.documents) >= after):
             raise TelegramError("sendDocument: транспорт отказал (ConnectError)")
         self.documents.append((filename, content, caption))
 
@@ -613,6 +619,50 @@ def test_both_stuck_days_are_redelivered_not_just_the_nearest(tmp_path: Path) ->
         "2026-07-29-new.html",
         "2026-07-30-new.html",
     ]
+
+
+def test_upgrade_without_markers_redelivers_the_window_once(tmp_path: Path) -> None:
+    """Путь обновления (спека §5, «цена отметки»): файл дня, написанный версией
+    БЕЗ отметок, выглядит СТАРЫМ. Первый прогон новой версии обязан довезти его
+    ровно один раз, второй прогон тех же суток — промолчать: отметка уже стоит.
+    """
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "2026-07-30-new.html").write_text(
+        '<a href="https://hh.ru/vacancy/1">запись версии без отметок</a>', encoding="utf-8"
+    )
+    day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
+    stale = vacancy(vacancy_id="1")
+
+    first = FakeClient()
+    assert sink(tmp_path, first).emit([stale], day31) == 0
+    assert [name for name, _, _ in first.documents] == ["2026-07-30-new.html"]
+
+    second = FakeClient()
+    assert sink(tmp_path, second).emit([stale], day31) == 0
+    assert not second.documents, "второй прогон тех же суток довёз файл повторно"
+
+
+def test_partial_redelivery_failure_repeats_only_the_day_that_failed(tmp_path: Path) -> None:
+    """Из двух застрявших дней первый доехал, второй упал — повтор шлёт
+    только второй: первый успел получить отметку до падения второго.
+    """
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy(vacancy_id="1")], EVENING)
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit(
+            [vacancy(vacancy_id="1"), vacancy(vacancy_id="2")], NEXT_MORNING
+        )
+    day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
+    both = [vacancy(vacancy_id="1"), vacancy(vacancy_id="2")]
+
+    first_attempt = FakeClient(fail_document_after=1)
+    with pytest.raises(TelegramError):
+        sink(tmp_path, first_attempt).emit(both, day31)
+    assert [name for name, _, _ in first_attempt.documents] == ["2026-07-29-new.html"]
+
+    retry = FakeClient()
+    assert sink(tmp_path, retry).emit(both, day31) == 0
+    assert [name for name, _, _ in retry.documents] == ["2026-07-30-new.html"]
 
 
 def test_republished_day_file_is_redelivered_after_a_failed_document(tmp_path: Path) -> None:
