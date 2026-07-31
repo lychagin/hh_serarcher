@@ -18,7 +18,7 @@ from itertools import groupby
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.base import REPORT_DATE_FORMAT
-from hh_search.sinks.text import snippet
+from hh_search.sinks.text import format_work_formats, snippet
 
 # Ссылки уже вписанных вакансий — вход дедупликации приёмника. Ограничение
 # на `hh.ru/vacancy/` намеренное: под регулярку не должны попадать ссылки
@@ -94,9 +94,16 @@ def _entry(item: ScoredVacancy, *, excerpt: bool) -> str:
         if discovered.published_at is None
         else format(discovered.published_at, REPORT_DATE_FORMAT)
     )
+    # Формат — своя константа из `_WORK_FORMAT_LABELS`, не текст работодателя,
+    # но идёт через `escape_html` тем же путём, что и остальные поля meta:
+    # штраф в скоринге без него выглядел бы произволом (спека §3), а
+    # исключение одного поля из общего экранирования — источник расхождения
+    # при следующей правке словаря подписей.
+    work_format = escape_html(format_work_formats(item.details.work_formats))
     meta = (
         f"{_plain(discovered.company)} · {_plain(discovered.area)} · "
-        f"{_plain(discovered.salary.raw, fallback='зарплата не указана')} · {published}"
+        f"{_plain(discovered.salary.raw, fallback='зарплата не указана')} · {published} · "
+        f"{work_format}"
     )
     description = (
         f'<br><span class="snippet">{escape_html(snippet(item.details.description))}…</span>'

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.base import REPORT_DATE_FORMAT
-from hh_search.sinks.text import collapse, snippet
+from hh_search.sinks.text import collapse, format_work_formats, snippet
 
 # Заголовок и описание пишет работодатель. `[Удалённо] Инженер` в начале
 # названия на hh.ru встречается, а `**[Ссылка](https://evil/) конец]
@@ -127,11 +127,15 @@ class MarkdownSink:
             "дата неизвестна" if published_at is None else format(published_at, REPORT_DATE_FORMAT)
         )
         excerpt = _escape(snippet(item.details.description))
+        # Формат — своя константа, не текст работодателя, поэтому `_escape`
+        # ей не грозит (markdown-спецсимволов в словаре подписей нет), но
+        # штраф в скоринге без него выглядел бы произволом (спека §3).
+        work_format = format_work_formats(item.details.work_formats)
         return (
             f"**[{_plain(discovered.title)}]({discovered.url})** — {item.score.total:.1f}\n\n"
             f"{_plain(discovered.company)} · {_plain(discovered.area)} · "
             f"{_plain(discovered.salary.raw, fallback='зарплата не указана')} · "
-            f"{published}\n\n"
+            f"{published} · {work_format}\n\n"
             f"{excerpt}…\n"
         )
 

@@ -12,11 +12,12 @@ from hh_search.domain.models import (
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
+    WorkFormat,
 )
 from hh_search.sinks import build_sinks
 from hh_search.sinks.csv_sink import COLUMNS, CsvSink
 from hh_search.sinks.markdown_sink import MarkdownSink
-from hh_search.sinks.text import SNIPPET_LENGTH
+from hh_search.sinks.text import SNIPPET_LENGTH, format_work_formats
 
 # Данные тестов повторяют то, что приходит из хранилища: даты — aware UTC с
 # микросекундами (`storage/time_utils.py`), а зарплата и дата публикации
@@ -37,6 +38,7 @@ def make_scored(
     salary: Salary = SALARY,
     published_at: datetime | None = PUBLISHED,
     description: str = "Требуется опыт Yocto и BSP.",
+    work_formats: frozenset[WorkFormat] = frozenset(),
 ) -> ScoredVacancy:
     return ScoredVacancy(
         discovered=DiscoveredVacancy(
@@ -49,7 +51,7 @@ def make_scored(
             published_at=published_at,
             found_by_query="programmist",
         ),
-        details=VacancyDetails(description=description),
+        details=VacancyDetails(description=description, work_formats=work_formats),
         score=ScoreBreakdown(
             title=1.0,
             stack=0.8,
@@ -103,6 +105,7 @@ def test_csv_row_carries_every_column(tmp_path: Path) -> None:
             "title": "Embedded Engineer",
             "company": "ООО Ромашка",
             "area": "Нижний Новгород",
+            "work_formats": "формат не указан",
             "salary_from": "200000",
             "salary_to": "",
             "currency": "₽",
@@ -541,6 +544,45 @@ def test_markdown_drops_control_characters(tmp_path: Path) -> None:
     assert "\x00" not in text
     assert "\u202e" not in text
     assert "Инженер" in text
+
+
+# --- Формат работы виден во всех отчётах -----------------------------------
+
+
+def test_work_format_labels_cover_every_enum_value() -> None:
+    """Новое значение перечисления у hh.ru не должно тихо превращаться в пустое
+    место в отчёте: отображение обязано покрывать ВСЕ значения WorkFormat."""
+    for value in WorkFormat:
+        assert format_work_formats(frozenset({value})), value
+
+
+def test_empty_formats_are_shown_as_unknown_not_as_office() -> None:
+    """Пустое множество — «формат не указан», а не «офис». Иначе отчёт
+    утверждает то, чего мы не знаем (и что мы решили не штрафовать)."""
+    shown = format_work_formats(frozenset())
+    assert "не указан" in shown
+    assert "офис" not in shown
+
+
+def test_several_formats_are_shown_together() -> None:
+    shown = format_work_formats(frozenset({WorkFormat.REMOTE, WorkFormat.HYBRID}))
+    assert "удалённо" in shown
+    assert "гибрид" in shown
+
+
+def test_csv_has_a_work_format_column(tmp_path: Path) -> None:
+    assert "work_formats" in COLUMNS
+    CsvSink(tmp_path).emit([make_scored(work_formats=frozenset({WorkFormat.REMOTE}))], NOW)
+    row = read_rows(tmp_path / "2026-07-27-new.csv")[0]
+    assert row["work_formats"] == "удалённо"
+
+
+def test_markdown_entry_shows_the_work_format(tmp_path: Path) -> None:
+    MarkdownSink(tmp_path, threshold=60.0).emit(
+        [make_scored(work_formats=frozenset({WorkFormat.REMOTE}))], NOW
+    )
+    text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
+    assert "удалённо" in text
 
 
 # --- фабрика и пустой вход ------------------------------------------------

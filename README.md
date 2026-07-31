@@ -277,7 +277,7 @@ docker compose up -d                           # демон: serve по расп
 **CSV** — UTF-8 с BOM и разделителем `;` ради Excel, колонки:
 
 ```
-id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;listing;url
+id;score;cluster;title;company;area;work_formats;salary_from;salary_to;currency;published_at;listing;url
 ```
 
 Балл записан числом, поэтому сортировка по нему и фильтр по зарплате работают

@@ -12,6 +12,7 @@ from hh_search.domain.models import (
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
+    WorkFormat,
 )
 from hh_search.sinks.html_report import (
     VACANCY_HREF_RE,
@@ -32,6 +33,7 @@ def vacancy(
     total: float = 80.0,
     cluster: str = "backend",
     description: str = "Описание вакансии",
+    work_formats: frozenset[WorkFormat] = frozenset(),
 ) -> ScoredVacancy:
     return ScoredVacancy(
         discovered=DiscoveredVacancy(
@@ -51,6 +53,7 @@ def vacancy(
             company=company,
             area="Нижний Новгород",
             salary=Salary(raw=None, amount_from=None, amount_to=None, currency=None),
+            work_formats=work_formats,
         ),
         score=ScoreBreakdown(
             title=0.0,
@@ -182,6 +185,26 @@ def test_href_regex_still_finds_a_normal_link_after_escaping() -> None:
     потому что дедупликация читает ссылки этим же регэкспом."""
     section = render_section([vacancy(vacancy_id="135501327")], NOW, 60.0)
     assert set(VACANCY_HREF_RE.findall(section)) == {"https://hh.ru/vacancy/135501327"}
+
+
+def test_html_entry_shows_the_work_format() -> None:
+    """Формат — константа из нашего словаря, а не текст с hh.ru, но
+    рендерится в той же строке `meta`, что и остальные поля: появление
+    нового поля не должно ослаблять экранирование заголовка рядом с ним."""
+    section = render_section(
+        [
+            vacancy(
+                total=90.0,
+                title="C++ <script>alert(1)</script>",
+                work_formats=frozenset({WorkFormat.REMOTE}),
+            )
+        ],
+        NOW,
+        60.0,
+    )
+    assert "удалённо" in section
+    assert "<script>" not in section
+    assert "&lt;script&gt;" in section
 
 
 def test_header_is_self_contained() -> None:

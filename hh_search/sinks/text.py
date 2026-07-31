@@ -9,9 +9,21 @@
 
 import re
 
+from hh_search.domain.models import WorkFormat
+
 # Описание с hh.ru — килобайты текста. Без обрезки «Топ» перестаёт быть
 # выжимкой и читается дольше самой страницы вакансии.
 SNIPPET_LENGTH = 200
+
+# Подписи для отчёта, не для hh.ru: значения перечисления уходят в query
+# запроса (см. `WorkFormat`), а здесь читатель, который штраф в скоринге
+# видит как число и не понимает, за что он начислен.
+_WORK_FORMAT_LABELS: dict[WorkFormat, str] = {
+    WorkFormat.REMOTE: "удалённо",
+    WorkFormat.HYBRID: "гибрид",
+    WorkFormat.ON_SITE: "офис",
+    WorkFormat.FIELD_WORK: "разъездной",
+}
 
 # Управляющие символы, которые не несут текста, но доезжают до файла:
 # нулевой байт и прочие C0/C1 ломают grep и часть редакторов, а
@@ -36,3 +48,22 @@ def collapse(text: str) -> str:
 def snippet(text: str) -> str:
     """Начало описания: свёрнутое в строку и обрезанное до `SNIPPET_LENGTH`."""
     return collapse(text)[:SNIPPET_LENGTH]
+
+
+def format_work_formats(formats: frozenset[WorkFormat]) -> str:
+    """Формат работы человеку: без этого штраф в скоринге выглядит произволом.
+
+    Пустое множество — «блока на странице не нашлось» ИЛИ «вакансия не
+    обогащена» (`VacancyDetails.work_formats`), и в обоих случаях это не
+    штраф, поэтому подпись обязана быть «формат не указан», а не «офис» —
+    последнее утверждало бы то, чего мы не знаем.
+
+    Несколько форматов — обычный случай (Team Lead Go из Москвы допускает
+    ON_SITE, REMOTE и HYBRID сразу), и печатаются они через запятую в
+    порядке `sorted()`: сам `frozenset` порядок не хранит, а хеш строк
+    рандомизируется на процесс — без сортировки один и тот же набор
+    печатался бы то так, то этак от запуска к запуску.
+    """
+    if not formats:
+        return "формат не указан"
+    return ", ".join(_WORK_FORMAT_LABELS[value] for value in sorted(formats))

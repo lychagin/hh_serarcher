@@ -6,9 +6,12 @@ from pathlib import Path
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.base import REPORT_DATE_FORMAT
+from hh_search.sinks.text import format_work_formats
 
 # `listing`, а не `found_by_query`: после переезда discovery на листинги в
 # этом поле лежит slug (`programmist`), а не текст поискового запроса.
+# `work_formats` стоит рядом с `area`: обе колонки описывают, ГДЕ по факту
+# нужно быть, чтобы работать над вакансией.
 COLUMNS = [
     "id",
     "score",
@@ -16,6 +19,7 @@ COLUMNS = [
     "title",
     "company",
     "area",
+    "work_formats",
     "salary_from",
     "salary_to",
     "currency",
@@ -133,6 +137,7 @@ class CsvSink:
             "title": _cell(discovered.title),
             "company": _cell(discovered.company),
             "area": _cell(discovered.area),
+            "work_formats": _cell(format_work_formats(item.details.work_formats)),
             "salary_from": _amount(salary.amount_from),
             "salary_to": _amount(salary.amount_to),
             "currency": _cell(salary.currency),
