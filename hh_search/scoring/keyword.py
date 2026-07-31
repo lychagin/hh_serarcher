@@ -1,5 +1,5 @@
 from hh_search.config.models import ProfileConfig
-from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, VacancyDetails
+from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, VacancyDetails, WorkFormat
 from hh_search.filtering.matching import SignalGroupMatcher
 
 # Поля склеиваются в одну строку, и разделитель обязан быть не-пробельным.
@@ -8,6 +8,19 @@ from hh_search.filtering.matching import SignalGroupMatcher
 # заголовок, кончающийся на «оператор», и описание, начинающееся с «ПК»,
 # давали стоп-слову «оператор пк» минус пятнадцать очков ниоткуда.
 _FIELD_SEPARATOR = "\n|\n"
+
+
+def _normalize_area(value: str) -> str:
+    """Схлопывает пробелы и регистр для точного сравнения региона.
+
+    Не подстрока: «Нижний Новгород» подстрокой сидит и в «Нижний Новгород и
+    область», и мало ли в чём ещё, а штраф, не сработавший там, где обязан
+    был, — молчаливая потеря дороже штрафа, сработавшего лишним. Цена точного
+    сравнения — административные варианты («городской округ Нижний
+    Новгород») приходится перечислять в `home_areas` явно, а не полагаться
+    на совпадение по вхождению.
+    """
+    return " ".join(value.split()).lower()
 
 
 class KeywordScorer:
@@ -33,6 +46,35 @@ class KeywordScorer:
         self._responsibilities = SignalGroupMatcher(signals.responsibilities)
         self._domain = SignalGroupMatcher(signals.domain)
         self._negative = SignalGroupMatcher(profile.negative)
+        # Нормализованные домашние регионы считаются один раз при построении
+        # скорера, а не на каждой вакансии: `location.home_areas` короток
+        # (единицы городов), но score() зовётся на сотнях вакансий за прогон.
+        self._home_areas = (
+            frozenset(_normalize_area(home) for home in profile.location.home_areas)
+            if profile.location is not None
+            else None
+        )
+
+    def _region_penalty(self, area: str | None, work_formats: frozenset[WorkFormat]) -> float:
+        """Штраф за вакансию вне домашнего региона без удалёнки (Task 3 плана).
+
+        Порядок обязателен, ровно как в `LocationConfig`: домашний регион не
+        штрафуется ни при каком формате — иначе штраф убивал бы офис в
+        родном городе. Иначе REMOTE среди форматов снимает штраф — вакансия
+        может предлагать сразу несколько форматов, и одного REMOTE
+        достаточно. Иначе штраф. Неизвестные регион (`area is None`) и формат
+        (`work_formats` пусто — блока на странице не нашлось или вакансия
+        ещё не обогащена) штрафа не несут по одной и той же причине:
+        штрафовать по отсутствующим данным нельзя.
+        """
+        location = self._profile.location
+        if location is None or area is None or self._home_areas is None:
+            return 0.0
+        if _normalize_area(area) in self._home_areas:
+            return 0.0
+        if not work_formats or WorkFormat.REMOTE in work_formats:
+            return 0.0
+        return location.penalty_not_remote_elsewhere
 
     def score(self, discovered: DiscoveredVacancy, details: VacancyDetails) -> ScoreBreakdown:
         title = discovered.title
@@ -42,6 +84,9 @@ class KeywordScorer:
         # скорера. Только discovered.company — это потерянный домен у каждой
         # вакансии на первом прогоне.
         company = discovered.company or details.company or ""
+        # Регион — по той же схеме, что и компания: листинг его тоже не
+        # отдаёт надёжно, а details.area появляется только после обогащения.
+        area = discovered.area or details.area
 
         roles = self._title_roles.find(title)
         tech = self._title_tech.find(title)
@@ -73,7 +118,9 @@ class KeywordScorer:
         # Штраф пропорционален ЧИСЛУ стоп-сигналов: одно случайное слово не
         # убивает хорошую вакансию, три убивают (спека §6). Три написания
         # одного стоп-слова — по-прежнему один сигнал и один штраф.
-        penalty = len(negative) * self._profile.penalty_per_signal
+        penalty = len(negative) * self._profile.penalty_per_signal + self._region_penalty(
+            area, details.work_formats
+        )
         # Верхнего clamp'а нет сознательно: компоненты ≤ 1.0, веса
         # неотрицательны и суммируются в 1.0 (валидатор `Weights`), штраф
         # неотрицателен — значит total ≤ 100 по построению, и min(..., 100)

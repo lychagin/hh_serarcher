@@ -1,8 +1,11 @@
 import gzip
 from pathlib import Path
 
-from hh_search.config.models import ProfileConfig, Saturation, Signals, Weights
-from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, VacancyDetails
+import pytest
+from pydantic import ValidationError
+
+from hh_search.config.models import LocationConfig, ProfileConfig, Saturation, Signals, Weights
+from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, VacancyDetails, WorkFormat
 from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sources.vacancy_page import parse_vacancy_page
 
@@ -23,6 +26,7 @@ def make_profile(
     stack: SignalList | None = None,
     domain: SignalList | None = None,
     negative: SignalList | None = None,
+    location: LocationConfig | None = None,
 ) -> ProfileConfig:
     """Стенд для арифметики §6: в stack шесть сигналов при насыщении 5, в
     responsibilities четыре при насыщении 3 — иначе «насыщение» проверить
@@ -39,6 +43,7 @@ def make_profile(
             domain=DEFAULT_DOMAIN if domain is None else domain,
         ),
         negative=DEFAULT_NEGATIVE if negative is None else negative,
+        location=location,
     )
 
 
@@ -50,16 +55,22 @@ def score_for(
     stack: SignalList | None = None,
     domain: SignalList | None = None,
     negative: SignalList | None = None,
+    location: LocationConfig | None = None,
+    area: str | None = "Нижний Новгород",
+    work_formats: frozenset[WorkFormat] = frozenset(),
 ) -> ScoreBreakdown:
     discovered = DiscoveredVacancy(
         id="1",
         url="https://hh.ru/vacancy/1",
         title=title,
         company=company,
+        area=area,
         found_by_query="programmist",
     )
-    details = VacancyDetails(description=description, company=page_company)
-    profile = make_profile(stack=stack, domain=domain, negative=negative)
+    details = VacancyDetails(
+        description=description, company=page_company, work_formats=work_formats
+    )
+    profile = make_profile(stack=stack, domain=domain, negative=negative, location=location)
     return KeywordScorer(profile).score(discovered, details)
 
 
@@ -447,3 +458,199 @@ def test_live_vacancy_page_scores_as_measured() -> None:
     )
     assert result.penalty == 0.0
     assert result.total == 80.0
+
+
+# --- штраф за неудалённую работу вне домашнего региона (Task 3) -----------
+
+LOCATION = LocationConfig(
+    home_areas=["Нижний Новгород", "Дзержинск"], penalty_not_remote_elsewhere=40
+)
+
+# Заголовок и описание подобраны так, чтобы БЕЗ штрафа балл был заметно выше
+# нуля: иначе штраф не отличить от пола оценки, и тест проходил бы вакуумно.
+STRONG_TITLE = "Team Lead backend"
+STRONG_BODY = "архитектур, менторинг, код-ревью, c++, kubernetes, kafka, docker, телеком"
+
+
+def test_home_area_is_not_penalised_whatever_the_format() -> None:
+    """Домашний регион побеждает формат: офис в родном городе подходит."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    office_at_home = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Нижний Новгород",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert office_at_home.total == plain.total
+
+
+def test_second_home_area_also_counts() -> None:
+    """`home_areas` — список: второй город в нём не хуже первого."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Дзержинск",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total == plain.total
+
+
+def test_remote_elsewhere_is_not_penalised() -> None:
+    """Удалёнка вне дома — законный случай: штрафа нет."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Москва",
+        work_formats=frozenset({WorkFormat.REMOTE}),
+    )
+    assert result.total == plain.total
+
+
+def test_office_elsewhere_is_penalised() -> None:
+    """Вне дома и не удалённо — ровно тот случай, ради которого штраф введён."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Казань",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total < plain.total
+    assert plain.total - result.total == 40
+
+
+def test_hybrid_elsewhere_is_penalised() -> None:
+    """Живой случай из «Топа»: гибрид вне дома штрафуется тем же правилом,
+    что и чистый офис — REMOTE среди форматов не заявлен."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Санкт-Петербург",
+        work_formats=frozenset({WorkFormat.HYBRID}),
+    )
+    assert result.total < plain.total
+
+
+def test_remote_among_several_formats_is_enough() -> None:
+    """Вакансия может предлагать сразу несколько форматов: одного REMOTE
+    среди них достаточно, отменять остальные не нужно."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Москва",
+        work_formats=frozenset({WorkFormat.ON_SITE, WorkFormat.REMOTE, WorkFormat.HYBRID}),
+    )
+    assert result.total == plain.total
+
+
+def test_unknown_format_is_not_penalised() -> None:
+    """Пустое множество форматов — блока на странице не нашлось или вакансия
+    ещё не обогащена (см. `VacancyDetails.work_formats`), а не «не удалённо».
+    Штрафовать за незнание нельзя."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Москва",
+        work_formats=frozenset(),
+    )
+    assert result.total == plain.total
+
+
+def test_unknown_area_is_not_penalised() -> None:
+    """Неизвестный регион — та же причина, что и неизвестный формат: штрафовать
+    по отсутствующим данным нельзя."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area=None,
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total == plain.total
+
+
+def test_penalty_lands_in_score_detail() -> None:
+    """Штраф обязан быть виден не только в `total`, но и в разбивке `penalty`."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="Казань",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.penalty - plain.penalty == 40
+
+
+def test_score_never_goes_below_zero() -> None:
+    """Штраф за регион подрезается тем же нижним пределом, что и штраф за
+    стоп-слова: слабая вакансия не уходит в минус."""
+    weak_location = LocationConfig(home_areas=["Нижний Новгород"], penalty_not_remote_elsewhere=100)
+    result = score_for(
+        "Курьер",
+        "Доставка заказов",
+        location=weak_location,
+        area="Казань",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total == 0.0
+
+
+def test_profile_without_location_section_scores_as_before() -> None:
+    """`location` не задан — штрафа нет вовсе: старые профили без раздела
+    `location` продолжают работать как раньше."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=None,
+        area="Казань",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total == plain.total
+
+
+def test_penalty_above_hundred_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        LocationConfig(home_areas=["X"], penalty_not_remote_elsewhere=400)
+
+
+def test_empty_home_areas_is_rejected() -> None:
+    """Раздел есть, а домашнего региона нет — опечатка, при которой штраф
+    ловит абсолютно всё, включая вакансии в родном городе автора конфига."""
+    with pytest.raises(ValidationError):
+        LocationConfig(home_areas=[], penalty_not_remote_elsewhere=40)
+
+
+def test_administrative_prefix_variant_is_not_recognised_as_home() -> None:
+    """Сравнение региона — точное, не по подстроке (см. `_normalize_area`).
+
+    «городской округ Нижний Новгород» — реальное значение `area` из живой
+    базы (§Step 4 брифа), не равное «Нижний Новгород» посимвольно. Оно
+    ЗАРАБОТАЕТ штраф, хотя фактически это тот же город: точное сравнение
+    ловит опечатки в `home_areas` ценой того, что такие административные
+    варианты приходится перечислять в конфиге явно — подстрочное сравнение
+    было бы дешевле, но цена его ошибки выше (см. докстринг `_is_home_area`
+    и «Нижний Новгород и область»)."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="городской округ Нижний Новгород",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total < plain.total

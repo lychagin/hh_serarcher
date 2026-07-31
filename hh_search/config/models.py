@@ -325,6 +325,23 @@ class Signals(Base):
     domain: SignalGroups = Field(min_length=1)
 
 
+class LocationConfig(Base):
+    """Домашний регион скорера — раздел `profile.location` (Task 3 плана).
+
+    Штраф асимметричен намеренно (правило CLAUDE.md «штраф вместо отсева»):
+    вакансия вне дома без удалёнки не отсеивается, а теряет очки — офис в
+    Казани и офис в Москве не равны по привлекательности, но оба законны.
+    """
+
+    # Пустой список — не «штрафа нет», а опечатка, при которой штраф ловит
+    # вообще всё, включая вакансии в родном городе автора конфига: раздел
+    # `location` есть, а домашнего региона в нём нет.
+    home_areas: list[NonEmptyStr] = Field(min_length=1)
+    # Верхняя граница та же, что у penalty_per_signal и report_threshold:
+    # опечатка на порядок (400 вместо 40) обнуляет любую вакансию вне дома.
+    penalty_not_remote_elsewhere: float = Field(ge=0, le=100)
+
+
 class ProfileConfig(Base):
     weights: Weights
     saturation: Saturation
@@ -340,6 +357,9 @@ class ProfileConfig(Base):
     # стоп-слов означает «локально не отсеиваем ничего», и это осмысленно.
     negative: SignalGroups
     report_threshold: float = Field(default=60.0, ge=0, le=100)
+    # Не задан — штрафа за регион нет вовсе: старые профили без раздела
+    # `location` продолжают скорить как раньше (Task 3 плана).
+    location: LocationConfig | None = None
 
 
 # Slug живых курируемых листингов hh.ru — строчные латинские буквы, цифры
