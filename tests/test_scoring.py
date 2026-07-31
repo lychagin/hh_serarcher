@@ -67,8 +67,12 @@ def score_for(
         area=area,
         found_by_query="programmist",
     )
+    # area дублируется в details: `discovered.area or details.area` в KeywordScorer.score
+    # заменяет ЛЮБУЮ ложную область (не только None, но и "") на details.area, а стенд
+    # передаёт единственное значение area — записать его только в discovered потеряло бы
+    # пустую строку по дороге и сделало бы тест на неё вакуумным.
     details = VacancyDetails(
-        description=description, company=page_company, work_formats=work_formats
+        description=description, company=page_company, work_formats=work_formats, area=area
     )
     profile = make_profile(stack=stack, domain=domain, negative=negative, location=location)
     return KeywordScorer(profile).score(discovered, details)
@@ -498,6 +502,21 @@ def test_second_home_area_also_counts() -> None:
     assert result.total == plain.total
 
 
+def test_area_is_normalised_before_comparison() -> None:
+    """Сравнение — после нормализации пробелов и регистра (бриф Step 3), не
+    посимвольно: лишние пробелы и другой регистр не должны включать штраф,
+    иначе `_normalize_area` можно удалить, и набор промолчит."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="  нижний   НОВГОРОД ",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total == plain.total
+
+
 def test_remote_elsewhere_is_not_penalised() -> None:
     """Удалёнка вне дома — законный случай: штрафа нет."""
     plain = score_for(STRONG_TITLE, STRONG_BODY)
@@ -582,6 +601,34 @@ def test_unknown_area_is_not_penalised() -> None:
     assert result.total == plain.total
 
 
+def test_empty_area_is_not_penalised() -> None:
+    """Пустая строка — то же незнание региона, что и `None`: `_extract_locality`
+    (`hh_search/sources/vacancy_page.py`) отдаёт `addressLocality` из JSON-LD
+    как есть, без проверки на пустоту, и `""` там законный результат."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total == plain.total
+
+
+def test_whitespace_only_area_is_not_penalised() -> None:
+    """Строка из одних пробелов — та же пустота, просто не пойманная `not area`."""
+    plain = score_for(STRONG_TITLE, STRONG_BODY)
+    result = score_for(
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=LOCATION,
+        area="   ",
+        work_formats=frozenset({WorkFormat.ON_SITE}),
+    )
+    assert result.total == plain.total
+
+
 def test_penalty_lands_in_score_detail() -> None:
     """Штраф обязан быть виден не только в `total`, но и в разбивке `penalty`."""
     plain = score_for(STRONG_TITLE, STRONG_BODY)
@@ -597,12 +644,23 @@ def test_penalty_lands_in_score_detail() -> None:
 
 def test_score_never_goes_below_zero() -> None:
     """Штраф за регион подрезается тем же нижним пределом, что и штраф за
-    стоп-слова: слабая вакансия не уходит в минус."""
-    weak_location = LocationConfig(home_areas=["Нижний Новгород"], penalty_not_remote_elsewhere=100)
+    стоп-слова: сумма штрафов не уводит `total` в минус.
+
+    Слабый заголовок из таблицы брифа делает `weighted == 0`, и `total == 0.0`
+    держится ДАЖЕ при штрафе, тождественно равном нулю, — такой тест ловил бы
+    только вычитание штрафа ПОСЛЕ clamp'а, а не сам факт клампа. Решение
+    контроллера (fix-раунд 1): внутреннее противоречие брифа между строкой
+    таблицы («слабый заголовок») и шапкой (`STRONG_TITLE`/`STRONG_BODY`,
+    комментарий про «пол оценки») разрешено в пользу шапки — сильная вакансия
+    набирает 94.0 без штрафа, штраф 100 уводит сумму в минус, и именно это
+    здесь проверяется."""
+    strong_location = LocationConfig(
+        home_areas=["Нижний Новгород"], penalty_not_remote_elsewhere=100
+    )
     result = score_for(
-        "Курьер",
-        "Доставка заказов",
-        location=weak_location,
+        STRONG_TITLE,
+        STRONG_BODY,
+        location=strong_location,
         area="Казань",
         work_formats=frozenset({WorkFormat.ON_SITE}),
     )
@@ -643,7 +701,7 @@ def test_administrative_prefix_variant_is_not_recognised_as_home() -> None:
     ЗАРАБОТАЕТ штраф, хотя фактически это тот же город: точное сравнение
     ловит опечатки в `home_areas` ценой того, что такие административные
     варианты приходится перечислять в конфиге явно — подстрочное сравнение
-    было бы дешевле, но цена его ошибки выше (см. докстринг `_is_home_area`
+    было бы дешевле, но цена его ошибки выше (см. докстринг `_normalize_area`
     и «Нижний Новгород и область»)."""
     plain = score_for(STRONG_TITLE, STRONG_BODY)
     result = score_for(
