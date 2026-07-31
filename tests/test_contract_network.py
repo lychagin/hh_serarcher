@@ -35,12 +35,13 @@
    снова сузится до одного `hh.ru`, красным станет разбор листинга.
 """
 
+import re
 import socket
 from collections.abc import Iterator
 
 import pytest
 
-from hh_search.config.models import HttpConfig, QuerySpec
+from hh_search.config.models import HttpConfig, QuerySpec, WorkFormat
 from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
 from hh_search.sources.http import PoliteClient
 from hh_search.sources.listing import build_listing_url, parse_listing
@@ -52,6 +53,17 @@ CONTACT = "serg.lychagin.usa@gmail.com"
 # связаться, и тест не имеет права представляться скромнее сервиса.
 USER_AGENT = f"hh-search/0.1 (personal job search; {CONTACT})"
 QUERY = QuerySpec(slug="programmist", cluster="backend")
+# Второй поток — тот же листинг с фильтром `work_format`. Форма URL и
+# хрупкое место (`canonical` без `work_format`) описаны у `QUERY_REMOTE`
+# ниже, рядом с тестами, которые их проверяют.
+QUERY_REMOTE = QuerySpec(slug="programmist", cluster="remote", work_format=WorkFormat.REMOTE)
+# Ключ встроенного состояния листинга, несущий формат работы конкретной
+# вакансии, — та же обёртка, что и `_WORK_FORMATS_RE` в `sources/work_format.py`
+# (там она читает страницу ОДНОЙ вакансии и требует согласия всех вхождений;
+# здесь вакансий в выдаче много, согласия не будет, и это законно — ищем
+# просто ФАКТ присутствия REMOTE хотя бы в одной). Значения приходят
+# HTML-экранированными, потому что блок вставлен как значение атрибута.
+_WORK_FORMATS_RE = re.compile(r"&#34;workFormatsElement&#34;:\[([^\]]*)\]")
 
 pytestmark = pytest.mark.network
 
@@ -123,6 +135,57 @@ def test_vacancy_page_still_exposes_job_posting(client: PoliteClient, listing_ht
     # и отличить его от дрейфа можно только агрегатом. Этим и занят
     # `SalaryBlockStats` на настоящем прогоне («ни на одной странице»), а
     # канарейка честно не обещает того, чего одна страница дать не может.
+
+
+@pytest.fixture(scope="module")
+def remote_listing_html(client: PoliteClient) -> str:
+    """Второй поток (`work_format=REMOTE`) не имел живого контрактного
+    покрытия вовсе: `work_format` в этом файле не встречался ни разу.
+
+    Успешный `_fetch` уже доказывает первый пункт контракта — что форма
+    URL остаётся разрешённой живым `robots.txt`: `client.get` сверяет URL
+    с правилами ДО запроса и поднял бы `RobotsDisallowed` (а `_fetch` —
+    `pytest.fail`), если бы `Allow: /vacancies/*?*&page=` исчезло или
+    `work_format` стало запрещённым отдельно от него.
+    """
+    url = build_listing_url(QUERY_REMOTE)
+    assert "&page=" in url, "без &page= второй поток попал бы под Disallow: *?* — см. §1"
+    return _fetch(client, url, f"второй поток /vacancies/{QUERY_REMOTE.slug} (work_format=REMOTE)")
+
+
+def test_remote_stream_listing_still_parses_despite_canonical_without_work_format(
+    remote_listing_html: str,
+) -> None:
+    """Самое хрупкое место второго потока (замер 2026-07-31, фикстура
+    `tests/fixtures/listing_remote_programmist.html.gz`): hh.ru не отражает
+    `work_format` в `<link rel="canonical">` второго потока. `_check_slug`
+    это переживает не потому, что знает про `work_format`, а потому что
+    `_canonical_targets` сравнивает `path`, а не URL целиком, — то же
+    решение, что уже держит `?page=N` первого потока. Если сравнение
+    когда-нибудь станет строже (или canonical начнёт нести `work_format` в
+    ИНОЙ форме, ломающей путь), разбор второго потока упадёт именно здесь.
+
+    Числа вакансий и регионов здесь намеренно не проверяются: живая выдача
+    меняется каждый день, а контрактный тест обязан ловить смену контракта,
+    а не движение данных.
+    """
+    vacancies = parse_listing(remote_listing_html, QUERY_REMOTE.slug)
+    assert vacancies, "второй поток не разобрался ни в одну вакансию — см. §1 спеки региона"
+    assert all(item.url.startswith("https://hh.ru/vacancy/") for item in vacancies)
+    assert all(item.id.isdigit() and item.title for item in vacancies)
+
+
+def test_remote_stream_state_still_carries_the_remote_format(remote_listing_html: str) -> None:
+    """Фильтр не выродился в пустышку: хотя бы один блок формата работы во
+    встроенном состоянии страницы несёт REMOTE. Доля и число таких блоков
+    здесь не утверждаются — это тоже движение данных, а не контракт;
+    достаточно факта, что фильтр действительно на что-то влияет."""
+    blocks = _WORK_FORMATS_RE.findall(remote_listing_html)
+    assert blocks, "во встроенном состоянии не нашлось ни одного блока формата работы"
+    assert any("REMOTE" in block for block in blocks), (
+        "ни один блок формата работы не содержит REMOTE — фильтр work_format=REMOTE "
+        "перестал на что-либо влиять"
+    )
 
 
 def test_live_robots_still_permits_the_source_we_chose(client: PoliteClient) -> None:
