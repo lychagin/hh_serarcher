@@ -41,8 +41,20 @@ LOOKBACK_DAYS = 2
 
 # Шаблон черновиков, которые эмиттер мог оставить сам: тот же суффикс, что
 # и у `tempfile.mkstemp(..., suffix=".part")` в `_draft`, плюс общий для
-# всех дней хвост имени файла дня. Уборка орфанов ищет РОВНО этот шаблон.
+# всех дней хвост имени файла дня. Уборка орфанов ищет РОВНО этот шаблон —
+# и отметка о доставке (`_SENT_SUFFIX`) под него не подпадает намеренно.
 _DRAFT_GLOB = "*-new.html*.part"
+
+# Отметка о доставке: пустой файл `<файл дня>.sent` рядом с файлом дня.
+# Означает ровно одно — ТЕКУЩЕЕ содержимое этого файла уехало
+# `send_document`. Публикация новой версии файла отметку снимает, успешная
+# отправка ставит заново, а её отсутствие при существующем файле дня и
+# есть застрявший документ (спека §5, item 1).
+#
+# Состояние приёмника файловое целиком, и это решение владельца: рецепт
+# README «уберите файлы за эти сутки и повторите» обязан продолжать
+# работать, а с записью в SQLite он молча перестал бы.
+_SENT_SUFFIX = ".sent"
 
 
 class TelegramSink:
@@ -66,11 +78,11 @@ class TelegramSink:
        исключение (item 2) — каталог мог стать недоступен уже ПОСЛЕ
        `send_message`;
     4. `send_document` — если падает, файл уже опубликован: следующий
-       прогон найдёт вакансии в файле дедупликацией и вернёт 0. Если при
-       этом хоть одна пришедшая вакансия нашлась ТОЛЬКО в файле одних из
-       предыдущих суток (а не сегодняшних), это и есть след той самой
-       непровезённой отправки — `emit` довозит именно её документ, не
-       трогая сообщение (item 1): оно уже ушло, повтор был бы дублем.
+       прогон найдёт вакансии в файле дедупликацией и вернёт 0, а файл дня
+       останется БЕЗ отметки о доставке (`_SENT_SUFFIX`). Прогон, у
+       которого нет свежих вакансий, довозит документы всех дней окна без
+       отметки, не трогая сообщение (item 1): оно уже ушло, повтор был бы
+       дублем.
 
     Порядок «сообщение, потом запись» (редакция 3) воспроизводил критическую
     находку: запись сама может упасть. Каталог отчётов `chmod 0o500` — и
@@ -102,24 +114,22 @@ class TelegramSink:
             return 0
         path = self._day_file(now.date())
         existing = self._read_day_file(path)
-        today_hrefs = set(VACANCY_HREF_RE.findall(existing))
         previous = self._previous_days(now.date())
-        previous_hrefs: set[str] = set()
-        for _, _, hrefs in previous:
-            previous_hrefs |= hrefs
 
-        already = set(today_hrefs)
+        already = set(VACANCY_HREF_RE.findall(existing))
+        for _, _, hrefs in previous:
+            already |= hrefs
         fresh: list[ScoredVacancy] = []
         for item in vacancies:
             url = item.discovered.url
-            if url in already or url in previous_hrefs:
+            if url in already:
                 continue
             # Пополняем на ходу: дубль может прийти и внутри одной пачки
             # (см. `CsvSink.emit` — тот же приём и та же причина).
             already.add(url)
             fresh.append(item)
         if not fresh:
-            return self._redeliver(vacancies, today_hrefs, previous)
+            return self._redeliver(previous)
 
         document = (existing or document_header(now)) + render_section(fresh, now, self._threshold)
         payload = document.encode("utf-8")
@@ -140,46 +150,60 @@ class TelegramSink:
             draft.unlink(missing_ok=True)
             raise
 
+        marker = self._marker(path)
+        # Опубликована новая версия файла дня — прежняя отметка была про
+        # прежнее содержимое и больше ничего не утверждает. Иначе утренняя
+        # доставка объявляла бы доставленным и то, что дописал вечер.
+        marker.unlink(missing_ok=True)
         self._client.send_document(path.name, payload, f"Отчёт за {now:%Y-%m-%d}")
+        marker.touch()
         return len(fresh)
 
-    def _redeliver(
-        self,
-        vacancies: Sequence[ScoredVacancy],
-        today_hrefs: set[str],
-        previous: Sequence[tuple[date, str, set[str]]],
-    ) -> int:
-        """Довезти документ ОДНИХ предыдущих суток, если он застрял (item 1).
+    def _redeliver(self, previous: Sequence[tuple[date, str, set[str]]]) -> int:
+        """Довезти документы предыдущих суток, застрявшие без отметки (item 1).
 
         Свежих вакансий нет — обычно это либо пустой прогон, либо повтор
-        того же дня, и путь молчит, как раньше. Но если хоть одна ПРИШЕДШАЯ
-        вакансия нашлась ТОЛЬКО в файле одних из `previous` суток (а не в
-        сегодняшнем), значит тот прогон отправил сообщение и упал именно на
-        `send_document` — и до сих пор не был повторён. Редоставка шлёт
-        РОВНО тот файл, ничего не пишет и не трогает `send_message`: он уже
-        ушёл, повтор был бы тем самым дублем, которого избегает дедуп.
+        того же дня, и путь молчит. Застрявший день опознаётся по ФАКТУ:
+        файл дня есть, а отметки о его доставке нет, то есть тот прогон
+        отправил сообщение и упал именно на `send_document`. Прежняя
+        редакция опознавала его по совпадению ссылок («вакансия нашлась
+        только в файле предыдущих суток») и принимала за него две здоровые
+        ситуации сразу — упавшего соседа-приёмника и повторный
+        `report --since`, — то есть слала в канал дубль документа.
 
-        Если `send_document` падает снова — исключение поднимается как
-        есть: следующий прогон обязан попробовать ещё раз, а не смолчать.
+        Обходятся ВСЕ дни окна, а не только ближайший: `return` внутри
+        цикла терял дальний застрявший день навсегда (находка I1).
+        Редоставка ничего не пишет в файл дня и не трогает `send_message`:
+        он уже ушёл, повтор был бы тем самым дублем, которого избегает
+        дедуп. Если `send_document` падает снова — исключение поднимается
+        как есть: следующий прогон обязан попробовать ещё раз, а не
+        смолчать.
         """
-        incoming = {item.discovered.url for item in vacancies}
-        for day, content, hrefs in previous:
-            stuck = (incoming & hrefs) - today_hrefs
-            if content and stuck:
-                self._client.send_document(
-                    self._day_file(day).name, content.encode("utf-8"), f"Отчёт за {day:%Y-%m-%d}"
-                )
-                return 0
+        for day, content, _ in previous:
+            marker = self._marker(self._day_file(day))
+            if not content or marker.exists():
+                continue
+            self._client.send_document(
+                self._day_file(day).name, content.encode("utf-8"), f"Отчёт за {day:%Y-%m-%d}"
+            )
+            marker.touch()
         return 0
+
+    def _marker(self, path: Path) -> Path:
+        """Отметка о доставке файла дня — пустой файл рядом с ним."""
+        return path.with_name(path.name + _SENT_SUFFIX)
 
     def _previous_days(self, today: date) -> list[tuple[date, str, set[str]]]:
         """Файлы `LOOKBACK_DAYS` предыдущих суток: (дата, содержимое, ссылки).
 
-        Ближайший день — первым: `_redeliver` останавливается на первом
-        совпадении, а застрять чаще всего может именно вчерашний файл.
+        СТАРШИЙ день — первым: довозка обходит их все подряд, и документы
+        обязаны лечь в канале в том порядке, в каком шли сутки. Прежний
+        порядок (ближайший день первым) объяснялся тем, что довозка
+        останавливалась на первом совпадении, — она больше не
+        останавливается (I1).
         """
         result: list[tuple[date, str, set[str]]] = []
-        for offset in range(1, LOOKBACK_DAYS + 1):
+        for offset in range(LOOKBACK_DAYS, 0, -1):
             day = today - timedelta(days=offset)
             content = self._read_day_file(self._day_file(day))
             result.append((day, content, set(VACANCY_HREF_RE.findall(content))))

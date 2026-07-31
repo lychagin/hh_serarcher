@@ -546,13 +546,21 @@ def test_readme_recipe_for_a_repeat_delivery_matches_the_real_lookback_window() 
     это не помогает: подавление найдёт вакансию в файле одних из
     `LOOKBACK_DAYS` предыдущих суток. Число здесь не переписывается руками,
     иначе разошлось бы на следующей же правке константы.
+
+    Это сторож ТЕКСТА, и одного его мало: обещание README «доставит только
+    в первый раз» два раунда было ложным при зелёном наборе, потому что
+    сверялось наличием подстрок. Поведение сторожат исполнением
+    `test_repeating_the_report_command_delivers_only_the_first_time` и
+    `test_removing_the_day_files_brings_the_full_delivery_back`
+    (`tests/test_telegram_sink.py`).
     """
-    from hh_search.sinks.telegram_sink import LOOKBACK_DAYS
+    from hh_search.sinks.telegram_sink import _SENT_SUFFIX, LOOKBACK_DAYS
 
     section = readme_section("## Отчёт в Telegram", "## Разработка")
     assert "LOOKBACK_DAYS" in section
     assert f"{LOOKBACK_DAYS} предыдущих суток" in section
     assert "недостаточно" in section, "README больше не предупреждает, что удаления файла мало"
+    assert _SENT_SUFFIX in section, "README не называет файл-отметку, которую тоже надо убрать"
 
 
 # --- спека приёмника telegram: ссылки на код ------------------------------

@@ -27,7 +27,7 @@ from hh_search.sinks.telegram_client import (
     TelegramError,
     message_length,
 )
-from hh_search.sinks.telegram_sink import TelegramSink
+from hh_search.sinks.telegram_sink import _SENT_SUFFIX, TelegramSink
 from tests.test_html_report import NOW, vacancy
 
 TOKEN = "1234567890:AAHtestTOKENvalueMUSTneverLEAK"
@@ -480,11 +480,18 @@ def test_failure_of_a_neighbour_sink_does_not_repeat_the_message_after_midnight(
 
     `report()` не помечает вакансии отправленными при отказе ЛЮБОГО
     приёмника, поэтому здоровый telegram получает вчерашнюю пачку целиком.
+
+    Документа тоже быть не должно, и это находка C1: вчерашняя пачка,
+    пришедшая наутро целиком, выглядит РОВНО как след недоставленного
+    `send_document` — вечерний прогон при этом был здоров и документ
+    отправил. Различает эти две ситуации только отметка о доставке
+    (`<файл дня>.sent`), а не совпадение ссылок.
     """
     assert sink(tmp_path, FakeClient()).emit([vacancy()], EVENING) == 1
     client = FakeClient()
     assert sink(tmp_path, client).emit([vacancy()], NEXT_MORNING) == 0
     assert not client.messages
+    assert not client.documents, "документ 29-го уехал вторым разом — вчера он уже доставлен"
 
 
 def test_the_previous_day_file_does_not_hide_a_genuinely_new_vacancy(tmp_path: Path) -> None:
@@ -523,6 +530,111 @@ def test_document_is_redelivered_when_suppressed_only_by_the_previous_day_file(
     assert filename == "2026-07-29-new.html"
     assert "2026-07-29" in caption
     assert content == (tmp_path / "2026-07-29-new.html").read_bytes()
+
+
+def test_a_redelivered_day_is_not_delivered_a_second_time(tmp_path: Path) -> None:
+    """Довозка обязана отметить день, который довезла.
+
+    Иначе она повторяет себя при каждом следующем прогоне без свежих
+    вакансий — а `report --since 7d` даёт такой прогон сколько угодно раз
+    подряд, потому что вакансии в нём уже отправлены и ничего не
+    помечается.
+    """
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
+    first = FakeClient()
+    assert sink(tmp_path, first).emit([vacancy()], NEXT_MORNING) == 0
+    assert len(first.documents) == 1
+
+    second = FakeClient()
+    assert sink(tmp_path, second).emit([vacancy()], NEXT_MORNING) == 0
+    assert not second.documents, "довозка не отметила день — документ поехал второй раз"
+
+
+def test_repeating_the_report_command_delivers_only_the_first_time(tmp_path: Path) -> None:
+    """Обещание README, сверенное исполнением, а не подстрокой.
+
+    README говорит про `report --since 7d`: «повторять её можно сколько
+    угодно — но доставит она только в первый раз… второй запуск ничего не
+    шлёт и печатает `telegram: 0`». Сторож у этой фразы был только
+    текстовый (наличие подстрок), а само поведение расходилось с ней
+    молча: `report` берёт УЖЕ отправленные вакансии (`reported_since`),
+    ничего не помечает и ничего не пишет, поэтому подпись «нашлась только
+    в файле предыдущих суток» держалась вечно — и каждый повтор слал
+    документ 29-го заново (воспроизведено: три повтора — три документа).
+    """
+    assert sink(tmp_path, FakeClient()).emit([vacancy(vacancy_id="1")], EVENING) == 1
+    for run in range(3):
+        client = FakeClient()
+        assert sink(tmp_path, client).emit([vacancy(vacancy_id="1")], NEXT_MORNING) == 0
+        assert not client.messages, f"повтор №{run + 1} отправил сообщение"
+        assert not client.documents, f"повтор №{run + 1} отправил документ"
+
+
+def test_removing_the_day_files_brings_the_full_delivery_back(tmp_path: Path) -> None:
+    """Рецепт README обязан работать и с отметкой о доставке.
+
+    «Уберите файлы за сегодня и за предыдущие сутки» — единственный способ
+    получить полный повтор, и он не имеет права сломаться о файл-отметку:
+    убрано `<дата>-new.html*`, значит убрана и она.
+    """
+    assert sink(tmp_path, FakeClient()).emit([vacancy(vacancy_id="1")], EVENING) == 1
+    for leftover in tmp_path.glob("2026-07-29-new.html*"):
+        leftover.unlink()
+
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([vacancy(vacancy_id="1")], NEXT_MORNING) == 1
+    assert len(client.messages) == 1
+    assert len(client.documents) == 1
+    assert client.documents[0][0] == "2026-07-30-new.html"
+
+
+def test_both_stuck_days_are_redelivered_not_just_the_nearest(tmp_path: Path) -> None:
+    """Находка I1: `return` внутри цикла терял ДАЛЬНИЙ застрявший день.
+
+    29-го `sendDocument` упал; 30-го пришли непомеченная вакансия 29-го и
+    новая, файл 30-го опубликован, `sendDocument` упал снова. 31-го
+    довозился только 30-й — и раз все приёмники отработали, `report()`
+    пометил обе вакансии, то есть документ 29-го не приезжал НИКОГДА.
+    Механизм довозки для него формально работал: это шире известного
+    остатка T-2, где теряется отказ последнего прогона суток.
+    """
+    day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
+    first, second = vacancy(vacancy_id="1"), vacancy(vacancy_id="2")
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([first], EVENING)
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([first, second], NEXT_MORNING)
+
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([first, second], day31) == 0
+    assert not client.messages
+    assert [name for name, _, _ in client.documents] == [
+        "2026-07-29-new.html",
+        "2026-07-30-new.html",
+    ]
+
+
+def test_republished_day_file_is_redelivered_after_a_failed_document(tmp_path: Path) -> None:
+    """Отметка о доставке относится к ТЕКУЩЕМУ содержимому файла дня.
+
+    Утренний прогон 29-го доставил документ, вечерний дописал в тот же файл
+    вторую вакансию и упал на `sendDocument`. Если бы утренняя отметка
+    пережила публикацию новой версии, день считался бы доставленным — и
+    вечерние записи, уже анонсированные сообщением, не приехали бы никогда.
+    Поэтому публикация отметку снимает, а ставит её заново только успешная
+    отправка.
+    """
+    morning29 = datetime(2026, 7, 29, 10, 15, tzinfo=UTC)
+    first, second = vacancy(vacancy_id="1"), vacancy(vacancy_id="2")
+    assert sink(tmp_path, FakeClient()).emit([first], morning29) == 1
+    with pytest.raises(TelegramError):
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([second], EVENING)
+
+    client = FakeClient()
+    assert sink(tmp_path, client).emit([first, second], NEXT_MORNING) == 0
+    assert not client.messages
+    assert [name for name, _, _ in client.documents] == ["2026-07-29-new.html"]
 
 
 def test_redelivery_raises_when_send_document_fails_again(tmp_path: Path) -> None:
@@ -605,6 +717,22 @@ def test_unremovable_draft_does_not_break_an_otherwise_empty_run(tmp_path: Path)
         reports.chmod(0o700)
     assert not client.messages
     assert not client.documents
+
+
+def test_sweep_does_not_touch_the_delivery_marker(tmp_path: Path) -> None:
+    """Шаблон уборки (`*-new.html*.part`) не имеет права накрыть отметку.
+
+    Отметка лежит рядом с файлом дня и начинается так же (`-new.html`), а
+    съеденная уборкой отметка означала бы повторный документ в канале при
+    первом же прогоне без свежих вакансий.
+    """
+    marker = tmp_path / f"2026-07-29-new.html{_SENT_SUFFIX}"
+    client = FakeClient()
+    target = sink(tmp_path, client)
+    target.emit([vacancy(vacancy_id="1")], NOW)
+    assert marker.exists(), "успешный `send_document` не оставил отметки"
+    target.emit([vacancy(vacancy_id="2")], NOW)
+    assert marker.exists(), "уборка черновиков съела отметку о доставке"
 
 
 def test_sweep_does_not_touch_a_published_day_file(tmp_path: Path) -> None:
