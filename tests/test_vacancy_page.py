@@ -292,13 +292,31 @@ def test_work_formats_read_from_the_remote_fixture() -> None:
     assert extract_work_formats(load_salary_fixture()) == frozenset({WorkFormat.REMOTE})
 
 
+def work_formats_block(*values: str) -> str:
+    """Блок формата в том виде, в каком его отдаёт hh.ru: HTML-экранированным.
+
+    Отдельная функция, потому что этой строкой пользуются с двух сторон: как
+    настоящим блоком внутри состояния и как ПОДДЕЛКОЙ, вписанной туда, куда
+    пишет работодатель.
+    """
+    listed = ",".join(f"&#34;{value}&#34;" for value in values)
+    return f"&#34;workFormats&#34;:[{{&#34;workFormatsElement&#34;:[{listed}]}}]"
+
+
+def in_state(payload: str) -> str:
+    """Полезная нагрузка внутри встроенного состояния страницы.
+
+    Обёртка обязательна: разбор читает только содержимое
+    `<template id="HH-Lux-InitialState">` — см.
+    `test_work_format_forged_in_the_employer_description_does_not_win`.
+    """
+    return f'<html><body><template id="HH-Lux-InitialState">{payload}</template></body></html>'
+
+
 def test_several_formats_are_all_kept() -> None:
     """Вакансия может предлагать несколько форматов, и REMOTE не должен
     потеряться среди них (живой пример: Team Lead Go, три формата)."""
-    html = (
-        "&#34;workFormats&#34;:[{&#34;workFormatsElement&#34;:"
-        "[&#34;ON_SITE&#34;,&#34;REMOTE&#34;,&#34;HYBRID&#34;]}]"
-    )
+    html = in_state(work_formats_block("ON_SITE", "REMOTE", "HYBRID"))
     assert extract_work_formats(html) == frozenset(
         {WorkFormat.ON_SITE, WorkFormat.REMOTE, WorkFormat.HYBRID}
     )
@@ -313,11 +331,85 @@ def test_missing_block_gives_empty_set_not_an_error() -> None:
 def test_unknown_format_value_is_ignored_and_does_not_crash() -> None:
     """hh.ru может завести новое значение перечисления. Неизвестное
     отбрасывается, известные из того же списка сохраняются."""
-    html = (
-        "&#34;workFormats&#34;:[{&#34;workFormatsElement&#34;:"
-        "[&#34;REMOTE&#34;,&#34;TELEPORT&#34;]}]"
-    )
+    html = in_state(work_formats_block("REMOTE", "TELEPORT"))
     assert extract_work_formats(html) == frozenset({WorkFormat.REMOTE})
+
+
+# --- Финальное ревью ветки, Critical 1: область, которой управляет чужой ---
+#
+# `extract_work_formats` искал первое совпадение по ВСЕЙ странице. На живой
+# фикстуре отрендеренное описание вакансии — текст работодателя — стоит на
+# ~74 000, а встроенное состояние начинается на ~186 000: подделка в описании
+# опережала настоящий ключ, снимала штраф −40 и превращала оценку 60.0 в
+# 100.0. Сторож `WorkFormatBlockStats` при этом молчал: формат ведь нашёлся.
+
+# Маркер начала описания вакансии — области, куда пишет работодатель. Есть на
+# обеих живых фикстурах и стоит ДО встроенного состояния.
+DESCRIPTION_MARKER = 'data-qa="vacancy-description"'
+
+# Слева — фикстура, в середине — её настоящий вердикт, справа — формат,
+# который подделка пытается ему навязать. Значения намеренно разные: подделка
+# «REMOTE» на странице, где REMOTE и так стоит, не доказала бы ничего.
+FORGERY_CASES = [
+    (FIXTURE, frozenset({WorkFormat.ON_SITE}), "REMOTE"),
+    (SALARY_FIXTURE, frozenset({WorkFormat.REMOTE}), "ON_SITE"),
+]
+
+
+@pytest.mark.parametrize(("fixture", "expected", "forged"), FORGERY_CASES)
+def test_work_format_forged_in_the_employer_description_does_not_win(
+    fixture: Path, expected: frozenset[WorkFormat], forged: str
+) -> None:
+    """Подделка в описании не меняет вердикт — и настоящий блок по-прежнему
+    читается: обе половины проверяются на живой странице, а не на синтетике."""
+    with gzip.open(fixture, "rt", encoding="utf-8") as handle:
+        html = handle.read()
+    assert extract_work_formats(html) == expected, "фикстура перестала читаться сама по себе"
+    index = html.index(DESCRIPTION_MARKER)
+    assert index < html.index("HH-Lux-InitialState"), (
+        "описание больше не стоит ДО встроенного состояния — подделка "
+        "перестала опережать настоящий ключ, и тест ничего не проверяет"
+    )
+    spoiled = html[:index] + work_formats_block(forged) + html[index:]
+    assert extract_work_formats(spoiled) == expected
+
+
+def test_conflicting_blocks_inside_the_state_refuse_to_guess() -> None:
+    """Описание вакансии лежит и внутри состояния тоже, поэтому одной границы
+    мало: два несогласных вхождения — это отказ в пользу неведения.
+
+    Пустое множество штрафа не несёт (`_region_penalty` в `scoring/keyword.py`),
+    то есть отказ ведёт себя ровно так же, как отсутствие блока.
+    """
+    with gzip.open(FIXTURE, "rt", encoding="utf-8") as handle:
+        html = handle.read()
+    spoiled = html.replace("</template>", work_formats_block("REMOTE") + "</template>", 1)
+    assert extract_work_formats(spoiled) == frozenset()
+
+
+def test_bare_key_without_its_wrapper_is_not_read() -> None:
+    """Ключ без обёртки `"workFormats":[{…}]` — не блок вакансии.
+
+    Описание работодателя лежит внутри состояния тоже, поэтому голая строка
+    `"workFormatsElement":[...]` там ничего не доказывает: у настоящего блока
+    есть родитель, и требование родителя стоит один символ регулярки. Если
+    hh.ru когда-нибудь перестроит состояние и обёртка исчезнет, формат
+    пропадёт у ВСЕХ страниц разом — а это ровно тот случай, про который
+    кричит `WorkFormatBlockStats`.
+    """
+    assert extract_work_formats(in_state("&#34;workFormatsElement&#34;:[&#34;REMOTE&#34;]")) == (
+        frozenset()
+    )
+
+
+def test_agreeing_blocks_inside_the_state_are_still_read() -> None:
+    """Отказ — только при РАСХОЖДЕНИИ: повтор того же значения вердикта не
+    отменяет, иначе правка hh.ru, дублирующая блок, тихо обнулила бы формат
+    на всех страницах разом."""
+    with gzip.open(FIXTURE, "rt", encoding="utf-8") as handle:
+        html = handle.read()
+    doubled = html.replace("</template>", work_formats_block("ON_SITE") + "</template>", 1)
+    assert extract_work_formats(doubled) == frozenset({WorkFormat.ON_SITE})
 
 
 def test_block_stats_shout_when_no_page_had_formats(
