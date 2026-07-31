@@ -251,7 +251,9 @@ def _score(config: Config, fixture: str, title: str) -> ScoreBreakdown:
 def test_example_profile_scores_the_live_pages(
     example_config: Config, fixture: str, title: str, expected: float
 ) -> None:
-    """Целевая вакансия — сотня, вакансия 1С — ноль, и обе на живых страницах."""
+    """Целевая вакансия — 60 (100 минус штраф 40 за московский офис вне
+    `location.home_areas` образца, см. `LIVE_SCORES` выше), вакансия 1С —
+    ноль, и обе на живых страницах."""
     assert _score(example_config, fixture, title).total == expected
 
 
@@ -292,8 +294,18 @@ def _statements(sql: str) -> list[str]:
 
 
 def _spec_section(start: str, end: str) -> str:
+    """Срез спеки от `start` до следующего вхождения `end` ПОСЛЕ `start`.
+
+    `end` ищется не от начала файла: та же сестринская функция и тот же
+    инвариант, что в `spec_section`/`readme_section`
+    `tests/test_spec_matches_code.py` — иначе `end`, случайно совпавший
+    подстрокой выше по файлу (раньше `start`), дал бы пустой или неверный
+    срез.
+    """
     text = SPEC.read_text(encoding="utf-8")
-    return text[text.index(start) : text.index(end)]
+    start_index = text.index(start)
+    end_index = text.index(end, start_index + len(start))
+    return text[start_index:end_index]
 
 
 def test_spec_ddl_matches_schema_sql() -> None:

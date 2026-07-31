@@ -43,8 +43,19 @@ CODE_LINE_BUDGET = 150
 
 
 def spec_section(start: str, end: str) -> str:
+    """Срез спеки от `start` до следующего вхождения `end` ПОСЛЕ `start`.
+
+    `end` ищется не от начала файла: иначе `end`, встретившийся раньше
+    `start` (или случайно совпавший подстрокой внутри более длинного
+    заголовка выше по файлу), дал бы пустой или неверный срез. Один и тот же
+    класс бага чинился в `readme_section` этого файла и в `_spec_section`
+    `tests/test_config_example.py` — все три сестры держат этот инвариант
+    одинаково.
+    """
     text = SPEC.read_text(encoding="utf-8")
-    return text[text.index(start) : text.index(end)]
+    start_index = text.index(start)
+    end_index = text.index(end, start_index + len(start))
+    return text[start_index:end_index]
 
 
 def spec_block(section: str, language: str) -> str:
@@ -241,18 +252,30 @@ README = ROOT / "README.md"
 
 
 def readme_section(start: str, end: str) -> str:
-    """Срез README от заголовка `start` до следующего вхождения `end`.
+    """Срез README от заголовка `start` до следующего заголовка `end`.
 
-    `end` ищется НАЧИНАЯ с конца `start`, а не с начала файла: иначе общий
-    маркер уровня заголовка (`"## "`, а не конкретный следующий раздел) находил
-    бы самый первый `## ` во всём файле — как правило, раньше самого `start` —
-    и давал пустой (или неправильный) срез вместо секции. Для четырёх прежних
-    вызовов с уникальным по всему файлу `end` результат не меняется: там
-    первое вхождение `end` и так лежит после `start`.
+    Два независимых требования к поиску `end`, каждое проверено мутацией:
+
+    1. Искать НАЧИНАЯ с конца `start`, а не с начала файла: иначе общий
+       маркер уровня заголовка (`"## "`, а не конкретный следующий раздел)
+       находил бы самый первый `## ` во всём файле — как правило, раньше
+       самого `start` — и давал пустой (или неправильный) срез вместо
+       секции. Для прежних вызовов с уникальным по всему файлу `end`
+       результат не меняется: там первое вхождение `end` и так лежит после
+       `start`.
+    2. Искать `end` ТОЛЬКО в начале строки (`re.MULTILINE`, а не голый
+       `str.index`): иначе подзаголовок `### Детали` сразу после `start`
+       ложно совпадал бы с `end="## "` — три `#` содержат подстроку `"## "`
+       начиная со второго символа, и голый `index()` находит её посреди
+       строки, а не в её начале. Безобидная вставка подзаголовка обрезала
+       бы секцию до пустой и красила сторож, который её читает.
     """
     text = README.read_text(encoding="utf-8")
     start_index = text.index(start)
-    end_index = text.index(end, start_index + len(start))
+    tail = text[start_index + len(start) :]
+    end_match = re.search(rf"^{re.escape(end)}", tail, re.MULTILINE)
+    assert end_match is not None, f"конец секции {end!r} после {start!r} не найден"
+    end_index = start_index + len(start) + end_match.start()
     return text[start_index:end_index]
 
 
