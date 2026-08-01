@@ -27,6 +27,7 @@ from hh_search.storage.repository import (
     SCHEMA_PATH,
     SqliteRepository,
 )
+from hh_search.storage.time_utils import to_utc_iso
 
 
 @pytest.fixture()
@@ -2459,7 +2460,7 @@ def _backdate_reported_at(repo: SqliteRepository, moment: datetime, *vacancy_ids
     """
     repo._connection.execute(  # noqa: SLF001 — reported_at в прошлом публичным API не поставить
         f"UPDATE vacancy SET reported_at = ? WHERE id IN ({','.join('?' for _ in vacancy_ids)})",
-        (moment.isoformat(), *vacancy_ids),
+        (to_utc_iso(moment), *vacancy_ids),
     )
     repo._connection.commit()  # noqa: SLF001 — та же подготовка состояния
 
@@ -2467,10 +2468,16 @@ def _backdate_reported_at(repo: SqliteRepository, moment: datetime, *vacancy_ids
 def test_forget_descriptions_only_touches_old_reported_rows(repo: SqliteRepository) -> None:
     """Обнуляются описания отправленных и старых. Всё остальное цело.
 
-    Три соседа проверяются вместе, потому что каждый ломается по-своему:
-    свежая отправленная теряется из `report --since` раньше срока,
-    строка `new` с описанием выпадает из очереди отчёта, а строка `new`
-    без описания ушла бы в сеть за уже скачанной страницей.
+    Четыре соседа проверяются вместе, потому что каждый ломается по-своему:
+    свежая отправленная теряется из `report --since` раньше срока, строка
+    `new` с описанием выпадает из очереди отчёта, строка `new` без описания
+    ушла бы в сеть за уже скачанной страницей, а вакансия, отправленная
+    давно и возвращённая человеком в `new` командой `mark <id> new`, —
+    самый дорогой случай: `set_status` сознательно не трогает `reported_at`
+    (время первой отправки — история), и предикат `status = 'reported'`
+    здесь единственное, что отличает её от строки «старая». Без него
+    уборка обнулила бы уже видимое человеку описание вакансии, которую он
+    попросил пересмотреть.
     """
     repo.add_discovered(make_vacancy("старая"), "embedded", 9)
     repo.save_enriched("старая", VacancyDetails(description="Yocto"), make_score())
@@ -2486,6 +2493,12 @@ def test_forget_descriptions_only_touches_old_reported_rows(repo: SqliteReposito
 
     repo.add_discovered(make_vacancy("без-описания"), "embedded", 9)
 
+    repo.add_discovered(make_vacancy("отозванная"), "embedded", 9)
+    repo.save_enriched("отозванная", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["отозванная"])
+    _backdate_reported_at(repo, datetime(2026, 1, 1, tzinfo=UTC), "отозванная")
+    repo.set_status("отозванная", "new")  # человек попросил «попробовать ещё раз»
+
     freed = repo.forget_descriptions(datetime(2026, 5, 1, tzinfo=UTC))
     assert freed == 1
 
@@ -2494,6 +2507,8 @@ def test_forget_descriptions_only_touches_old_reported_rows(repo: SqliteReposito
     assert [item.discovered.id for item in recent] == ["свежая"]
     assert [v.id for v, _ in repo.pending_scoring()] == ["с-описанием"]
     assert [v.id for v in repo.pending_enrichment(max_attempts=3)] == ["без-описания"]
+    # status='new' с давним reported_at и целым описанием — видна unreported()
+    assert [item.discovered.id for item in repo.unreported()] == ["отозванная"]
 
 
 def test_forget_descriptions_is_idempotent(repo: SqliteRepository) -> None:
@@ -2535,7 +2550,10 @@ def test_forget_runs_keeps_the_row_that_never_finished(repo: SqliteRepository) -
 
     `running` без `finished_at` — след убитого процесса, то есть улика
     отказа, ради которой журнал и ведётся. Закроет её
-    `close_abandoned_runs()`, и удалит уже следующая уборка.
+    `close_abandoned_runs()` (переведёт в `interrupted`, не проставив
+    `finished_at` — время смерти неизвестно), а удалит уже следующая
+    уборка: граница — `COALESCE(finished_at, started_at)`, и `started_at`
+    у такой строки есть всегда.
     """
     old_run = repo.start_run()
     repo.finish_run(old_run, "ok", finished_at=datetime(2024, 1, 1, tzinfo=UTC))
@@ -2547,6 +2565,55 @@ def test_forget_runs_keeps_the_row_that_never_finished(repo: SqliteRepository) -
 
     remaining = repo._connection.execute("SELECT id FROM run").fetchall()  # noqa: SLF001
     assert {int(row["id"]) for row in remaining} == {unfinished_run}
+
+
+def test_forget_runs_deletes_an_old_interrupted_row_without_finished_at(
+    repo: SqliteRepository,
+) -> None:
+    """I2: `interrupted` не получает `finished_at` — и всё равно попадает под срок.
+
+    `close_abandoned_runs()` сознательно не проставляет `finished_at`:
+    время смерти неизвестно, и выдумывать его значило бы соврать (см. его
+    собственный докстринг). Раньше это делало обещание спеки «365 дней»
+    ложным: `forget_runs` сравнивал голый `finished_at`, и строка
+    `interrupted` никогда не попадала под `< cutoff` — кладбище росло
+    вечно. Граница — `COALESCE(finished_at, started_at)`, и у закрытой
+    строки `started_at` есть всегда.
+    """
+    run_id = repo.start_run()
+    repo._connection.execute(  # noqa: SLF001 — «начат давно» публичным API не поставить
+        "UPDATE run SET started_at = ? WHERE id = ?",
+        (to_utc_iso(datetime(2020, 1, 1, tzinfo=UTC)), run_id),
+    )
+    repo._connection.commit()  # noqa: SLF001 — та же подготовка состояния
+    assert repo.close_abandoned_runs() == 1
+
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    assert repo.count_runs_before(cutoff) == 1
+    assert repo.forget_runs(cutoff) == 1
+
+
+def test_forget_runs_never_deletes_a_running_row(repo: SqliteRepository) -> None:
+    """I2: `running` не удаляется никогда, сколько бы ни было её `started_at`.
+
+    Живой прогон обязан пережить уборку, даже если формально «стар» по
+    дате старта: граница по `COALESCE(finished_at, started_at)` без
+    отдельной защиты `status != 'running'` удалила бы идущий прогон,
+    длящийся дольше срока хранения журнала.
+    """
+    run_id = repo.start_run()
+    repo._connection.execute(  # noqa: SLF001 — «начат давно» публичным API не поставить
+        "UPDATE run SET started_at = ? WHERE id = ?",
+        (to_utc_iso(datetime(2020, 1, 1, tzinfo=UTC)), run_id),
+    )
+    repo._connection.commit()  # noqa: SLF001 — та же подготовка состояния
+
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    assert repo.count_runs_before(cutoff) == 0
+    assert repo.forget_runs(cutoff) == 0
+
+    remaining = repo._connection.execute("SELECT id FROM run").fetchall()  # noqa: SLF001
+    assert {int(row["id"]) for row in remaining} == {run_id}
 
 
 def test_descriptions_before_counts_bytes_not_characters(repo: SqliteRepository) -> None:
@@ -2563,6 +2630,80 @@ def test_descriptions_before_counts_bytes_not_characters(repo: SqliteRepository)
     cutoff = datetime(2026, 5, 1, tzinfo=UTC)
     rows, size = repo.descriptions_before(cutoff)
     assert (rows, size) == (1, 6)
+
+
+# --- I3: любое НЕ-ISO значение в колонке границы не считается «старым» -----
+#
+# В SQLite типы сортируются `NULL < INTEGER/REAL < TEXT < BLOB`, поэтому
+# любое число в текстовой колонке меньше любой ISO-строки независимо от
+# значения, а укороченный или пустой текст лексикографически меньше полной
+# даты («0», «2026», «» — все меньше «2026-05-...»). Без защиты `reported_at
+# < ?` / `finished_at < ?` считает такую строку «старше границы» и обнуляет
+# или удаляет её молча — в необратимом месте хранилища.
+CORRUPT_BOUNDARY_VALUES: tuple[object, ...] = (
+    b"\xff\xfe not utf8",
+    "не-дата",
+    "2026-13-45T99:99",
+    "",
+    "0",
+    "2026",
+    "  ",
+    0,
+    17,
+)
+
+
+@pytest.mark.parametrize("corrupt_value", CORRUPT_BOUNDARY_VALUES)
+def test_forget_descriptions_ignores_corrupt_reported_at(
+    repo: SqliteRepository, corrupt_value: object
+) -> None:
+    """I3: порченый `reported_at` не считается «старым» ни в каком виде.
+
+    Ни одна из девяти форм порчи не имеет права дать `forget_descriptions`
+    обнулить описание: строка либо переживёт следующую уборку с валидной
+    датой, либо останется уликой для человека — но не исчезнет молча.
+    """
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["1"])
+    repo._connection.execute(  # noqa: SLF001 — порча ровно той формы, что бывает на диске
+        "UPDATE vacancy SET reported_at = ? WHERE id = ?", (corrupt_value, "1")
+    )
+    repo._connection.commit()  # noqa: SLF001 — та же подготовка состояния
+
+    cutoff = datetime(2026, 5, 1, tzinfo=UTC)
+    assert repo.descriptions_before(cutoff) == (0, 0)
+    assert repo.forget_descriptions(cutoff) == 0
+    remaining = repo._connection.execute(  # noqa: SLF001 — проверка, что описание цело
+        "SELECT description FROM vacancy WHERE id = ?", ("1",)
+    ).fetchone()
+    assert remaining["description"] == "Yocto"
+
+
+@pytest.mark.parametrize("corrupt_value", CORRUPT_BOUNDARY_VALUES)
+def test_forget_runs_ignores_corrupt_finished_at(
+    repo: SqliteRepository, corrupt_value: object
+) -> None:
+    """I3: порченый `finished_at` не считается «старым» ни в каком виде.
+
+    Для `run` цена промаха выше, чем для `vacancy`: строка не обнуляется, а
+    удаляется, и испорченный `finished_at` сам по себе улика — терять её
+    вместе со строкой значит стирать след того самого отказа, ради которого
+    журнал ведётся.
+    """
+    run_id = repo.start_run()
+    repo.finish_run(run_id, "ok", finished_at=datetime(2020, 1, 1, tzinfo=UTC))
+    repo._connection.execute(  # noqa: SLF001 — порча ровно той формы, что бывает на диске
+        "UPDATE run SET finished_at = ? WHERE id = ?", (corrupt_value, run_id)
+    )
+    repo._connection.commit()  # noqa: SLF001 — та же подготовка состояния
+
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    assert repo.count_runs_before(cutoff) == 0
+    assert repo.forget_runs(cutoff) == 0
+
+    remaining = repo._connection.execute("SELECT id FROM run").fetchall()  # noqa: SLF001
+    assert {int(row["id"]) for row in remaining} == {run_id}
 
 
 def test_vacuum_shrinks_the_file_after_descriptions_are_cleared(tmp_path: Path) -> None:

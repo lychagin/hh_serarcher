@@ -15,6 +15,30 @@ from datetime import datetime
 from hh_search.storage.base import STATUS_REPORTED
 from hh_search.storage.time_utils import to_utc_iso
 
+# Форма, в которой `to_utc_iso`/`now_iso` всегда пишут дату: ISO-8601 с
+# обязательными секундами и разделителем `T` (Python `isoformat()` на aware
+# datetime). Не эвристика, а точное описание того, что кладёт сюда сам
+# проект — GLOB (в отличие от LIKE) регистрозависим и не путает `_`/`%` с
+# обычными символами, поэтому шаблон надёжно ловит нужную длину и разряды.
+_ISO_SHAPE_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*"
+
+
+def _is_valid_iso(column_sql: str) -> str:
+    """SQL-условие: значение похоже на ISO-дату И SQLite умеет её разобрать.
+
+    Без этой защиты `column < ?` в SQLite ломается на порядке типов: типы
+    сортируются `NULL < INTEGER/REAL < TEXT < BLOB`, поэтому любое ЧИСЛО в
+    текстовой колонке меньше любой ISO-строки независимо от значения — тот
+    же класс дыры, что чинит `CAST(... AS INTEGER)` у `enrich_attempts` в
+    `repository.py`. Для дат `CAST` не спасает (SQLite не умеет привести
+    произвольный текст к дате), поэтому форма проверяется `GLOB`'ом — он же
+    отсекает пустые и укороченные строки («0», «2026», «» — все
+    лексикографически МЕНЬШЕ полной даты и без защиты считались бы
+    «старыми»), — а диапазоны (месяц 1–12, час 0–23 и т. д.) проверяет
+    встроенный `datetime()`, возвращающий NULL на некорректном значении.
+    """
+    return f"{column_sql} GLOB '{_ISO_SHAPE_GLOB}' AND datetime({column_sql}) IS NOT NULL"
+
 
 class Retention:
     """Уборка старых данных. Ручная: демон эти методы не зовёт."""
@@ -32,7 +56,8 @@ class Retention:
         """
         row = self._connection.execute(
             "SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(CAST(description AS BLOB))), 0) AS size "
-            "FROM vacancy WHERE status = ? AND description IS NOT NULL AND reported_at < ?",
+            "FROM vacancy WHERE status = ? AND description IS NOT NULL "
+            f"AND {_is_valid_iso('reported_at')} AND reported_at < ?",
             (STATUS_REPORTED, to_utc_iso(cutoff)),
         ).fetchone()
         return (int(row["rows"]), int(row["size"])) if row else (0, 0)
@@ -40,15 +65,18 @@ class Retention:
     def forget_descriptions(self, cutoff: datetime) -> int:
         """Обнулить описания отправленных вакансий старше границы.
 
-        Три условия, и каждое несёт свой инвариант. `status='reported'` —
+        Условия, и каждое несёт свой инвариант. `status='reported'` —
         очередь обогащения отбирает `status='new' AND description IS
         NULL`, и обнули мы описание у `new`, вакансия ушла бы в сеть за
         уже скачанной страницей. `description IS NOT NULL` — делает метод
         идемпотентным: повторный вызов вернёт 0, а не число уже пустых
-        строк. `reported_at < ?` — строки с пустым `reported_at` не
-        попадают под сравнение с NULL и остаются целы, что верно: дату
-        отправки ставит `mark_reported`, и её отсутствие означает
-        состояние, которого уборка не понимает.
+        строк. `_is_valid_iso(...)` — испорченный `reported_at` (число,
+        пустая строка, обрывок даты — см. докстринг функции) не считается
+        «старым»: строка остаётся уликой, а не тихой потерей. `reported_at
+        < ?` — строки с пустым `reported_at` не попадают под сравнение с
+        NULL и остаются целы, что верно: дату отправки ставит
+        `mark_reported`, и её отсутствие означает состояние, которого
+        уборка не понимает.
 
         Строка остаётся на месте. Она и есть дедупликация: удалённая
         вакансия была бы найдена заново, скачана ещё раз и повторно
@@ -56,31 +84,55 @@ class Retention:
         """
         cursor = self._connection.execute(
             "UPDATE vacancy SET description = NULL "
-            "WHERE status = ? AND description IS NOT NULL AND reported_at < ?",
+            "WHERE status = ? AND description IS NOT NULL "
+            f"AND {_is_valid_iso('reported_at')} AND reported_at < ?",
             (STATUS_REPORTED, to_utc_iso(cutoff)),
         )
         self._connection.commit()
         return cursor.rowcount
 
+    # Граница журнала — `COALESCE(finished_at, started_at)`, а не голый
+    # `finished_at`. `close_abandoned_runs()` переводит зависшую строку в
+    # `interrupted`, но сознательно НЕ проставляет `finished_at` — время
+    # смерти неизвестно, и выдумывать его значило бы соврать (см. докстринг
+    # самого `close_abandoned_runs`). С голым `finished_at` это делало
+    # обещание спеки «365 дней» ложным: строка `interrupted` НИКОГДА не
+    # получала `finished_at`, то есть никогда не попадала под `< cutoff`, и
+    # кладбище росло вечно. `started_at` у такой строки есть всегда — он и
+    # служит запасной датой для уже закрытых строк.
+    #
+    # `status != 'running'` — отдельная защита ЖИВОЙ строки, а не даты.
+    # Голого `started_at` недостаточно: прогон, идущий часами (или просто
+    # начатый до того, как истёк срок хранения журнала), обязан остаться
+    # нетронутым, даже если граница по дате старта у него «старая». Уборка
+    # берёт тот же замок `single_run`, что и прогон (§3.2 спеки
+    # 2026-08-01), поэтому строка `running`, увиденная здесь, — это либо
+    # текущий прогон, либо ещё не закрытый `close_abandoned_runs()`; в
+    # обоих случаях удалять её раньше — тот же Critical, ради
+    # недостижимости которого написана эта защита.
+    _RUN_BOUNDARY_SQL = "COALESCE(finished_at, started_at)"
+
     def count_runs_before(self, cutoff: datetime) -> int:
-        """Сколько ЗАКРЫТЫХ строк журнала старше границы."""
+        """Сколько строк журнала, кроме идущего прогона, старше границы."""
         row = self._connection.execute(
-            "SELECT COUNT(*) AS rows FROM run WHERE finished_at IS NOT NULL AND finished_at < ?",
+            "SELECT COUNT(*) AS rows FROM run WHERE status != 'running' "
+            f"AND {_is_valid_iso(self._RUN_BOUNDARY_SQL)} AND {self._RUN_BOUNDARY_SQL} < ?",
             (to_utc_iso(cutoff),),
         ).fetchone()
         return int(row["rows"]) if row else 0
 
     def forget_runs(self, cutoff: datetime) -> int:
-        """Удалить закрытые строки журнала старше границы.
+        """Удалить строки журнала, кроме идущего прогона, старше границы.
 
-        По `finished_at`, а не по `started_at`: незакрытая строка
-        (`running`, оставшаяся от убитого процесса) даты завершения не
-        имеет, и удалять её по дате старта значило бы стирать улику ровно
-        того отказа, ради которого журнал ведётся. Такие строки закрывает
-        `close_abandoned_runs()`, и удалит их следующая уборка.
+        Приём и обоснование границы — в комментарии над
+        `_RUN_BOUNDARY_SQL`; `_is_valid_iso(...)` защищает от той же
+        порчи типов и укороченных дат, что и `forget_descriptions`, — для
+        `run` цена промаха выше: строка не обнуляется, а удаляется, и
+        испорченный `finished_at` сам по себе улика.
         """
         cursor = self._connection.execute(
-            "DELETE FROM run WHERE finished_at IS NOT NULL AND finished_at < ?",
+            "DELETE FROM run WHERE status != 'running' "
+            f"AND {_is_valid_iso(self._RUN_BOUNDARY_SQL)} AND {self._RUN_BOUNDARY_SQL} < ?",
             (to_utc_iso(cutoff),),
         )
         self._connection.commit()
