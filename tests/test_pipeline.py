@@ -2099,6 +2099,34 @@ def test_a_listing_that_is_not_ours_is_never_retried(
     assert listing.call_count == 1
 
 
+@respx.mock
+def test_retried_listing_saves_the_validator_of_the_rescuing_response_not_the_degenerate_one(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """После повтора в кэш идёт ETag ответа, который РАЗОБРАЛСЯ, а не первого.
+
+    `_parse_with_retry` возвращает пару `(vacancies, final)` именно ради
+    этого: если бы `store_page` взял заголовки исходного `response` вместо
+    `final`, кэш запомнил бы ETag вырожденного ответа. Следующий прогон
+    отправил бы его в `If-None-Match`, получил бы `304` с пустым телом — и
+    страница замолчала бы навсегда, потому что статус остался бы `ok`
+    (третья ветка `_check_not_silent` намеренно не поднимает тревогу на
+    пустой, но осмысленный ответ 304).
+    """
+    mock_robots()
+    respx.get(url__startswith=LISTING_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=listing_without_item_list(), headers={"ETag": '"degenerate"'}),
+            httpx.Response(200, text=TWO_VACANCIES, headers={"ETag": '"good"'}),
+        ]
+    )
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+
+    run(config, repo, [RecordingSink()])
+
+    assert repo.cache_headers(LISTING_URL) == {"If-None-Match": '"good"'}
+
+
 # --- R-3 fix-loop: сводка DegenerateDigest сверяется с реальным прогоном ---
 
 

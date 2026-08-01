@@ -488,7 +488,12 @@ def report_command(ctx: typer.Context, since: Since = "7d") -> None:
     if match is None:
         _die(f"--since ожидает число дней (7 или 7d), получено {since!r}", EXIT_CONFIG)
     sinks = _sinks(config)
-    cutoff = datetime.now(UTC) - timedelta(days=int(match.group(1)))
+    # Одно значение на всю команду, а не три раздельных `datetime.now(UTC)`:
+    # на границе суток горизонт, окно довозки и файл дня иначе могли бы
+    # разъехаться на календарный день. `pipeline/reporting.py` держит тот
+    # же приём под именем `moment`.
+    moment = datetime.now(UTC)
+    cutoff = moment - timedelta(days=int(match.group(1)))
     horizon_day = horizon(_state_dir(config))
     if horizon_day is not None and cutoff.date() < horizon_day:
         # Тихая потеря иначе: выборки отчёта фильтруют по
@@ -540,8 +545,8 @@ def report_command(ctx: typer.Context, since: Since = "7d") -> None:
             # в этой же ситуации отдаёт внятный текст и ненулевой код. По
             # выводу `report` человек решает, чинить ему конфиг или том, —
             # двух разных ответов на один отказ у CLI быть не должно.
-            maintain_sinks(sinks, datetime.now(UTC))
-            written, failed = emit_to_sinks(sinks, vacancies, datetime.now(UTC))
+            maintain_sinks(sinks, moment)
+            written, failed = emit_to_sinks(sinks, vacancies, moment)
     except RunInProgress as error:
         _die(f"{error}. Отчёт пишется в тот же файл дня, поэтому ждём", EXIT_FAILED)
     if failed:

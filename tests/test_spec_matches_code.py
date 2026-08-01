@@ -556,7 +556,8 @@ def test_readme_recipe_for_a_repeat_delivery_matches_the_real_lookback_window() 
     `test_removing_the_day_files_brings_the_full_delivery_back`
     (`tests/test_telegram_sink.py`).
     """
-    from hh_search.sinks.telegram_sink import _SENT_SUFFIX, LOOKBACK_DAYS
+    from hh_search.sinks.base import LOOKBACK_DAYS
+    from hh_search.sinks.telegram_sink import _SENT_SUFFIX
 
     section = readme_section("## Отчёт в Telegram", "## Разработка")
     assert "LOOKBACK_DAYS" in section

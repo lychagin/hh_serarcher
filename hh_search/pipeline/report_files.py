@@ -14,7 +14,7 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from hh_search.sinks.telegram_sink import LOOKBACK_DAYS
+from hh_search.sinks.base import LOOKBACK_DAYS
 
 logger = logging.getLogger(__name__)
 

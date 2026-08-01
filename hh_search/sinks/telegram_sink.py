@@ -17,27 +17,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from hh_search.domain.models import ScoredVacancy
+from hh_search.sinks.base import LOOKBACK_DAYS
 from hh_search.sinks.html_report import VACANCY_HREF_RE, document_header, render_section
 from hh_search.sinks.telegram_client import TelegramClient
 from hh_search.sinks.telegram_message import render_message
-
-# Сколько СУТОК назад читать файлы отчёта ради дедупликации, помимо
-# сегодняшнего (спека §5, item 3). Одних вчерашних было мало: отказ
-# `send_document` вечером 29-го и повторный отказ ДОВОЗКИ (item 1) утром
-# 30-го оставляют вакансию непомеченной ещё одни сутки, и прогон 31-го,
-# заглянув только на день назад (в пустой файл 30-го — довозка ничего не
-# пишет), не находит её нигде и повторяет вечернее сообщение дословно.
-# Двух суток достаточно ровно для этого сценария: прогон 31-го видит файлы
-# 30-го И 29-го.
-#
-# Шире — не значит безопаснее. `mark <id> new` возвращает вакансию в
-# очередь, обнулив счётчик попыток, и если её ссылка совпадёт с файлом
-# ПЯТИДНЕВНОЙ давности, широкое окно молча проглотит вручную возвращённую
-# вакансию — находка ревью, которую сторожит
-# `test_vacancy_outside_the_lookback_window_is_not_suppressed`. Окно
-# намеренно узкое: ровно столько, сколько нужно для воспроизведённого
-# сценария, и ни днём больше.
-LOOKBACK_DAYS = 2
 
 # Шаблон черновиков, которые эмиттер мог оставить сам: тот же суффикс, что
 # и у `tempfile.mkstemp(..., suffix=".part")` в `_draft`, плюс общий для

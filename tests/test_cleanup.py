@@ -18,7 +18,7 @@ from hh_search.pipeline.cleanup import (
     horizon,
     plan,
 )
-from hh_search.sinks.telegram_sink import LOOKBACK_DAYS
+from hh_search.sinks.base import LOOKBACK_DAYS
 from hh_search.storage.repository import SqliteRepository
 from hh_search.storage.time_utils import to_utc_iso
 
@@ -652,6 +652,17 @@ def test_a_future_horizon_on_disk_does_not_block_an_honest_write(tmp_path: Path)
     запись никогда её не перекроет. Цена — не потеря данных, а потеря
     сигнала: `report --since` предупреждало бы ПОСТОЯННО, что и на любую
     границу, — то же обесценивание, что чинит R-3 для `partial`.
+
+    Дата порчи выражена через сам допуск `HORIZON_CLOCK_SKEW_TOLERANCE`, а
+    не оторванной от него календарной датой. Прежняя редакция писала на
+    диск фиксированный `2099-01-01` (~73 года от `NOW`), и мутационный
+    харнесс поймал дыру: `HORIZON_CLOCK_SKEW_TOLERANCE = timedelta(days=3650)`
+    (раздутый в 3650 раз, ~10 лет) оставлял тест зелёным, потому что 73
+    года легко проглатывают и десятилетний допуск — тест на самом деле не
+    про допуск, а про «когда-нибудь очень нескоро». Сторож ниже проверяет
+    ОТНОШЕНИЕ: допуск обязан оставаться заметно меньше запаса `margin`,
+    иначе следующая строка падает раньше, чем дело дойдёт до `execute()`,
+    и раздувание допуска красит тест немедленно, а не тонет в фикстуре.
     """
     db = tmp_path / "hh.db"
     repo = SqliteRepository(db)
@@ -660,11 +671,16 @@ def test_a_future_horizon_on_disk_does_not_block_an_honest_write(tmp_path: Path)
     reports.mkdir()
     state = tmp_path / "state"
     state.mkdir()
-    (state / HORIZON_FILE).write_text("2099-01-01\n", encoding="utf-8")
+    margin = timedelta(days=30)
+    assert HORIZON_CLOCK_SKEW_TOLERANCE < margin, (
+        "допуск разъелся до размера запаса порчи — фикстура ниже больше не порча"
+    )
+    corrupt = NOW.date() + HORIZON_CLOCK_SKEW_TOLERANCE + margin
+    (state / HORIZON_FILE).write_text(f"{corrupt:%Y-%m-%d}\n", encoding="utf-8")
 
     execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
 
-    assert horizon(state) == date(2026, 5, 3)  # не застрял на 2099-01-01
+    assert horizon(state) == date(2026, 5, 3)  # не застрял на дате порчи
 
 
 def test_horizon_equal_to_today_is_trusted_and_not_rolled_back(tmp_path: Path) -> None:
