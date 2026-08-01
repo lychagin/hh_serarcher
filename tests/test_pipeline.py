@@ -2097,3 +2097,99 @@ def test_a_listing_that_is_not_ours_is_never_retried(
     run(config, repo, [RecordingSink()])
 
     assert listing.call_count == 1
+
+
+# --- R-3 fix-loop: сводка DegenerateDigest сверяется с реальным прогоном ---
+
+
+@respx.mock
+def test_degenerate_digest_reports_the_real_ratio_when_only_some_pages_needed_a_retry(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Рядовая помеха: одна страница из двух пришла без ItemList, повтор её спас.
+
+    Мутационный харнесс нашёл дыру: сама сводка `DegenerateDigest` не была
+    проверена ничем, кроме отсутствия исключения, — мутация `digest.rescued
+    += 1` (удалить строку) не красила ни одного теста. Здесь прогон гонится
+    целиком через `run()`, а не через прямой вызов `log_summary()`: числа в
+    тексте обязаны совпасть с тем, что реально произошло на двух листингах.
+    """
+    two_listings = """
+queries:
+  - slug: programmist
+    cluster: embedded
+    weight: 9
+    pages: 1
+  - slug: devops
+    cluster: backend
+    weight: 3
+    pages: 1
+"""
+    config = load_config(write_config(tmp_path, **{"queries.yaml": two_listings}))
+    repository = SqliteRepository(":memory:")
+    repository.init_schema()
+    mock_robots()
+    respx.get(LISTING_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=listing_without_item_list()),
+            httpx.Response(200, text=listing_html(("111", "Senior Embedded Engineer"))),
+        ]
+    )
+    respx.get("https://hh.ru/vacancies/devops").mock(
+        return_value=httpx.Response(
+            200, text=listing_html(("222", "Senior DevOps Engineer"), slug="devops")
+        )
+    )
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+
+    with caplog.at_level(logging.INFO, logger="hh_search.pipeline.listing_pages"):
+        stats = run(config, repository, [RecordingSink()])
+
+    assert (stats.status, stats.discovered) == ("ok", 2)
+    assert "страниц листингов без блока ItemList: 1 из 2, повтор спас 1" in caplog.text
+
+
+@respx.mock
+def test_degenerate_digest_warns_loudly_when_every_fetched_page_needed_a_retry(
+    tmp_path: Path, repo: SqliteRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Дрейф разметки выглядит иначе: вырожденной приходит КАЖДАЯ отданная страница.
+
+    Ветка `digest.degenerate == digest.pages` печатает отдельный, более
+    громкий текст на `WARNING`, а не на `INFO` — и он тоже обязан сверяться
+    с реальными числами прогона, а не молчать при мутации любого из трёх
+    счётчиков `DegenerateDigest`.
+    """
+    two_pages = load_config(
+        write_config(tmp_path, **{"queries.yaml": ONE_PAGE.replace("pages: 1", "pages: 2")})
+    )
+    mock_robots()
+    # `respx.get(url)` без явного `params=` не сужает запрос по query-строке
+    # (проверено этим же тестом на StopIteration: маршрут для голого пути
+    # молча подобрал и `?page=1`), поэтому первая и вторая страница листинга
+    # различаются вручную — по полному URL запроса, а не по маршруту respx.
+    seen_urls: dict[str, int] = {}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen_urls[url] = seen_urls.get(url, 0) + 1
+        if seen_urls[url] == 1:
+            return httpx.Response(200, text=listing_without_item_list())
+        rescued = (
+            listing_html(("111", "Senior Embedded Engineer"))
+            if url == LISTING_URL
+            else listing_html(("222", "Middle Python Developer"))
+        )
+        return httpx.Response(200, text=rescued)
+
+    respx.get(url__startswith=LISTING_URL).mock(side_effect=answer)
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+
+    with caplog.at_level(logging.WARNING, logger="hh_search.pipeline.listing_pages"):
+        stats = run(two_pages, repo, [RecordingSink()])
+
+    assert (stats.status, stats.discovered) == ("ok", 2)
+    assert (
+        "все 2 отданных страниц листингов пришли без блока ItemList, повтор спас 2: "
+        "это уже не рядовая помеха источника, а похоже на смену разметки"
+    ) in caplog.text
