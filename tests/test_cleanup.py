@@ -1,5 +1,6 @@
 """Уборка: план, исполнение и то, чего она не трогает никогда."""
 
+import os
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -7,8 +8,10 @@ import pytest
 
 from hh_search.domain.models import DiscoveredVacancy, Salary, ScoreBreakdown, VacancyDetails
 from hh_search.pipeline.cleanup import (
+    HORIZON_FILE,
     PROTECTED_DAYS,
     CleanupDays,
+    CleanupPlan,
     execute,
     horizon,
     plan,
@@ -309,17 +312,24 @@ def test_protected_window_is_computed_from_the_now_argument_not_the_system_clock
 ) -> None:
     """Защищённое окно отсчитывается от `now`-аргумента, а не от системных часов.
 
-    `now` теста (2030-06-15) заведомо не совпадает с реальной датой машины.
-    Файл датирован РЕАЛЬНЫМ сегодня — если бы граница защищённого окна
+    `now` теста заведомо не совпадает с реальной датой машины. Файл
+    датирован РЕАЛЬНЫМ сегодня — если бы граница защищённого окна
     считалась от `date.today()`, а не от переданного `now`, такой файл
-    остался бы защищён на годы дольше, чем обещает контракт, и тест,
-    зафиксировавший обе даты числом, был бы зелён сегодня и красен через
-    сутки. Здесь `date.today()` взят из настоящих часов исполнения, а не
-    захардкожен, поэтому сторож остаётся honest на любую дату запуска.
+    остался бы защищён на годы дольше, чем обещает контракт.
+
+    M-4 (ревью Task 4, раунд 1): прежняя редакция хардкодила ОБЕ даты
+    (`2030-06-15` и «сегодня» неявно, через `date.today()`) — приём с
+    `date.today()` был правильным, но вторая дата обязана ехать ЗА первой,
+    а не стоять числом: как только реальные часы дошли бы до
+    `2030-06-12` (окно защиты трое суток до `2030-06-15`), тест начал бы
+    краснеть от календаря, а не от кода — тот самый класс отказа, который
+    и проверяет этот тест. `future_now` теперь считается смещением от
+    `date.today()`, а не абсолютной датой, поэтому не протухает никогда.
     """
     reports = tmp_path / "reports"
     reports.mkdir()
-    future_now = datetime(2030, 6, 15, 10, 0, tzinfo=UTC)
+    far_future = date.today() + timedelta(days=3650)
+    future_now = datetime(far_future.year, far_future.month, far_future.day, 10, 0, tzinfo=UTC)
     near_real_today = report_file(reports, date.today())
     db = tmp_path / "hh.db"
     repo = SqliteRepository(db)
@@ -356,3 +366,344 @@ def test_report_file_exactly_at_the_reports_cutoff_is_kept(tmp_path: Path) -> No
 
     assert at_cutoff.exists()
     assert not one_day_older.exists()
+
+
+# --- Раунд починки 1 (ревью Task 4): I-1..I-5, M-1 -------------------------
+
+
+def _prepare_pending_cleanup(tmp_path: Path) -> tuple[SqliteRepository, Path, Path]:
+    """Старый файл отчёта и старая отправленная вакансия — общая заготовка
+    для сторожей записи горизонта (F2/F5/K2): то, что уборка обязана
+    сделать ДО попытки записать горизонт, и что не должно теряться, если
+    сама запись не удастся.
+    """
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    old = report_file(reports, date(2020, 1, 1))
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["1"])
+    _backdate_reported_at(repo, datetime(2020, 1, 1, tzinfo=UTC), "1")
+    return repo, reports, old
+
+
+def _assert_destructive_steps_survived_horizon_failure(
+    repo: SqliteRepository, old: Path, result: CleanupPlan
+) -> None:
+    """Файлы убраны, описание обнулено, VACUUM прошёл — несмотря на то, что
+    записать горизонт не удалось. Отказ назван словами в `result.errors`."""
+    assert not old.exists()
+    assert repo.descriptions_before(NOW) == (0, 0)
+    assert result.errors
+
+
+# --- I-1: недоступный каталог отчётов не роняет уборку целиком -------------
+
+
+def test_execute_survives_an_unreadable_reports_dir(tmp_path: Path) -> None:
+    """I-1: каталог отчётов без прав доступа не должен ронять уборку целиком.
+
+    Прецедент в этом же проекте: `TelegramSink._sweep_orphaned_drafts`
+    глушит `OSError` ровно ради каталога `0o500` — «недоступный на запись
+    каталог отчётов не имеет права ронять `maintain`». Уборка обязана
+    вести себя так же: убрать базу и назвать отказ файлов словами, а не
+    упасть трейсбеком.
+    """
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    report_file(reports, date(2020, 1, 1))
+    reports.chmod(0o000)
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["1"])
+    _backdate_reported_at(repo, datetime(2020, 1, 1, tzinfo=UTC), "1")
+    state = tmp_path / "state"
+
+    try:
+        result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+    finally:
+        reports.chmod(0o755)  # иначе pytest не уберёт tmp_path следом
+
+    assert result.report_files == 0
+    assert result.errors
+    assert result.descriptions == 1  # база убрана, несмотря на недоступные файлы
+    assert horizon(state) is not None  # горизонт тоже не заблокирован отказом файлов
+
+
+def test_plan_and_execute_survive_reports_dir_being_a_plain_file(tmp_path: Path) -> None:
+    """I-1 (вторая форма): `reports_dir` — файл, а не каталог.
+
+    `NotADirectoryError` из `iterdir()` не зависит от прав доступа и от
+    того, кем запущен процесс (в отличие от `chmod 0o000`, который root
+    игнорирует), поэтому проверяет тот же класс отказа надёжнее.
+    """
+    reports = tmp_path / "reports"
+    reports.write_text("не каталог", encoding="utf-8")
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+
+    plan_result = plan(repo, reports, NOW, CleanupDays(reports=90))
+    assert plan_result.report_files == 0
+    assert plan_result.errors
+
+    state = tmp_path / "state"
+    exec_result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+    assert exec_result.report_files == 0
+    assert exec_result.errors
+
+
+# --- I-2: гонка между iterdir() и stat()/unlink() ---------------------------
+
+
+def test_execute_survives_a_file_vanishing_between_listing_and_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (C1): жертва исчезает между `iterdir()` и `stat()`/`unlink()`.
+
+    Гонка с внешним удалением, ротацией или синхронизацией тома. Уборка
+    обязана пропустить пропавший файл и довести дело до конца — удалить
+    оставшихся жертв, убрать базу, записать горизонт, — а не упасть
+    посередине списка.
+
+    Первый `stat()` пути `doomed` — тот, что делает `is_file()` внутри
+    отбора жертв, — обязан пройти как обычно: иначе файл выпал бы из
+    списка жертв ДО гонки и тест проверял бы не ту дыру. Гонка
+    имитируется на ВТОРОМ обращении — том самом, что раньше стояло
+    снаружи `try`.
+    """
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    doomed = report_file(reports, date(2020, 1, 1))
+    survivor = report_file(reports, date(2020, 1, 2))
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    state = tmp_path / "state"
+
+    real_stat = Path.stat
+    seen = {"count": 0}
+
+    def flaky_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == doomed:
+            seen["count"] += 1
+            if seen["count"] > 1:
+                doomed.unlink(missing_ok=True)
+                raise FileNotFoundError(doomed)
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+
+    assert not survivor.exists()
+    assert result.report_files == 1
+    assert result.errors
+    assert horizon(state) is not None
+
+
+def test_plan_survives_a_file_vanishing_before_its_size_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (C2): та же гонка в сухом прогоне.
+
+    Предпросмотр необратимой команды не имеет права падать сильнее самой
+    команды — иначе `plan()` менее надёжен, чем `--apply`, и предпросмотр
+    перестаёт быть предпросмотром именно тогда, когда нужнее всего.
+    """
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    doomed = report_file(reports, date(2020, 1, 1))
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+
+    real_stat = Path.stat
+    seen = {"count": 0}
+
+    def flaky_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == doomed:
+            seen["count"] += 1
+            if seen["count"] > 1:
+                doomed.unlink(missing_ok=True)
+                raise FileNotFoundError(doomed)
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    result = plan(repo, reports, NOW, CleanupDays(reports=90))
+
+    assert result.report_files == 1
+    assert result.errors
+
+
+# --- I-3: запись горизонта после точки невозврата не защищена --------------
+
+
+def test_horizon_write_failure_is_reported_not_raised_when_state_parent_is_read_only(
+    tmp_path: Path,
+) -> None:
+    """F5: каталог-родитель состояния недоступен на запись.
+
+    Горизонт не записывается, но остальная уборка (файлы, описания,
+    VACUUM) уже случилась и не теряется. Писатель горизонта раньше не
+    ловил ничего, хотя стоит ПОСЛЕ точки невозврата: человек видел
+    трейсбек, не зная, случилась ли уборка вообще.
+    """
+    repo, reports, old = _prepare_pending_cleanup(tmp_path)
+    state_parent = tmp_path / "readonly"
+    state_parent.mkdir()
+    state = state_parent / "state"
+    state_parent.chmod(0o500)
+    try:
+        result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+    finally:
+        state_parent.chmod(0o700)  # иначе pytest не уберёт tmp_path следом
+
+    _assert_destructive_steps_survived_horizon_failure(repo, old, result)
+    assert horizon(state) is None
+
+
+def test_horizon_write_failure_is_reported_not_raised_when_last_cleanup_is_a_directory(
+    tmp_path: Path,
+) -> None:
+    """F2: `state/last-cleanup` оказался каталогом.
+
+    `write_text` на пути, который уже существует как каталог, поднимает
+    `IsADirectoryError` — уже удалённый файл отчёта от этого не
+    возвращается, и исключение не имеет права уйти наружу.
+    """
+    repo, reports, old = _prepare_pending_cleanup(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / HORIZON_FILE).mkdir()
+
+    result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+
+    _assert_destructive_steps_survived_horizon_failure(repo, old, result)
+
+
+def test_horizon_write_failure_is_reported_not_raised_when_state_dir_is_a_file(
+    tmp_path: Path,
+) -> None:
+    """K2: `state_dir` сам оказался файлом, а не каталогом.
+
+    `mkdir(parents=True, exist_ok=True)` всё равно поднимает
+    `FileExistsError`, когда по этому пути уже лежит файл, — `exist_ok`
+    прощает существующий КАТАЛОГ, не любой существующий узел.
+    """
+    repo, reports, old = _prepare_pending_cleanup(tmp_path)
+    state = tmp_path / "state"
+    state.write_text("не каталог", encoding="utf-8")
+
+    result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+
+    _assert_destructive_steps_survived_horizon_failure(repo, old, result)
+
+
+# --- I-4: горизонт обязан быть монотонным -----------------------------------
+
+
+def test_horizon_never_moves_backward(tmp_path: Path) -> None:
+    """K7: горизонт двигается только вперёд, `max(старое, новое)`.
+
+    Уборка с `descriptions=30` пишет горизонт `2026-07-02`; следующая
+    уборка с более мягким `descriptions=365` целится в `2025-08-01` —
+    дальше в прошлое. Без монотонности горизонт откатился бы назад и
+    отменил собственное обещание: файл утверждал бы «за 2025-08-01
+    описаний нет», хотя на самом деле их нет только за 2026-07-02, — и
+    `report --since 200d` показал бы неполную выборку как полную,
+    ничего не сказав об этом.
+    """
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    state = tmp_path / "state"
+
+    execute(repo, reports, state, NOW, CleanupDays(descriptions=30))
+    strict_horizon = horizon(state)
+    assert strict_horizon == date(2026, 7, 2)
+
+    execute(repo, reports, state, NOW, CleanupDays(descriptions=365))
+    assert horizon(state) == strict_horizon  # не откатился на 2025-08-01
+
+
+# --- I-5: горизонт пишется ПОСЛЕ уборки, не до ------------------------------
+
+
+def test_horizon_is_written_only_after_the_cleanup_it_promises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Мутация, которую этот тест обязан ловить: перенос записи горизонта в
+    начало `execute()`. Отказ `forget_descriptions` — то, что уборка
+    обещает горизонтом, — обязан остановить запись горизонта, иначе файл
+    начнёт утверждать то, чего на самом деле не произошло.
+    """
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    state = tmp_path / "state"
+
+    def boom(cutoff: datetime) -> int:
+        raise RuntimeError("бум")
+
+    monkeypatch.setattr(repo, "forget_descriptions", boom)
+
+    with pytest.raises(RuntimeError, match="бум"):
+        execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
+
+    assert horizon(state) is None
+
+
+# --- M-1: комментарий обещал больше, чем делает регулярка ------------------
+
+
+def test_a_human_file_that_happens_to_start_with_a_date_is_removed_too(tmp_path: Path) -> None:
+    """M-1: правило — форма имени, а не авторство.
+
+    Комментарий у `_REPORT_NAME_RE` раньше обещал, что уборка не трогает
+    «любые файлы человека». Файл человека, чьё имя само подпадает под
+    образец даты, удаляется наравне с отчётами — так вело себя и раньше
+    (поведение не менялось), протухла только формулировка комментария.
+    """
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    human_file = report_file(reports, date(2020, 1, 1), suffix="-мои-заметки.txt")
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    state = tmp_path / "state"
+
+    execute(repo, reports, state, NOW, CleanupDays(reports=90))
+
+    assert not human_file.exists()
+
+
+# --- Отказ, названный словами в возвращённом значении -----------------------
+
+
+def test_describe_names_the_errors_it_carries() -> None:
+    """Общее требование раунда: отказ обязан быть виден в том, что
+    возвращается наверх, а не только в логе — `describe()` печатает его
+    для человека, а будущий CLI переиспользует этот текст."""
+    result = CleanupPlan(
+        descriptions=0,
+        description_bytes=0,
+        runs=0,
+        report_files=0,
+        report_bytes=0,
+        descriptions_cutoff=NOW,
+        errors=("каталог отчётов /data/reports недоступен: [Errno 13] Permission denied",),
+    )
+    assert "ОШИБКА" in result.describe(applied=True)
+    assert "Permission denied" in result.describe(applied=True)

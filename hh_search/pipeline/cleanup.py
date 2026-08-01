@@ -1,33 +1,34 @@
 """Ручная уборка: план и исполнение (спека 2026-08-01 §3).
 
-Оркестровка и только она. SQL живёт в `storage/retention.py`, а знание о
-том, каких файлов отчётов касаться нельзя, взято из
-`sinks/telegram_sink.py` ИМПОРТОМ константы, а не переписанным числом:
-разъедься они — и уборка начала бы ломать довозку молча.
+Оркестровка и только она. SQL живёт в `storage/retention.py`, отбор
+файлов отчётов (форма имени, защищённое окно довозки) — в
+`report_files.py`, вынесенном оттуда же ради бюджета строк (ревью
+Task 4, раунд починки 1). `PROTECTED_DAYS` реэкспортируется отсюда: он
+часть публичного интерфейса этого модуля (см. `tests/test_cleanup.py`),
+хотя вычисляется в `report_files.py` — там же, где используется, рядом
+с `LOOKBACK_DAYS` из `sinks/telegram_sink.py`, импортом константы, а не
+переписанным числом: разъедься они — и уборка начала бы ломать довозку
+молча.
 """
 
 import logging
-import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from hh_search.sinks.telegram_sink import LOOKBACK_DAYS
+from hh_search.pipeline.report_files import PROTECTED_DAYS, total_bytes, victim_files
 from hh_search.storage.base import Housekeeper
 
+__all__ = [
+    "PROTECTED_DAYS",
+    "CleanupDays",
+    "CleanupPlan",
+    "execute",
+    "horizon",
+    "plan",
+]
+
 logger = logging.getLogger(__name__)
-
-# Имя файла отчёта начинается с даты: `2026-07-31-new.html`, `-new.csv`,
-# `-new.md`, плюс отметка о доставке `-new.html.sent`. Всё, что под
-# образец не подпадает, уборка не трогает — включая черновики `*.part`
-# (у них дата тоже впереди, но суффикс чужой) и любые файлы человека.
-_REPORT_NAME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-[^/]*(?<!\.part)$")
-
-# Сколько последних суток отчётов защищено в любом случае: окно довозки
-# плюс сегодня. Один день сверх необходимого взят намеренно — цена
-# лишнего файла на диске нулевая, цена удалённой отметки `.sent` —
-# повторный документ в канале.
-PROTECTED_DAYS = LOOKBACK_DAYS + 1
 
 HORIZON_FILE = "last-cleanup"
 
@@ -81,6 +82,13 @@ class CleanupPlan:
     report_files: int
     report_bytes: int
     descriptions_cutoff: datetime
+    # Причины, по которым часть уборки не удалась (недоступный каталог
+    # отчётов, гонка при удалении файла, отказ записи горизонта). Пустой
+    # кортеж — уборка прошла без сучка. Поле обязано жить В ВОЗВРАЩЁННОМ
+    # значении, а не только в логе (ревью Task 4, общее требование раунда
+    # 1): человек не имеет права остаться в неведении, случилась ли
+    # уборка целиком; текст переиспользует CLI будущей задачи.
+    errors: tuple[str, ...] = ()
 
     def describe(self, applied: bool) -> str:
         verb = "убрано" if applied else "будет убрано"
@@ -95,20 +103,24 @@ class CleanupPlan:
                 "база ужата (VACUUM). `report --since` за границу описаний "
                 "больше не покажет вакансий — предупреждение об этом печатает сам `report`"
             )
+        for error in self.errors:
+            lines.append(f"ОШИБКА: {error}")
         return "\n".join(lines)
 
 
 def plan(repo: Housekeeper, reports_dir: Path, now: datetime, days: CleanupDays) -> CleanupPlan:
     """Посчитать, ничего не меняя."""
-    victims = _victim_files(reports_dir, now, days)
+    victims, dir_errors = victim_files(reports_dir, now, days.reports)
+    report_bytes, size_errors = total_bytes(victims)
     rows, size = repo.descriptions_before(now - timedelta(days=days.descriptions))
     return CleanupPlan(
         descriptions=rows,
         description_bytes=size,
         runs=repo.count_runs_before(now - timedelta(days=days.runs)),
         report_files=len(victims),
-        report_bytes=sum(path.stat().st_size for path in victims),
+        report_bytes=report_bytes,
         descriptions_cutoff=now - timedelta(days=days.descriptions),
+        errors=(*dir_errors, *size_errors),
     )
 
 
@@ -120,17 +132,26 @@ def execute(
     Порядок: сначала файлы, потом база, потом `VACUUM`, потом горизонт.
     Горизонт последним потому, что он — обещание «за этой датой описаний
     нет», и записывать его до того, как они действительно убраны, значило
-    бы обещать за уборку, которая могла и не случиться.
+    бы обещать за уборку, которая могла и не случиться (сторож —
+    `test_horizon_is_written_only_after_the_cleanup_it_promises`).
+
+    Отказ любой части (каталог отчётов недоступен, файл исчез гонкой
+    между `iterdir()` и `unlink()`, горизонт не записался) не поднимается
+    исключением: уборка обязана довести остальное до конца и назвать
+    отказ словами в `CleanupPlan.errors`, а не оставить человека гадать,
+    случилась ли она хоть частично (ревью Task 4, I-1..I-3).
     """
-    victims = _victim_files(reports_dir, now, days)
+    victims, dir_errors = victim_files(reports_dir, now, days.reports)
     removed_bytes = 0
     removed = 0
+    file_errors: list[str] = []
     for path in victims:
-        size = path.stat().st_size
         try:
+            size = path.stat().st_size
             path.unlink()
         except OSError as error:
             logger.error("файл отчёта %s не удалён: %s", path, error)
+            file_errors.append(f"файл отчёта {path} не удалён: {error}")
             continue
         removed += 1
         removed_bytes += size
@@ -139,7 +160,8 @@ def execute(
     descriptions = repo.forget_descriptions(cutoff)
     runs = repo.forget_runs(now - timedelta(days=days.runs))
     repo.vacuum()
-    _write_horizon(state_dir, cutoff)
+    horizon_error = _write_horizon(state_dir, cutoff)
+    errors = (*dir_errors, *file_errors, *((horizon_error,) if horizon_error else ()))
     return CleanupPlan(
         descriptions=descriptions,
         description_bytes=size_before,
@@ -147,6 +169,7 @@ def execute(
         report_files=removed,
         report_bytes=removed_bytes,
         descriptions_cutoff=cutoff,
+        errors=errors,
     )
 
 
@@ -162,33 +185,28 @@ def horizon(state_dir: Path) -> date | None:
         return None
 
 
-def _write_horizon(state_dir: Path, cutoff: datetime) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / HORIZON_FILE).write_text(f"{cutoff:%Y-%m-%d}\n", encoding="utf-8")
+def _write_horizon(state_dir: Path, cutoff: datetime) -> str | None:
+    """Записать горизонт МОНОТОННО; отказ возвращается текстом, не исключением.
 
+    Монотонность — только вперёд, `max(старое, новое)` (ревью Task 4,
+    I-4): более мягкий срок хранения в следующем прогоне не имеет права
+    отменить обещание, данное более жёстким прогоном раньше, иначе «за
+    этой датой описаний нет» стало бы ложью задним числом.
 
-def _victim_files(reports_dir: Path, now: datetime, days: CleanupDays) -> list[Path]:
-    """Файлы отчётов под удаление. Защищённое окно не отдаётся никогда."""
-    if days.reports is None or not reports_dir.exists():
-        return []
-    cutoff = now.date() - timedelta(days=days.reports)
-    protected_from = now.date() - timedelta(days=PROTECTED_DAYS)
-    victims = []
-    for path in sorted(reports_dir.iterdir()):
-        if not path.is_file():
-            continue
-        day = _day_of(path.name)
-        if day is None or day >= cutoff or day >= protected_from:
-            continue
-        victims.append(path)
-    return victims
-
-
-def _day_of(name: str) -> date | None:
-    match = _REPORT_NAME_RE.match(name)
-    if match is None:
-        return None
+    Запись стоит ПОСЛЕ необратимого шага уборки (файлы удалены, база
+    ужата), поэтому её отказ не поднимается исключением (I-3): человек
+    обязан узнать, что уборка случилась, а обещание записать не удалось,
+    а не получить трейсбек без единой подсказки, что произошло на самом
+    деле.
+    """
+    new_day = cutoff.date()
+    existing = horizon(state_dir)
+    day = max(existing, new_day) if existing is not None else new_day
     try:
-        return date(int(match[1]), int(match[2]), int(match[3]))
-    except ValueError:
-        return None
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / HORIZON_FILE).write_text(f"{day:%Y-%m-%d}\n", encoding="utf-8")
+    except OSError as error:
+        message = f"горизонт не записан ({state_dir / HORIZON_FILE}): {error}"
+        logger.error(message)
+        return message
+    return None
