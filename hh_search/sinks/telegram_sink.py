@@ -224,9 +224,21 @@ class TelegramSink:
         недоступен на запись, — тот же отказ, который иначе всплыл бы
         только на `marker.touch()` ПОСЛЕ `send_document`. Пробный файл
         создаётся и тут же убирается: он не несёт смысла и не имеет права
-        задержаться в каталоге отчётов.
+        задержаться в каталоге отчётов НАВСЕГДА.
+
+        Имя нарочно попадает под шаблон уборки черновиков `_DRAFT_GLOB`
+        (`-new.html` в имени, `.part` в хвосте). Между `mkstemp` и
+        `unlink` есть узкое окно TOCTOU — права сменились, том моргнул на
+        удаление, — и падение здесь не обязано быть тихим (writability
+        уже проверена, посылать можно, поэтому исключение поднимается как
+        есть и следующий `send_document` этого прогона не случается). Но
+        если `unlink` так и не прошёл, файл — не сирота без хозяина:
+        следующий `maintain` подберёт его тем же `_sweep_orphaned_drafts`,
+        что и осиротевший черновик `emit` (находка ревью раунда 2).
         """
-        handle, name = tempfile.mkstemp(dir=self._reports_dir, prefix=".maintain-probe-")
+        handle, name = tempfile.mkstemp(
+            dir=self._reports_dir, prefix="maintain-probe-new.html", suffix=".part"
+        )
         os.close(handle)
         Path(name).unlink()
 

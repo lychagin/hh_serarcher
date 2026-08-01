@@ -702,6 +702,49 @@ def test_redelivery_raises_when_send_document_fails_again(tmp_path: Path) -> Non
     assert not (tmp_path / "2026-07-30-new.html").exists()
 
 
+def test_an_undeletable_writability_probe_does_not_linger_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Находка ревью раунда 2: пробный файл `_ensure_reports_dir_is_writable`
+    (C1) не имеет права остаться в каталоге отчётов НАВСЕГДА.
+
+    Между `mkstemp` и `unlink` есть узкое окно TOCTOU — права сменились,
+    том моргнул на удаление, — и падение `unlink` здесь честно прерывает
+    довозку ДО `send_document` (дубля не возникает), но раньше не оставляло
+    пробному файлу никакого выхода: шаблон уборки `_DRAFT_GLOB` его не
+    подхватывал, другой уборки в кодовой базе нет, а `maintain` зовётся
+    каждый прогон — то есть при повторяющемся отказе мусор копился бы
+    вечно. Подтверждено исполнением: монки-патч `Path.unlink`, роняющий
+    `PermissionError` только для файлов `maintain-probe`.
+    """
+    stuck = tmp_path / "2026-07-27-new.html"
+    stuck.write_text("<html>вчерашний отчёт</html>", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def flaky_unlink(path: Path, missing_ok: bool = False) -> None:
+        if "maintain-probe" in path.name:
+            raise PermissionError("транзиентный отказ тома на удаление")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    client = FakeClient()
+    with pytest.raises(PermissionError):
+        sink(tmp_path, client).maintain(NOW)
+    assert not client.documents, "проверка упала ДО send_document — дубля быть не должно"
+    monkeypatch.undo()
+
+    leftover = [path for path in tmp_path.iterdir() if "maintain-probe" in path.name]
+    assert len(leftover) == 1, "пробный файл обязан остаться на диске после неудачного unlink"
+
+    # Права починили (в жизни — том), unlink снова работает: следующий
+    # `maintain` обязан подобрать неубранный пробный файл.
+    sink(tmp_path, FakeClient()).maintain(NOW)
+
+    assert not [path for path in tmp_path.iterdir() if "maintain-probe" in path.name], (
+        "неубранный пробный файл не подобран следующим maintain — остался мусором навсегда"
+    )
+
+
 def test_no_redelivery_when_fresh_is_empty_only_because_of_todays_own_file(
     tmp_path: Path,
 ) -> None:
