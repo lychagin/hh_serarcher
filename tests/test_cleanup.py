@@ -636,6 +636,35 @@ def test_horizon_never_moves_backward(tmp_path: Path) -> None:
     assert horizon(state) == strict_horizon  # не откатился на 2025-08-01
 
 
+def test_a_future_horizon_on_disk_does_not_block_an_honest_write(tmp_path: Path) -> None:
+    """Раунд починки 2 (ревью Task 4): горизонт из будущего не залипает навсегда.
+
+    Горизонт по построению — это `now - неотрицательный срок`
+    (`CleanupDays.__post_init__` отвергает отрицательный срок), то есть
+    честно посчитанное значение не может быть позже `now`. Дата на
+    диске, оказавшаяся ВПЕРЕДИ `now` (порча, ручная правка, баг), не
+    может быть правдой ни при каком раскладе — но она СИНТАКСИЧЕСКИ
+    валидна, и `horizon()` не перехватывает её как мусор. Починка I-4
+    (`max(старое, новое)`) внесла регрессию: с такой датой на диске
+    `max` всегда возвращает её и залипает навсегда — следующая честная
+    запись никогда её не перекроет. Цена — не потеря данных, а потеря
+    сигнала: `report --since` предупреждало бы ПОСТОЯННО, что и на любую
+    границу, — то же обесценивание, что чинит R-3 для `partial`.
+    """
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / HORIZON_FILE).write_text("2099-01-01\n", encoding="utf-8")
+
+    execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
+
+    assert horizon(state) == date(2026, 5, 3)  # не застрял на 2099-01-01
+
+
 # --- I-5: горизонт пишется ПОСЛЕ уборки, не до ------------------------------
 
 

@@ -160,7 +160,7 @@ def execute(
     descriptions = repo.forget_descriptions(cutoff)
     runs = repo.forget_runs(now - timedelta(days=days.runs))
     repo.vacuum()
-    horizon_error = _write_horizon(state_dir, cutoff)
+    horizon_error = _write_horizon(state_dir, cutoff, now)
     errors = (*dir_errors, *file_errors, *((horizon_error,) if horizon_error else ()))
     return CleanupPlan(
         descriptions=descriptions,
@@ -185,13 +185,26 @@ def horizon(state_dir: Path) -> date | None:
         return None
 
 
-def _write_horizon(state_dir: Path, cutoff: datetime) -> str | None:
+def _write_horizon(state_dir: Path, cutoff: datetime, now: datetime) -> str | None:
     """Записать горизонт МОНОТОННО; отказ возвращается текстом, не исключением.
 
     Монотонность — только вперёд, `max(старое, новое)` (ревью Task 4,
     I-4): более мягкий срок хранения в следующем прогоне не имеет права
     отменить обещание, данное более жёстким прогоном раньше, иначе «за
     этой датой описаний нет» стало бы ложью задним числом.
+
+    Сохранённый горизонт ВПЕРЕДИ `now` доверия не заслуживает и в `max`
+    не участвует (ревью Task 4, раунд починки 2 — регрессия самой I-4).
+    Горизонт по построению — это `now - неотрицательный срок`
+    (`CleanupDays.__post_init__` отвергает отрицательный срок), то есть
+    честно посчитанное значение не может быть позже `now`; дата из
+    будущего на диске — порча, ручная правка или баг где-то ещё, и
+    `horizon()` её не перехватывает: она синтаксически валидна. Без этой
+    защиты `max(будущее, что угодно)` залипал бы на будущей дате
+    навсегда — ни один следующий честный прогон её не перекрыл бы, а
+    `report --since` предупреждало бы ПОСТОЯННО, то есть точно так же
+    бесполезно, как не предупреждало бы никогда (тот же класс
+    обесцененного сигнала, что R-3 чинит для `partial`).
 
     Запись стоит ПОСЛЕ необратимого шага уборки (файлы удалены, база
     ужата), поэтому её отказ не поднимается исключением (I-3): человек
@@ -201,7 +214,10 @@ def _write_horizon(state_dir: Path, cutoff: datetime) -> str | None:
     """
     new_day = cutoff.date()
     existing = horizon(state_dir)
-    day = max(existing, new_day) if existing is not None else new_day
+    if existing is not None and existing <= now.date():
+        day = max(existing, new_day)
+    else:
+        day = new_day
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         (state_dir / HORIZON_FILE).write_text(f"{day:%Y-%m-%d}\n", encoding="utf-8")
