@@ -1,6 +1,7 @@
 import gzip
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -112,7 +113,9 @@ TWO_ENRICHABLE = listing_html(
 class RecordingSink:
     """Приёмник, который помнит, что и сколько раз ему отдали."""
 
-    def __init__(self, name: str = "recording", fail: bool = False) -> None:
+    def __init__(
+        self, name: str = "recording", fail: bool = False, fail_maintain: bool = False
+    ) -> None:
         self.name = name
         self.batches: list[list[str]] = []
         # Сохраняется не только id: часть проверок читает поля, за которые
@@ -120,10 +123,13 @@ class RecordingSink:
         # уже ПОСЛЕ обратного чтения из базы.
         self.items: list[ScoredVacancy] = []
         self._fail = fail
+        self._fail_maintain = fail_maintain
         self.maintained = 0
 
     def maintain(self, now: datetime) -> None:
         self.maintained += 1
+        if self._fail_maintain:
+            raise RuntimeError(f"приёмник {self.name} не обслужен")
 
     def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
         if self._fail:
@@ -863,6 +869,68 @@ def test_a_failing_maintain_does_not_degrade_the_run(
     assert not (tmp_path / "2026-07-27-new.html.sent").exists(), (
         "отметка не ставится при отказе — иначе документ считался бы доставленным"
     )
+
+
+@respx.mock
+@pytest.mark.skipif(os.getuid() == 0, reason="от root каталог только для чтения не бывает")
+def test_a_readonly_reports_dir_does_not_redeliver_the_same_document_forever(
+    config: Config, repo: SqliteRepository, tmp_path: Path
+) -> None:
+    """C1: каталог отчётов, ставший недоступным на запись, не имеет права
+    превращать довозку в бесконечный дубль при зелёном статусе прогона.
+
+    `_redeliver` ставит отметку `marker.touch()` ПОСЛЕ `send_document`.
+    Если каталог отчётов только читается (`:ro`-монтирование, `chmod
+    0o500`, съехавший owner после рестарта контейнера), `touch()` падает
+    уже ПОСЛЕ того, как документ уехал в канал: отметка не появляется, и
+    следующий `maintain` шлёт тот же документ снова. Раньше этот путь был
+    достижим только изнутри `emit`, и там исключение красило приёмник и
+    понижало статус прогона; теперь `maintain` зовётся каждый прогон, а
+    `maintain_sinks` отказ сознательно глотает — то есть один и тот же
+    документ уезжает в канал раз в четыре часа, пока том не починят, а
+    `status=ok` и healthcheck остаются зелёными.
+
+    Дифференциальный замер: три тихих прогона (без свежих вакансий) с
+    недоступным на запись каталогом.
+    """
+    mock_source(listing_html(("111", "Senior Embedded Engineer")))
+    client = FakeClient()
+    telegram = TelegramSink(tmp_path, config.profile.report_threshold, client)  # type: ignore[arg-type]
+    run(config, repo, [telegram])
+
+    stuck = tmp_path / "2026-07-27-new.html"
+    stuck.write_text("<html>вчерашний отчёт</html>", encoding="utf-8")
+    tmp_path.chmod(0o500)
+    try:
+        statuses = [run(config, repo, [telegram]).status for _ in range(3)]
+    finally:
+        tmp_path.chmod(0o700)
+
+    assert statuses == ["ok", "ok", "ok"]
+    redelivered = [name for name, _, _ in client.documents if name == "2026-07-27-new.html"]
+    assert len(redelivered) <= 1, (
+        f"документ довезён {len(redelivered)} раз при недоступном на запись каталоге"
+    )
+
+
+@respx.mock
+def test_a_failing_maintain_does_not_stop_the_next_sink_from_maintaining(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """I3: «Отказ громкий, но не заразный» — упавший `maintain` одного
+    приёмника не имеет права оборвать обслуживание остальных.
+
+    `maintain_sinks` перебирает приёмники по очереди и ловит исключение
+    каждого отдельно — сторож на случай, если однажды после `except`
+    в цикле появится `return` вместо перехода к следующей итерации: тогда
+    первый же упавший приёмник тихо забирал бы обслуживание у всех
+    приёмников, идущих следом.
+    """
+    mock_source(listing_html(("111", "Senior Embedded Engineer")))
+    broken = RecordingSink("broken", fail_maintain=True)
+    healthy = RecordingSink("healthy")
+    run(config, repo, [broken, healthy])
+    assert healthy.maintained == 1
 
 
 @respx.mock

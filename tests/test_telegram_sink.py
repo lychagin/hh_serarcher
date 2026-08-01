@@ -781,14 +781,19 @@ def test_sweep_does_not_touch_the_delivery_marker(tmp_path: Path) -> None:
 
     Отметка лежит рядом с файлом дня и начинается так же (`-new.html`), а
     съеденная уборкой отметка означала бы повторный документ в канале при
-    первом же прогоне без свежих вакансий.
+    первом же прогоне без свежих вакансий. Уборка переехала в `maintain`
+    (T-2) — сторож обязан звать именно его между записями: `emit` больше
+    не метёт черновики, и без явного `maintain` глоб-шаблон нечего
+    вымести, а мутация в нём осталась бы незамеченной (находка I2).
     """
     marker = tmp_path / f"2026-07-29-new.html{_SENT_SUFFIX}"
     client = FakeClient()
     target = sink(tmp_path, client)
     target.emit([vacancy(vacancy_id="1")], NOW)
     assert marker.exists(), "успешный `send_document` не оставил отметки"
-    target.emit([vacancy(vacancy_id="2")], NOW)
+
+    target.maintain(NOW)
+
     assert marker.exists(), "уборка черновиков съела отметку о доставке"
 
 
@@ -799,13 +804,18 @@ def test_sweep_does_not_touch_a_published_day_file(tmp_path: Path) -> None:
     `emit` создаёт заново, поэтому прежняя редакция оставалась зелёной и
     при `_DRAFT_GLOB = "*"`, и при `"*-new.html"` — то есть не видела ровно
     той поломки, ради которой написана. Видна она только по накопительности:
-    вторая запись обязана ДОПОЛНИТЬ первую, а не переписать её.
+    вторая запись обязана ДОПОЛНИТЬ первую, а не переписать её. Уборка
+    переехала в `maintain` (T-2) — сторож зовёт его между записями: без
+    этого вызова глоб-шаблон нечего вымести, и мутация в нём осталась бы
+    незамеченной (находка I2).
     """
     day_file = tmp_path / "2026-07-29-new.html"
     client = FakeClient()
     target = sink(tmp_path, client)
     target.emit([vacancy(vacancy_id="1", title="Утренняя")], NOW)
     after_first = day_file.read_bytes()
+
+    target.maintain(NOW)
     target.emit([vacancy(vacancy_id="2", title="Вечерняя")], NOW)
 
     after_second = day_file.read_bytes()
@@ -833,6 +843,30 @@ def test_two_consecutive_failed_midnights_still_do_not_repeat_the_message(
     assert not client.messages
     assert len(client.documents) == 1
     assert client.documents[0][0] == "2026-07-29-new.html"
+
+
+def test_dedup_window_of_emit_covers_both_previous_days_not_just_the_nearest(
+    tmp_path: Path,
+) -> None:
+    """item 3: дедуп `emit` обязан смотреть на ОБА предыдущих дня окна.
+
+    Ссылка на вакансию лежит в файле ПОЗАВЧЕРАШНИХ суток — на дальней
+    границе `LOOKBACK_DAYS` (`_previous_days` отдаёт список из двух
+    элементов, старший день первым), а файла ВЧЕРАШНИХ суток нет вовсе —
+    ближайший предыдущий день пуст. Если бы `already` собирался только из
+    ближайшего предыдущего дня (например, из `previous[-1:]`), `emit`
+    счёл бы вакансию новой и прислал бы то же сообщение вторично — молча,
+    без единого отказа. T-2 увёл довозку из `emit` в `maintain`, и
+    предыдущая редакция этого теста проверяла дедуп-окно КОСВЕННО, через
+    совмещённый сценарий «довозка плюс дедуп» — после переезда он перестал
+    вызывать `emit` вовсе, и это окно осталось без прямого сторожа.
+    """
+    same = vacancy(vacancy_id="1")
+    assert sink(tmp_path, FakeClient()).emit([same], EVENING) == 1
+    client = FakeClient()
+    day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
+    assert sink(tmp_path, client).emit([same], day31) == 0
+    assert not client.messages, "дедуп не заглянул на два дня назад — сообщение повторилось"
 
 
 def test_vacancy_outside_the_lookback_window_is_not_suppressed(tmp_path: Path) -> None:
