@@ -8,7 +8,7 @@ import pytest
 
 from hh_search.config.models import QuerySpec, WorkFormat
 from hh_search.domain.models import DiscoveredVacancy
-from hh_search.errors import FetchFailed
+from hh_search.errors import DegenerateListing, FetchFailed
 from hh_search.sources.http import Robots
 from hh_search.sources.listing import build_listing_url, parse_listing
 
@@ -247,6 +247,27 @@ def test_missing_item_list_does_not_blame_the_markup_alone() -> None:
     assert "разметк" in message, "версия про смену разметки обязана остаться"
     assert "разов" in message or "вырожденн" in message, "вторая версия обязана быть названа"
     assert "похоже, разметка страницы изменилась" not in message
+
+
+def test_missing_item_list_raises_the_retryable_type() -> None:
+    """Тип отказа — часть контракта: по нему конвейер решает, повторять ли.
+
+    Проверяется вместе с обратным случаем: промах `canonical` обязан
+    остаться обычным `FetchFailed`, иначе повтор распространится на
+    постоянный отказ.
+    """
+    without_block = (
+        '<html><head><link rel="canonical" href="https://hh.ru/vacancies/programmist">'
+        '<script type="application/ld+json">{"@type": "BreadcrumbList"}</script>'
+        "</head></html>"
+    )
+    with pytest.raises(DegenerateListing):
+        parse_listing(without_block, "programmist")
+
+    wrong_slug = without_block.replace("programmist", "yocto", 1)
+    with pytest.raises(FetchFailed) as caught:
+        parse_listing(wrong_slug, "programmist")
+    assert not isinstance(caught.value, DegenerateListing)
 
 
 def test_parse_listing_raises_when_not_a_single_item_parsed() -> None:

@@ -13,16 +13,15 @@
 
 import logging
 
-import httpx
-
-from hh_search.config.models import Config, QuerySpec
+from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden, FetchFailed, RobotsDisallowed
 from hh_search.filtering.prefilter import Prefilter
 from hh_search.pipeline.failures import FailureDigest
 from hh_search.pipeline.forbidden import ForbiddenStreak
+from hh_search.pipeline.listing_pages import DegenerateDigest, store_page
 from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.sources.http import PoliteClient
-from hh_search.sources.listing import build_listing_url, parse_listing
+from hh_search.sources.listing import build_listing_url
 from hh_search.storage.base import REJECT_CODE_PREFILTER, Repository
 
 logger = logging.getLogger(__name__)
@@ -43,6 +42,7 @@ def discover(
     # Отказы копятся и печатаются сводкой: при недоступном источнике они
     # отличаются только URL, а причина у всех одна (см. pipeline/failures.py).
     skipped = FailureDigest()
+    degenerate = DegenerateDigest()
     for query in config.queries.queries:
         # Дедупликация на весь ЛИСТИНГ, а не на страницу. Пагинация hh.ru
         # сдвигается между запросами (выдача живая, вакансии добавляются и
@@ -85,44 +85,10 @@ def discover(
             # ниже. Считай мы разобранные, отказ разбора остался бы
             # `partial`, то есть успехом для healthcheck.
             fetched += 1
-            _store_page(repo, query, url, response, stats, seen)
+            store_page(repo, query, url, response, stats, seen, client, degenerate)
     skipped.log_summary("страниц листингов не получено")
+    degenerate.log_summary()
     _check_not_silent(config, stats, fetched, unchanged)
-
-
-def _store_page(
-    repo: Repository,
-    query: QuerySpec,
-    url: str,
-    response: httpx.Response,
-    stats: RunStats,
-    seen: set[str],
-) -> None:
-    """Разобрать страницу, записать вакансии и только потом — валидатор."""
-    try:
-        vacancies = parse_listing(response.text, query.slug)
-    except FetchFailed as error:
-        # Валидатор не сохраняем и вычищаем прежний: 304 на следующем
-        # прогоне спрятал бы дрейф формата за нулевой работой, а один
-        # лишний полный ответ — дешевле месяца молчания.
-        repo.reset_cache(url)
-        stats.degrade(PARTIAL, f"листинг {url} не разобран: {error}")
-        logger.error("листинг %s не разобран, кэш условного запроса сброшен: %s", url, error)
-        return
-    for vacancy in vacancies:
-        # Запись идёт в любом случае, а счёт — только на первой встрече.
-        # Пропускать повтор целиком нельзя: `add_discovered` идемпотентен и
-        # именно он решает судьбу кластера (охрана `cluster_weight <`), а
-        # `new_count` уже верен — на известный id метод отвечает False.
-        # Врал только `discovered`, и правится ровно он.
-        if repo.add_discovered(vacancy, query.cluster, query.weight):
-            stats.new_count += 1
-        if vacancy.id not in seen:
-            seen.add(vacancy.id)
-            stats.discovered += 1
-    repo.save_cache_headers(
-        url, response.headers.get("ETag"), response.headers.get("Last-Modified")
-    )
 
 
 def _check_not_silent(config: Config, stats: RunStats, fetched: int, unchanged: int) -> None:
@@ -195,10 +161,10 @@ def _check_not_silent(config: Config, stats: RunStats, fetched: int, unchanged: 
         # (`pages: 2`, на втором листе кончились вакансии), и объявлять
         # прогон `failed` из-за него значит красить индикатор в красный
         # на исправном сервисе. Дрейф формата этой веткой не прячется:
-        # он отказывает разбором, а `_store_page` при отказе разбора
-        # сбрасывает валидатор, поэтому уже следующий прогон получит на
-        # эту страницу полный ответ, `unchanged` станет нулём — и сторож
-        # выше сработает.
+        # он отказывает разбором, а `store_page` (`listing_pages.py`) при
+        # отказе разбора сбрасывает валидатор, поэтому уже следующий
+        # прогон получит на эту страницу полный ответ, `unchanged` станет
+        # нулём — и сторож выше сработает.
         logger.warning(
             "источник отдал %d свежих страниц листингов без единой вакансии, ещё %d "
             "не изменились (304): похоже на пустой хвост пагинации, а не на отказ. "

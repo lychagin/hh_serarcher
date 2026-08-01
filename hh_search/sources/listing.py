@@ -55,7 +55,7 @@ from urllib.parse import SplitResult, urlsplit
 
 from hh_search.config.models import QuerySpec
 from hh_search.domain.models import DiscoveredVacancy
-from hh_search.errors import FetchFailed
+from hh_search.errors import DegenerateListing, FetchFailed
 from hh_search.sources.vacancy_page import find_ld_json, vacancy_id_from_path, vacancy_url
 
 logger = logging.getLogger(__name__)
@@ -195,7 +195,7 @@ def _item_list(html: str, slug: str) -> list[Any]:
         # называются обе. Живой прогон 2026-07-29 стоил ложной диагностики:
         # отказ объявил смену разметки, а повторный запрос той же страницы
         # разобрался этим же парсером на 20 элементов.
-        raise FetchFailed(
+        raise DegenerateListing(
             f"на странице листинга {slug!r} нет блока JSON-LD с ItemList. Так выглядит "
             "и смена разметки, и разовый вырожденный ответ hh.ru — отличать по тому, "
             "повторяется ли отказ на других листингах и на следующем прогоне (кэш "

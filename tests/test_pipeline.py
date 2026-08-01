@@ -72,6 +72,20 @@ def listing_html(*vacancies: tuple[str, str], slug: str = "programmist") -> str:
     )
 
 
+def listing_without_item_list(slug: str = "programmist") -> str:
+    """Вырожденный ответ hh.ru: canonical на месте, блока ItemList нет.
+
+    Ровно то, что hh.ru перемежающеся отдаёт живьём: код 200, вёрстка
+    цела, JSON-LD на странице есть — но не тот. Перекачка той же страницы
+    проходит, то есть отказ временный (спека 2026-08-01 §1.1).
+    """
+    return (
+        f'<html><head><link rel="canonical" href="https://hh.ru/vacancies/{slug}">'
+        '<script type="application/ld+json">{"@type": "BreadcrumbList"}</script>'
+        "</head><body></body></html>"
+    )
+
+
 def page_html(description: str = "Опыт Yocto и Buildroot.") -> str:
     block = json.dumps(
         {
@@ -1838,3 +1852,89 @@ def test_prefilter_still_covers_the_queue_beyond_the_enrich_ceiling(tmp_path: Pa
 
     assert stats.rejected == 1
     assert [vacancy_id for vacancy_id, _ in repository.rejected_by_prefilter()] == ["222"]
+
+
+# --- R-3: вырожденная страница листинга повторяется ровно один раз ---------
+
+
+@respx.mock
+def test_degenerate_listing_is_retried_and_the_run_stays_ok(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Повтор спасает страницу, и прогон остаётся `ok`.
+
+    Смысл починки именно в статусе: при 12 страницах за прогон
+    вырожденный ответ выпадает в трёх прогонах из четырёх, и `partial`
+    переставал отличаться от настоящего дрейфа вёрстки.
+    """
+    mock_robots()
+    listing = respx.get(url__startswith=LISTING_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=listing_without_item_list()),
+            httpx.Response(200, text=TWO_VACANCIES),
+        ]
+    )
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+    sink = RecordingSink()
+
+    stats = run(config, repo, [sink])
+
+    assert (stats.status, stats.error) == ("ok", None)
+    assert listing.call_count == 2, "ровно один повтор, не больше и не меньше"
+    assert sink.seen == ["111"]
+
+
+@respx.mock
+def test_degenerate_listing_twice_degrades_the_run_and_stops_at_two_requests(
+    tmp_path: Path, db_path: str
+) -> None:
+    """Второй вырожденный ответ подряд — `partial`, и третьего запроса нет.
+
+    Листингов два: будь он один, прогон без вакансий понизил бы себя до
+    `failed` агрегатным сторожем `_check_not_silent`, и тест проверял бы
+    не ту строку.
+    """
+    root = tmp_path / "two"
+    root.mkdir(parents=True, exist_ok=True)
+    two_pages = load_config(
+        write_config(root, **{"queries.yaml": ONE_PAGE.replace("pages: 1", "pages: 2")})
+    )
+    disk = SqliteRepository(db_path)
+    disk.init_schema()
+    mock_robots()
+    listing = respx.get(url__startswith=LISTING_URL).mock(
+        side_effect=[
+            httpx.Response(200, text=TWO_VACANCIES),
+            httpx.Response(200, text=listing_without_item_list()),
+            httpx.Response(200, text=listing_without_item_list()),
+        ]
+    )
+    respx.get(url__regex=PAGE_PATTERN).mock(return_value=httpx.Response(200, text=page_html()))
+
+    stats = run(two_pages, disk, [RecordingSink()])
+
+    assert stats.status == "partial"
+    assert listing.call_count == 3, "первая страница без повтора, вторая с одним"
+
+
+@respx.mock
+def test_a_listing_that_is_not_ours_is_never_retried(
+    config: Config, repo: SqliteRepository
+) -> None:
+    """Промах `canonical` — отказ ПОСТОЯННЫЙ, и повтор только удвоил бы запросы.
+
+    Так выглядит несуществующий slug: hh.ru отвечает 200 и общим
+    индексом. Повторять это значило бы удваивать нагрузку на hh.ru на
+    каждой странице каждого прогона до тех пор, пока человек не заметит
+    опечатку в конфиге.
+    """
+    mock_robots()
+    listing = respx.get(url__startswith=LISTING_URL).mock(
+        return_value=httpx.Response(
+            200, text=listing_html(("111", "Senior Embedded Engineer"), slug="yocto")
+        )
+    )
+
+    run(config, repo, [RecordingSink()])
+
+    assert listing.call_count == 1
