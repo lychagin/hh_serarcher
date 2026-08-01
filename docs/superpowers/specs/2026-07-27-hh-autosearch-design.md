@@ -374,7 +374,7 @@ URL с query-строкой, то есть всего RSS-поиска цели�
 ```text
 hh_search/
   __main__.py           CLI: команды демона (см. §8.3), маркер устойчивого 403, внятный отказ тома
-  errors.py             иерархия ошибок: AccessForbidden, FetchFailed, RobotsDisallowed, StorageUnavailable
+  errors.py             иерархия ошибок: AccessForbidden, DegenerateListing, FetchFailed, RobotsDisallowed, StorageUnavailable
   logging_setup.py      stdout плюс /data/logs/hh.log с ротацией; httpx приглушён
   runlock.py            файловый замок: одновременно работает ровно один прогон
   scheduler.py          цикл режима serve: дедлайн, SIGTERM, устойчивый 403
@@ -388,15 +388,15 @@ hh_search/
     prefilter.py        шаг 3: отсев по заголовку — единственный барьер перед сетью
   pipeline/
     __init__.py         run_once: ПОРЯДОК семи шагов и закрытие журнала на любом исходе
+    cleanup.py          ручная уборка: план, исполнение, горизонт хранения
+    cleanup_plan.py     датаклассы уборки (CleanupDays, CleanupPlan), вынесены из cleanup.py бюджетом строк
     discovery.py        шаги 1–3: обход листингов, дедупликация, отсев и возврат из отказа
     enrichment.py       шаги 4–6: скачивание страниц, оценка, локальный пересчёт
     failures.py         сводка однотипных отказов вместо строки на каждый URL
     forbidden.py        счётчик подряд идущих 403 на весь прогон
-    listing_pages.py      одна страница листинга: разбор, повтор вырожденного ответа, запись
+    listing_pages.py    одна страница листинга: разбор, повтор вырожденного ответа, запись
+    report_files.py     отбор файлов отчётов под удаление, вынесен из cleanup.py бюджетом строк
     reporting.py        шаг 7: два прохода «пересчёт → unreported» и отправка в приёмники
-    cleanup.py            ручная уборка: план, исполнение, горизонт хранения
-    cleanup_plan.py        датаклассы уборки (CleanupDays, CleanupPlan), вынесены из cleanup.py бюджетом строк
-    report_files.py       отбор файлов отчётов под удаление, вынесен из cleanup.py бюджетом строк
     stats.py            счётчики прогона, ранг статусов ok/partial/failed, коды возврата
   scoring/
     base.py             протокол Scorer

@@ -209,9 +209,9 @@ hh.ru, строку `run` не жалко, а удалённый файл отч
 ### 3.2 Форма команды
 
 ```sh
-uv run hh-search cleanup                       # сухой прогон: что будет удалено
-uv run hh-search cleanup --apply               # описания и журнал прогонов
-uv run hh-search cleanup --reports --apply     # плюс файлы отчётов
+uv run python -m hh_search cleanup                       # сухой прогон: что будет удалено
+uv run python -m hh_search cleanup --apply               # описания и журнал прогонов
+uv run python -m hh_search cleanup --reports --apply     # плюс файлы отчётов
 ```
 
 Сроки — параметры `--descriptions-days 90`, `--runs-days 365`,
@@ -268,9 +268,10 @@ uv run hh-search cleanup --reports --apply     # плюс файлы отчёт�
 ### 3.4 Размещение кода
 
 - `storage/retention.py` — **новый модуль, весь SQL уборки**:
-  `forget_descriptions(cutoff)`, `forget_runs(cutoff)`, `vacuum()`. Оба метода
-  сперва попадают в протокол `storage/base.py`, иначе mypy отвергнет подмену
-  реализации в тестах.
+  `descriptions_before(cutoff)`, `forget_descriptions(cutoff)`,
+  `count_runs_before(cutoff)`, `forget_runs(cutoff)`, `vacuum()`. Все пять
+  сперва попадают в протокол `Housekeeper` (`storage/base.py`), иначе mypy
+  отвергнет подмену реализации в тестах.
 - `pipeline/cleanup.py` — **новый модуль, оркестровка**: зовёт хранилище,
   сканирует каталог отчётов, собирает отчёт о плане или о сделанном.
 - `__main__.py` — тонкая команда поверх этого.
