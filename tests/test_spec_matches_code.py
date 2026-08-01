@@ -23,11 +23,13 @@
 """
 
 import ast
+import inspect
 import re
 from pathlib import Path
 
 import yaml
 
+from hh_search.__main__ import cleanup_command
 from hh_search.config.models import LocationConfig
 from hh_search.domain.models import WorkFormat
 
@@ -598,3 +600,40 @@ def test_telegram_spec_names_functions_that_exist() -> None:
         assert f"def {name}(" in module.read_text(encoding="utf-8"), (
             f"{module.name} больше не содержит `{name}`, а спека на него ссылается"
         )
+
+
+# --- README/спека §13 п.5: сроки уборки по умолчанию (ревью Task 5, раунд ---
+# починки 1, Important-2)
+#
+# 90/365/90 в README и в §13 спеки — переписанные копии умолчаний
+# `cleanup_command`, и дешевле некуда сверяемые исполнением: сигнатура самой
+# команды уже несёт эти числа. Ни один тест их не сверял, и правка любого
+# умолчания оставила бы оба документа врущими молча — тот же класс дыры,
+# что уже чинили `test_readme_lists_the_real_csv_columns` и
+# `test_spec_cli_block_matches_the_real_cli` для своих утверждений.
+
+
+def _cleanup_command_defaults() -> dict[str, int]:
+    """Умолчания срока хранения — из САМОЙ команды, а не переписанные числа."""
+    signature = inspect.signature(cleanup_command)
+    return {
+        name: signature.parameters[name].default
+        for name in ("descriptions_days", "runs_days", "reports_days")
+    }
+
+
+def test_readme_cleanup_defaults_match_the_command() -> None:
+    defaults = _cleanup_command_defaults()
+    section = readme_section("### Уборка старых данных", "## Где смотреть результаты")
+    assert f"описания {defaults['descriptions_days']} дней" in section
+    assert f"журнал прогонов {defaults['runs_days']}" in section
+    assert f"файлы отчётов {defaults['reports_days']} (" in section
+
+
+def test_spec_cleanup_defaults_match_the_command() -> None:
+    defaults = _cleanup_command_defaults()
+    text = SPEC.read_text(encoding="utf-8")
+    section = text[text.index("5. **Ретенция данных реализована**") :]
+    assert f"вакансий старше {defaults['descriptions_days']} дней" in section
+    assert f"прогонов старше {defaults['runs_days']} дней" in section
+    assert f"отчётов старше {defaults['reports_days']} дней" in section

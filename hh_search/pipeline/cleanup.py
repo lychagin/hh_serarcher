@@ -2,20 +2,21 @@
 
 Оркестровка и только она. SQL живёт в `storage/retention.py`, отбор
 файлов отчётов (форма имени, защищённое окно довозки) — в
-`report_files.py`, вынесенном оттуда же ради бюджета строк (ревью
-Task 4, раунд починки 1). `PROTECTED_DAYS` реэкспортируется отсюда: он
-часть публичного интерфейса этого модуля (см. `tests/test_cleanup.py`),
-хотя вычисляется в `report_files.py` — там же, где используется, рядом
-с `LOOKBACK_DAYS` из `sinks/telegram_sink.py`, импортом константы, а не
-переписанным числом: разъедься они — и уборка начала бы ломать довозку
-молча.
+`report_files.py`, а формы данных (`CleanupDays`, `CleanupPlan`) — в
+`cleanup_plan.py`, вынесенных оттуда же ради бюджета строк (ревью Task 4,
+раунд починки 1; ревью Task 5, раунд починки 1). Обе константы и оба
+класса реэкспортируются отсюда: они часть публичного интерфейса этого
+модуля (см. `tests/test_cleanup.py`), хотя вычисляются в своих файлах —
+`PROTECTED_DAYS` там же, где используется, рядом с `LOOKBACK_DAYS` из
+`sinks/telegram_sink.py`, импортом константы, а не переписанным числом:
+разъедься они — и уборка начала бы ломать довозку молча.
 """
 
 import logging
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from hh_search.pipeline.cleanup_plan import CleanupDays, CleanupPlan
 from hh_search.pipeline.report_files import PROTECTED_DAYS, total_bytes, victim_files
 from hh_search.storage.base import Housekeeper
 
@@ -46,81 +47,6 @@ HORIZON_FILE = "last-cleanup"
 # котором живёт вся остальная работа проекта с датами; не прячем его.
 HORIZON_CLOCK_SKEW_TOLERANCE = timedelta(days=1)
 
-_MB = 1024 * 1024
-
-
-@dataclass(frozen=True)
-class CleanupDays:
-    """Сроки хранения. `reports=None` означает «файлы не трогать вовсе».
-
-    Одним полем выражены и флаг `--reports`, и его срок: два поля
-    разъехались бы при первой же правке CLI.
-    """
-
-    descriptions: int = 90
-    runs: int = 365
-    reports: int | None = None
-
-    def __post_init__(self) -> None:
-        """Отрицательный срок отвергается, ноль — разрешён.
-
-        Отрицательный срок задаёт границу В БУДУЩЕМ (`now -
-        timedelta(days=-N)`), и уборка обнулила бы описание вакансии,
-        отправленной секунду назад, — между `--descriptions-days -365` и
-        «стереть всё» не стояло бы ничего. Ноль не отвергается: это
-        предельно короткий, но осмысленный срок (`CleanupDays(reports=0)`
-        — законное ручное действие, проверяемое сторожем окна довозки).
-        Проверка живёт здесь, а не в CLI, — так её получит любой
-        вызывающий, а не только команда.
-        """
-        for name, value in (
-            ("descriptions", self.descriptions),
-            ("runs", self.runs),
-            ("reports", self.reports),
-        ):
-            if value is not None and value < 0:
-                raise ValueError(f"срок хранения {name} не может быть отрицательным: {value}")
-
-
-@dataclass(frozen=True)
-class CleanupPlan:
-    """Что уборка сделает или сделала. Одна форма на оба случая.
-
-    Одна, а не две: сухой прогон обязан печатать РОВНО то, что напечатал
-    бы `--apply`, иначе он перестаёт быть предпросмотром.
-    """
-
-    descriptions: int
-    description_bytes: int
-    runs: int
-    report_files: int
-    report_bytes: int
-    descriptions_cutoff: datetime
-    # Причины, по которым часть уборки не удалась (недоступный каталог
-    # отчётов, гонка при удалении файла, отказ записи горизонта). Пустой
-    # кортеж — уборка прошла без сучка. Поле обязано жить В ВОЗВРАЩЁННОМ
-    # значении, а не только в логе (ревью Task 4, общее требование раунда
-    # 1): человек не имеет права остаться в неведении, случилась ли
-    # уборка целиком; текст переиспользует CLI будущей задачи.
-    errors: tuple[str, ...] = ()
-
-    def describe(self, applied: bool) -> str:
-        verb = "убрано" if applied else "будет убрано"
-        lines = [
-            f"описаний: {self.descriptions} ({self.description_bytes / _MB:.1f} МБ) — {verb}",
-            f"строк журнала прогонов: {self.runs} — {verb}",
-            f"файлов отчётов: {self.report_files} ({self.report_bytes / _MB:.1f} МБ) — {verb}",
-            f"граница хранения описаний: {self.descriptions_cutoff:%Y-%m-%d}",
-        ]
-        if applied:
-            lines.append(
-                "база ужата (VACUUM). `report --since` за границу описаний "
-                "больше не покажет вакансий — предупреждение об этом печатает сам `report`"
-            )
-        for error in self.errors:
-            lines.append(f"ОШИБКА: {error}")
-        return "\n".join(lines)
-
 
 def plan(repo: Housekeeper, reports_dir: Path, now: datetime, days: CleanupDays) -> CleanupPlan:
     """Посчитать, ничего не меняя."""
@@ -134,6 +60,7 @@ def plan(repo: Housekeeper, reports_dir: Path, now: datetime, days: CleanupDays)
         report_files=len(victims),
         report_bytes=report_bytes,
         descriptions_cutoff=now - timedelta(days=days.descriptions),
+        reports_considered=days.reports is not None,
         errors=(*dir_errors, *size_errors),
     )
 
@@ -143,17 +70,34 @@ def execute(
 ) -> CleanupPlan:
     """Убрать и вернуть то, что убрано.
 
-    Порядок: сначала файлы, потом база, потом `VACUUM`, потом горизонт.
-    Горизонт последним потому, что он — обещание «за этой датой описаний
-    нет», и записывать его до того, как они действительно убраны, значило
-    бы обещать за уборку, которая могла и не случиться (сторож —
-    `test_horizon_is_written_only_after_the_cleanup_it_promises`).
+    Порядок: сначала файлы, потом описания, потом журнал прогонов, потом
+    `VACUUM`, потом горизонт. Каждый шаг с базой пойман ОТДЕЛЬНО (ревью
+    Task 5, раунд починки 1, Important-1): раньше исключение из любого из
+    трёх вызовов репозитория улетало наружу мимо `CleanupPlan.errors`,
+    прямиком в `_storage_errors` CLI, — и `describe()` не печатался вовсе,
+    хотя файлы уже были удалены, а часть базы уже изменена. Замер ревью:
+    `vacuum()`, упавший `database or disk is full` (самый вероятный отказ
+    именно для VACUUM — ему нужна вторая копия базы на диске), прятал 5
+    удалённых файлов, 3 обнулённых описания и 2 удалённые строки журнала.
+
+    Горизонт пишется, только если описания ДЕЙСТВИТЕЛЬНО обнулились
+    (`descriptions_ok`): он обещает «за этой датой описаний нет», а
+    писать его после отказа `forget_descriptions` значило бы обещать за
+    уборку, которой не было, — инвариант Task 4
+    (`test_horizon_is_written_only_after_the_cleanup_it_promises`), теперь
+    исполняемый явной проверкой, а не побочным эффектом порядка вызовов.
+    Отказ `forget_runs` или `vacuum` горизонт не блокирует: они не имеют
+    отношения к тому, что он обещает, — если бы блокировали, честно
+    убранные описания остались бы без предупреждения `report --since`
+    навсегда, то есть отказ VACUUM убивал бы ровно тот механизм, ради
+    которого горизонт заведён.
 
     Отказ любой части (каталог отчётов недоступен, файл исчез гонкой
-    между `iterdir()` и `unlink()`, горизонт не записался) не поднимается
-    исключением: уборка обязана довести остальное до конца и назвать
-    отказ словами в `CleanupPlan.errors`, а не оставить человека гадать,
-    случилась ли она хоть частично (ревью Task 4, I-1..I-3).
+    между `iterdir()` и `unlink()`, шаг базы, горизонт не записался) не
+    поднимается исключением: уборка обязана довести остальное до конца и
+    назвать отказ словами в `CleanupPlan.errors`, а не оставить человека
+    гадать, случилась ли она хоть частично (ревью Task 4, I-1..I-3; ревью
+    Task 5, Important-1).
     """
     victims, dir_errors = victim_files(reports_dir, now, days.reports)
     removed_bytes = 0
@@ -169,13 +113,52 @@ def execute(
             continue
         removed += 1
         removed_bytes += size
+
     cutoff = now - timedelta(days=days.descriptions)
-    _, size_before = repo.descriptions_before(cutoff)
-    descriptions = repo.forget_descriptions(cutoff)
-    runs = repo.forget_runs(now - timedelta(days=days.runs))
-    repo.vacuum()
-    horizon_error = _write_horizon(state_dir, cutoff, now)
-    errors = (*dir_errors, *file_errors, *((horizon_error,) if horizon_error else ()))
+    descriptions = 0
+    size_before = 0
+    descriptions_ok = False
+    storage_errors: list[str] = []
+    try:
+        _, size_before = repo.descriptions_before(cutoff)
+        descriptions = repo.forget_descriptions(cutoff)
+        descriptions_ok = True
+    except Exception as error:  # noqa: BLE001 — отказ базы не имеет права
+        # прятать уже удалённые выше файлы; репозиторий не обещает
+        # конкретной иерархии исключений (см. `Housekeeper`), и ловится
+        # ЛЮБОЙ отказ, а не только известный сегодня.
+        message = f"описания не обнулены: {error}"
+        logger.error(message)
+        storage_errors.append(message)
+
+    runs = 0
+    try:
+        runs = repo.forget_runs(now - timedelta(days=days.runs))
+    except Exception as error:  # noqa: BLE001 — своя ошибка не должна
+        # прятать уже убранные файлы и описания.
+        message = f"журнал прогонов не убран: {error}"
+        logger.error(message)
+        storage_errors.append(message)
+
+    vacuum_ok = False
+    try:
+        repo.vacuum()
+        vacuum_ok = True
+    except Exception as error:  # noqa: BLE001 — VACUUM переписывает базу
+        # целиком и держит вторую копию на диске — самый вероятный отказ
+        # именно здесь; не отменяет уже обнулённые описания и удалённые
+        # строки журнала.
+        message = f"база не ужата (VACUUM): {error}"
+        logger.error(message)
+        storage_errors.append(message)
+
+    horizon_error = _write_horizon(state_dir, cutoff, now) if descriptions_ok else None
+    errors = (
+        *dir_errors,
+        *file_errors,
+        *storage_errors,
+        *((horizon_error,) if horizon_error else ()),
+    )
     return CleanupPlan(
         descriptions=descriptions,
         description_bytes=size_before,
@@ -183,6 +166,8 @@ def execute(
         report_files=removed,
         report_bytes=removed_bytes,
         descriptions_cutoff=cutoff,
+        reports_considered=days.reports is not None,
+        vacuum_ok=vacuum_ok,
         errors=errors,
     )
 

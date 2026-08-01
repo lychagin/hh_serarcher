@@ -86,7 +86,10 @@ DescriptionsDays = Annotated[
     int, typer.Option("--descriptions-days", help="Срок хранения описаний")
 ]
 RunsDays = Annotated[int, typer.Option("--runs-days", help="Срок хранения журнала прогонов")]
-ReportsDays = Annotated[int, typer.Option("--reports-days", help="Срок хранения файлов отчётов")]
+ReportsDays = Annotated[
+    int,
+    typer.Option("--reports-days", help="Срок хранения файлов отчётов; без --reports не действует"),
+]
 
 
 @app.callback()

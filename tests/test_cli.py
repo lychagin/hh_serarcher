@@ -1238,6 +1238,32 @@ def test_cleanup_does_not_delete_report_files_without_the_flag(tmp_path: Path) -
     assert old_report.exists()
 
 
+@respx.mock
+def test_cleanup_reports_days_without_the_flag_does_not_imply_files_were_considered(
+    tmp_path: Path,
+) -> None:
+    """Minor-3 (раунд починки 1): `--reports-days` без `--reports` молча
+    ничего не удалял и раньше — дыра была в том, что вывод команды при
+    этом читался так, будто файлы проверили и нашли ноль."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+
+    result = invoke(config_dir, "cleanup", "--apply", "--reports-days", "0")
+
+    assert result.exit_code == 0
+    assert "файлов отчётов: 0" not in result.output
+    assert "--reports" in result.output
+
+
+def test_cleanup_help_names_the_dependency_between_reports_flags() -> None:
+    """Minor-3: справка обязана сказать, что `--reports-days` без `--reports`
+    ничего не делает, — иначе флаг выглядит рабочим сам по себе."""
+    result = runner.invoke(app, ["cleanup", "--help"])
+    assert result.exit_code == 0
+    assert "не действует" in result.output
+
+
 def test_cleanup_refuses_while_a_run_holds_the_lock(tmp_path: Path) -> None:
     """Уборка пишет в ту же базу, что демон, — значит берёт тот же замок."""
     config_dir = prepare(tmp_path)
@@ -1265,6 +1291,9 @@ def test_cleanup_rejects_a_negative_retention_period(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "не может быть отрицательным" in result.output
+    # Minor-4 (раунд починки 1): сообщение обязано называть флаг, который
+    # человек набирал, а не внутреннее имя поля датакласса.
+    assert "--descriptions-days" in result.output
     assert "Traceback" not in result.output
 
 
@@ -1291,8 +1320,17 @@ def test_cleanup_exits_nonzero_when_a_report_directory_is_unreadable(tmp_path: P
 
 
 @respx.mock
-def test_cleanup_explains_a_storage_failure_instead_of_a_traceback(tmp_path: Path) -> None:
-    """Тот же контраст, что у `run`/`mark`/`report` на томе `:ro` — не голый sqlite3."""
+def test_cleanup_on_a_read_only_volume_keeps_what_it_already_did(tmp_path: Path) -> None:
+    """Раунд починки 1 (ревью Task 5, Important-1), глазами CLI: том `:ro`
+    во время `--apply` не имеет права прятать то, что уже случилось.
+
+    До фикса эта же подготовка данных давала код 1 и «нет доступа к
+    каталогу данных» — `_storage_errors` ловил отказ базы, вылетевший из
+    `execute()` исключением, и `describe()` не печатался вовсе. Теперь
+    `execute()` ловит отказ САМ (см. `tests/test_cleanup.py`), а CLI
+    только печатает `describe()` и отдаёт код 3 (частичный успех, как у
+    `report` с недоставившим приёмником) — без голого traceback `sqlite3`.
+    """
     config_dir = prepare(tmp_path)
     mock_source()
     invoke(config_dir, "run")
@@ -1302,6 +1340,28 @@ def test_cleanup_explains_a_storage_failure_instead_of_a_traceback(tmp_path: Pat
         result = invoke(config_dir, "cleanup", "--apply")
     finally:
         allow_writes(state)
+
+    assert result.exit_code == 3
+    assert "ОШИБКА" in result.output
+    assert "Traceback" not in result.output
+    assert "нет доступа к каталогу данных" not in result.output  # не тот путь ошибки
+
+
+@respx.mock
+def test_cleanup_still_explains_a_total_directory_lockout(tmp_path: Path) -> None:
+    """`_storage_errors` остаётся в деле для отказов ДО начала уборки —
+    например, каталог состояния целиком недоступен, и `_open()` не может
+    даже проверить, есть ли файл базы. Этот класс отказа `execute()` не
+    ловит и ловить не должен: ничего необратимого ещё не произошло."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    state = tmp_path / "state"
+    state.chmod(0)
+    try:
+        result = invoke(config_dir, "cleanup", "--apply")
+    finally:
+        state.chmod(0o755)
 
     assert result.exit_code == 1
     assert "нет доступа к каталогу данных" in result.output

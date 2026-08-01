@@ -1,6 +1,7 @@
 """Уборка: план, исполнение и то, чего она не трогает никогда."""
 
 import os
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -761,6 +762,12 @@ def test_horizon_is_written_only_after_the_cleanup_it_promises(
     начало `execute()`. Отказ `forget_descriptions` — то, что уборка
     обещает горизонтом, — обязан остановить запись горизонта, иначе файл
     начнёт утверждать то, чего на самом деле не произошло.
+
+    Раунд починки 1 (ревью Task 5, Important-1) научил `execute()` ловить
+    отказ базы вместо того, чтобы ронять его наружу исключением: сторож
+    обновлён под новый контракт — отказ виден в `CleanupPlan.errors`, а не
+    в `pytest.raises`, — но мутацию (запись горизонта до отказа) ловит
+    ровно так же, как и раньше.
     """
     db = tmp_path / "hh.db"
     repo = SqliteRepository(db)
@@ -774,9 +781,9 @@ def test_horizon_is_written_only_after_the_cleanup_it_promises(
 
     monkeypatch.setattr(repo, "forget_descriptions", boom)
 
-    with pytest.raises(RuntimeError, match="бум"):
-        execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
+    result = execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
 
+    assert any("бум" in error for error in result.errors)
     assert horizon(state) is None
 
 
@@ -822,3 +829,167 @@ def test_describe_names_the_errors_it_carries() -> None:
     )
     assert "ОШИБКА" in result.describe(applied=True)
     assert "Permission denied" in result.describe(applied=True)
+
+
+# --- Раунд починки 1 (ревью Task 5): отказ базы посреди `--apply` ----------
+#
+# Important-1: `execute()` шёл «файлы → база → VACUUM → горизонт», но
+# исключение из ЛЮБОГО вызова репозитория улетало наружу мимо
+# `CleanupPlan.errors`, прямиком в `_storage_errors` CLI — `describe()` не
+# печатался вовсе, и человек не узнавал ни одного факта о том, что уже
+# необратимо случилось (файлы удалены, описания обнулены, журнал почищен).
+# Замер ревью: `vacuum()`, упавший `database or disk is full` (самый
+# вероятный отказ именно для VACUUM — ему нужна вторая копия базы на
+# диске), прятал 5 удалённых файлов, 3 обнулённых описания и 2 удалённые
+# строки журнала, а горизонт не записывался — то есть отказывал ровно тот
+# механизм, ради которого горизонт заведён.
+
+
+def test_execute_reports_a_vacuum_failure_without_hiding_what_already_happened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`VACUUM`, упавший `database is full`, не имеет права прятать уже
+    удалённые файлы и уже обнулённые описания."""
+    repo, reports, old = _prepare_pending_cleanup(tmp_path)
+    state = tmp_path / "state"
+
+    def broken_vacuum(self: SqliteRepository) -> None:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(SqliteRepository, "vacuum", broken_vacuum)
+
+    result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+
+    assert not old.exists()
+    assert repo.descriptions_before(NOW) == (0, 0)
+    assert result.descriptions == 1
+    assert any("VACUUM" in error for error in result.errors)
+    assert horizon(state) is not None  # описания убраны — горизонт обещать можно
+
+
+def test_describe_does_not_claim_vacuum_succeeded_when_it_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Тот же принцип, из-за которого чинится Important-1: тексты не имеют
+    права обещать того, чего не было. `describe()` раньше печатал «база
+    ужата (VACUUM)» безусловно при `applied=True`, даже когда `VACUUM`
+    только что отказал строкой выше — два противоречащих друг другу
+    утверждения в одном выводе."""
+    repo, reports, old = _prepare_pending_cleanup(tmp_path)
+    state = tmp_path / "state"
+
+    def broken_vacuum(self: SqliteRepository) -> None:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(SqliteRepository, "vacuum", broken_vacuum)
+
+    result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+    text = result.describe(applied=True)
+
+    assert "база ужата" not in text
+    assert "VACUUM" in text
+
+
+def test_execute_does_not_write_the_horizon_when_descriptions_are_not_forgotten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Горизонт обещает «за этой датой описаний нет» — обещать нельзя, если
+    `forget_descriptions` сам отказал. Инвариант Task 4, теперь под
+    сторожем, который его действительно исполняет, а не полагается на
+    порядок вызовов, роняющий всё исключением."""
+    repo, reports, old = _prepare_pending_cleanup(tmp_path)
+    state = tmp_path / "state"
+
+    def broken_forget(self: SqliteRepository, cutoff: datetime) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(SqliteRepository, "forget_descriptions", broken_forget)
+
+    result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+
+    assert not old.exists()  # файлы не зависят от базы и убираются как обычно
+    assert result.errors
+    assert any("опис" in error for error in result.errors)
+    assert horizon(state) is None
+
+
+def test_execute_still_writes_the_horizon_when_only_the_run_log_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Отказ журнала прогонов не имеет отношения к тому, что обещает
+    горизонт (описания), — он обязан быть записан всё равно."""
+    repo, reports, old = _prepare_pending_cleanup(tmp_path)
+    state = tmp_path / "state"
+
+    def broken_runs(self: SqliteRepository, cutoff: datetime) -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(SqliteRepository, "forget_runs", broken_runs)
+
+    result = execute(repo, reports, state, NOW, CleanupDays(reports=90))
+
+    assert not old.exists()
+    assert repo.descriptions_before(NOW) == (0, 0)
+    assert result.errors
+    assert horizon(state) is not None
+
+
+# --- Раунд починки 1: Minor-3, файлы отчётов без флага `--reports` --------
+
+
+def test_describe_does_not_imply_report_files_were_considered_without_the_flag() -> None:
+    """Без `--reports` вывод не имеет права выглядеть так, будто файлы
+    отчётов проверялись и их не нашлось, — человек решит, что уборка их
+    уже почистила, хотя они не рассматривались вовсе."""
+    result = CleanupPlan(
+        descriptions=0,
+        description_bytes=0,
+        runs=0,
+        report_files=0,
+        report_bytes=0,
+        descriptions_cutoff=NOW,
+        reports_considered=False,
+    )
+    text = result.describe(applied=True)
+    assert "файлов отчётов: 0" not in text
+    assert "--reports" in text
+
+
+def test_plan_marks_report_files_as_not_considered_without_the_flag(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    report_file(reports, date(2020, 1, 1))
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+
+    result = plan(repo, reports, NOW, CleanupDays(reports=None))
+
+    assert "файлов отчётов: 0" not in result.describe(applied=False)
+
+
+def test_describe_still_shows_the_report_files_count_with_the_flag(tmp_path: Path) -> None:
+    """Контроль: с `--reports` строка про файлы остаётся как была."""
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+
+    result = plan(repo, reports, NOW, CleanupDays(reports=90))
+
+    assert "файлов отчётов: 0 (0.0 МБ)" in result.describe(applied=False)
+
+
+# --- Раунд починки 1: Minor-4, сообщение обязано называть флаг -------------
+
+
+def test_cleanup_days_negative_error_names_the_flag_not_the_field() -> None:
+    """Человек набирал `--descriptions-days`, а не `descriptions` — сообщение
+    обязано называть то, что он видел на экране."""
+    with pytest.raises(ValueError, match=r"--descriptions-days"):
+        CleanupDays(descriptions=-1)
+    with pytest.raises(ValueError, match=r"--runs-days"):
+        CleanupDays(runs=-1)
+    with pytest.raises(ValueError, match=r"--reports-days"):
+        CleanupDays(reports=-1)
