@@ -1174,6 +1174,197 @@ def test_a_report_that_fits_says_nothing_about_truncation(tmp_path: Path) -> Non
     assert "усечён" not in result.output
 
 
+# --- cleanup: ручная уборка старых данных (R-1) ----------------------------
+
+
+def backdate_reported_at(db: Path, days: int) -> None:
+    """Отодвинуть `reported_at` всех вакансий в прошлое, тем же приёмом, что `backdate_last_run`."""
+    stale = datetime.now(UTC) - timedelta(days=days)
+    raw = sqlite3.connect(str(db))
+    raw.execute("UPDATE vacancy SET reported_at = ?", (stale.isoformat(),))
+    raw.commit()
+    raw.close()
+
+
+@respx.mock
+def test_cleanup_without_apply_changes_nothing(tmp_path: Path) -> None:
+    """Без флага команда печатает план в БУДУЩЕМ времени и не трогает диск.
+
+    Для необратимой команды, которую зовут раз в несколько месяцев,
+    забыть добавить флаг безопаснее, чем забыть его убрать.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    db = state_path(config_dir)
+    reports = tmp_path / "reports"
+    db_before = db.read_bytes()
+    reports_before = {path: path.read_bytes() for path in sorted(reports.iterdir())}
+
+    result = invoke(config_dir, "cleanup")
+
+    assert result.exit_code == 0
+    assert "будет убрано" in result.output
+    assert db.read_bytes() == db_before
+    assert {path: path.read_bytes() for path in sorted(reports.iterdir())} == reports_before
+
+
+@respx.mock
+def test_cleanup_apply_clears_descriptions_and_says_so(tmp_path: Path) -> None:
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    backdate_reported_at(state_path(config_dir), days=200)
+
+    result = invoke(config_dir, "cleanup", "--apply")
+
+    assert result.exit_code == 0
+    assert "убрано" in result.output
+    assert "VACUUM" in result.output
+
+
+@respx.mock
+def test_cleanup_does_not_delete_report_files_without_the_flag(tmp_path: Path) -> None:
+    """Файлы отчётов — единственное необратимое из трёх действий уборки."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    old_report = tmp_path / "reports" / "2020-01-01-new.csv"
+    old_report.write_text("старый отчёт", encoding="utf-8")
+
+    result = invoke(config_dir, "cleanup", "--apply")
+
+    assert result.exit_code == 0
+    assert old_report.exists()
+
+
+def test_cleanup_refuses_while_a_run_holds_the_lock(tmp_path: Path) -> None:
+    """Уборка пишет в ту же базу, что демон, — значит берёт тот же замок."""
+    config_dir = prepare(tmp_path)
+    assert invoke(config_dir, "init-db").exit_code == 0
+    lock_path = state_path(config_dir).with_name(state_path(config_dir).name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = invoke(config_dir, "cleanup", "--apply")
+
+    assert result.exit_code != 0
+    assert "прогон" in result.output
+
+
+def test_cleanup_rejects_a_negative_retention_period(tmp_path: Path) -> None:
+    """Отрицательный срок приходит от человека через флаг — конфиг-ошибка, не трейсбек.
+
+    `CleanupDays.__post_init__` уже отвергает отрицательный срок; здесь
+    сторожится, что CLI превращает это в `_die(..., EXIT_CONFIG)`, а не в
+    голый traceback `ValueError`.
+    """
+    config_dir = prepare(tmp_path)
+    assert invoke(config_dir, "init-db").exit_code == 0
+
+    result = invoke(config_dir, "cleanup", "--descriptions-days", "-5")
+
+    assert result.exit_code == 2
+    assert "не может быть отрицательным" in result.output
+    assert "Traceback" not in result.output
+
+
+@respx.mock
+def test_cleanup_exits_nonzero_when_a_report_directory_is_unreadable(tmp_path: Path) -> None:
+    """Отказ части уборки не имеет права остаться кодом 0.
+
+    `cleanup` зовут раз в несколько месяцев, и по коду возврата человек
+    решает, случилось ли то, что он просил, — `CleanupPlan.errors`
+    непустые обязаны это показать, а не только текстом в выводе.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    reports_dir = tmp_path / "reports"
+    reports_dir.chmod(stat.S_IXUSR)
+    try:
+        result = invoke(config_dir, "cleanup", "--apply", "--reports")
+    finally:
+        reports_dir.chmod(0o755)
+
+    assert result.exit_code != 0
+    assert "ОШИБКА" in result.output
+
+
+@respx.mock
+def test_cleanup_explains_a_storage_failure_instead_of_a_traceback(tmp_path: Path) -> None:
+    """Тот же контраст, что у `run`/`mark`/`report` на томе `:ro` — не голый sqlite3."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    state = tmp_path / "state"
+    deny_writes(state)
+    try:
+        result = invoke(config_dir, "cleanup", "--apply")
+    finally:
+        allow_writes(state)
+
+    assert result.exit_code == 1
+    assert "нет доступа к каталогу данных" in result.output
+    assert "Traceback" not in result.output
+
+
+# --- report --since: предупреждение за горизонтом уборки (R-1) -------------
+
+
+@respx.mock
+def test_report_warns_when_the_window_reaches_past_the_cleanup_horizon(tmp_path: Path) -> None:
+    """`report --since 120` после уборки на 90 днях обязан сказать вслух.
+
+    Иначе потеря тихая: выборки отчёта фильтруют по `description IS NOT
+    NULL`, и человек получил бы 90 дней, попросив 120, без единого слова.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    assert invoke(config_dir, "cleanup", "--apply").exit_code == 0
+
+    result = invoke(config_dir, "report", "--since", "120d")
+
+    assert result.exit_code == 0
+    assert "уборк" in result.output
+
+
+@respx.mock
+def test_report_says_nothing_when_the_window_stays_within_the_cleanup_horizon(
+    tmp_path: Path,
+) -> None:
+    """Контроль: предупреждение не имеет права быть постоянным фоном."""
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    assert invoke(config_dir, "cleanup", "--apply").exit_code == 0
+
+    result = invoke(config_dir, "report", "--since", "7d")
+
+    assert result.exit_code == 0
+    assert "уборк" not in result.output
+
+
+@respx.mock
+def test_report_warning_does_not_replace_the_reports_own_work(tmp_path: Path) -> None:
+    """Предупреждение не имеет права заменить собой работу команды.
+
+    Уборка на умолчаниях не трогает сегодняшнюю вакансию (её `reported_at`
+    моложе 90 дней): `report --since 120d` обязан и предупредить о
+    горизонте, и всё равно доставить то, что внутри него осталось.
+    """
+    config_dir = prepare(tmp_path)
+    mock_source()
+    invoke(config_dir, "run")
+    assert invoke(config_dir, "cleanup", "--apply").exit_code == 0
+
+    result = invoke(config_dir, "report", "--since", "120d")
+
+    assert result.exit_code == 0
+    assert "уборк" in result.output
+    assert "отдано приёмникам вакансий: 1" in result.output
+
+
 # --- M11: цветной трейсбек rich выключен ----------------------------------
 
 

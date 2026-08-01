@@ -24,6 +24,7 @@ from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden, StorageUnavailable
 from hh_search.logging_setup import setup_logging
 from hh_search.pipeline import EXIT_CODES, OK, PARTIAL, RunStats, run_once
+from hh_search.pipeline.cleanup import CleanupDays, execute, horizon, plan
 from hh_search.pipeline.reporting import emit_to_sinks, maintain_sinks
 from hh_search.runlock import RunInProgress, single_run
 from hh_search.scheduler import EXIT_FORBIDDEN, StopSignal, serve
@@ -79,6 +80,13 @@ MIN_RUN_INTERVAL_FRACTION = 0.5
 
 ConfigDir = Annotated[Path | None, typer.Option("--config-dir", help="Каталог с YAML-конфигами")]
 Since = Annotated[str, typer.Option("--since", help="Период в днях: 7 или 7d")]
+Apply = Annotated[bool, typer.Option("--apply", help="Выполнить уборку, а не показать план")]
+Reports = Annotated[bool, typer.Option("--reports", help="Удалять и файлы отчётов")]
+DescriptionsDays = Annotated[
+    int, typer.Option("--descriptions-days", help="Срок хранения описаний")
+]
+RunsDays = Annotated[int, typer.Option("--runs-days", help="Срок хранения журнала прогонов")]
+ReportsDays = Annotated[int, typer.Option("--reports-days", help="Срок хранения файлов отчётов")]
 
 
 @app.callback()
@@ -271,6 +279,11 @@ def _lock_path(config: Config) -> Path:
     return state.with_name(state.name + ".lock")
 
 
+def _state_dir(config: Config) -> Path:
+    """Каталог рядом с базой: там же лежат маркер 403 и горизонт уборки."""
+    return config.app.paths.state.parent
+
+
 def _execute(config: Config, sinks: Sequence[Sink]) -> RunStats | None:
     """Один прогон. `None` — прогон пропущен, потому что предыдущий был только что.
 
@@ -419,6 +432,51 @@ def mark(ctx: typer.Context, vacancy_id: str, status: str) -> None:
     typer.echo(f"{vacancy_id} → {status}")
 
 
+@app.command("cleanup")
+def cleanup_command(
+    ctx: typer.Context,
+    apply: Apply = False,
+    reports: Reports = False,
+    descriptions_days: DescriptionsDays = 90,
+    runs_days: RunsDays = 365,
+    reports_days: ReportsDays = 90,
+) -> None:
+    """Убрать старые описания, журнал прогонов и (по флагу) файлы отчётов.
+
+    Без `--apply` печатает план и не трогает ничего. Замок тот же, что у
+    прогона: команда пишет в ту же базу, что демон.
+    """
+    config = _config(ctx)
+    try:
+        days = CleanupDays(
+            descriptions=descriptions_days,
+            runs=runs_days,
+            reports=reports_days if reports else None,
+        )
+    except ValueError as error:
+        # Отрицательный срок приходит от человека через флаг — это ошибка
+        # ввода, а не повод показывать traceback `ValueError` из датакласса.
+        _die(str(error), EXIT_CONFIG)
+    now = datetime.now(UTC)
+    try:
+        with _storage_errors(config), single_run(_lock_path(config)), _open(config) as repo:
+            if apply:
+                result = execute(repo, config.app.paths.reports, _state_dir(config), now, days)
+            else:
+                result = plan(repo, config.app.paths.reports, now, days)
+    except RunInProgress as error:
+        _die(str(error), EXIT_FAILED)
+    except StorageUnavailable as error:
+        _die(str(error), EXIT_FAILED)
+    typer.echo(result.describe(applied=apply))
+    if result.errors:
+        # Отказ части уборки не имеет права остаться кодом 0: `cleanup`
+        # зовут раз в несколько месяцев, и по коду возврата человек решает,
+        # случилось ли то, что он просил. `describe()` уже вывел причины
+        # строками «ОШИБКА: …» — здесь только код.
+        raise typer.Exit(EXIT_CODES[PARTIAL])
+
+
 @app.command("report")
 def report_command(ctx: typer.Context, since: Since = "7d") -> None:
     """Перегенерировать отчёт из базы по уже отправленным вакансиям."""
@@ -428,6 +486,17 @@ def report_command(ctx: typer.Context, since: Since = "7d") -> None:
         _die(f"--since ожидает число дней (7 или 7d), получено {since!r}", EXIT_CONFIG)
     sinks = _sinks(config)
     cutoff = datetime.now(UTC) - timedelta(days=int(match.group(1)))
+    horizon_day = horizon(_state_dir(config))
+    if horizon_day is not None and cutoff.date() < horizon_day:
+        # Тихая потеря иначе: выборки отчёта фильтруют по
+        # `description IS NOT NULL`, и убранные вакансии просто не
+        # придут — без единого слова о том, что окно шире хранимого.
+        typer.echo(
+            f"описания старше {horizon_day:%Y-%m-%d} убраны прошлой уборкой (`cleanup`): "
+            f"за эту границу отчёт вакансий не покажет, хотя запрошено с "
+            f"{cutoff:%Y-%m-%d}",
+            err=True,
+        )
     limit = config.app.limits.rows_per_batch
     try:
         with _storage_errors(config), _open(config) as repo:
