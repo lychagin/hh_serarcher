@@ -18,7 +18,7 @@ from hh_search.domain.models import (
     VacancyDetails,
     WorkFormat,
 )
-from hh_search.storage.base import DEFAULT_BATCH_LIMIT
+from hh_search.storage.base import DEFAULT_BATCH_LIMIT, Housekeeper
 from hh_search.storage.migrations import ADDED_COLUMNS
 from hh_search.storage.quarantine import STATUS_CORRUPT
 from hh_search.storage.repository import (
@@ -2444,3 +2444,164 @@ def test_unknown_stored_value_is_ignored_on_read(tmp_path: object) -> None:
     repository = SqliteRepository(db_path)
     assert repository.unreported()[0].details.work_formats == frozenset({WorkFormat.REMOTE})
     repository.close()
+
+
+# --- R-1: уборка — единственное место, где строки исчезают -----------------
+
+
+def _backdate_reported_at(repo: SqliteRepository, moment: datetime, *vacancy_ids: str) -> None:
+    """`reported_at` в прошлом — публичный API такой даты не ставит.
+
+    `mark_reported` всегда пишет «сейчас» (§5.3 конвейера: время отправки —
+    факт истории, а не параметр вызывающего), поэтому состояние «отправлено
+    давно» готовится сырым SQL — как и везде в этом файле, где порчу или
+    прошлое нельзя получить через публичные методы.
+    """
+    repo._connection.execute(  # noqa: SLF001 — reported_at в прошлом публичным API не поставить
+        f"UPDATE vacancy SET reported_at = ? WHERE id IN ({','.join('?' for _ in vacancy_ids)})",
+        (moment.isoformat(), *vacancy_ids),
+    )
+    repo._connection.commit()  # noqa: SLF001 — та же подготовка состояния
+
+
+def test_forget_descriptions_only_touches_old_reported_rows(repo: SqliteRepository) -> None:
+    """Обнуляются описания отправленных и старых. Всё остальное цело.
+
+    Три соседа проверяются вместе, потому что каждый ломается по-своему:
+    свежая отправленная теряется из `report --since` раньше срока,
+    строка `new` с описанием выпадает из очереди отчёта, а строка `new`
+    без описания ушла бы в сеть за уже скачанной страницей.
+    """
+    repo.add_discovered(make_vacancy("старая"), "embedded", 9)
+    repo.save_enriched("старая", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["старая"])
+    _backdate_reported_at(repo, datetime(2026, 1, 1, tzinfo=UTC), "старая")
+
+    repo.add_discovered(make_vacancy("свежая"), "embedded", 9)
+    repo.save_enriched("свежая", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["свежая"])
+
+    repo.add_discovered(make_vacancy("с-описанием"), "embedded", 9)
+    repo.save_description("с-описанием", VacancyDetails(description="Yocto"))
+
+    repo.add_discovered(make_vacancy("без-описания"), "embedded", 9)
+
+    freed = repo.forget_descriptions(datetime(2026, 5, 1, tzinfo=UTC))
+    assert freed == 1
+
+    # соседи целы: каждый виден ровно той выборке, которой был виден раньше
+    recent = repo.reported_since(datetime(2020, 1, 1, tzinfo=UTC))
+    assert [item.discovered.id for item in recent] == ["свежая"]
+    assert [v.id for v, _ in repo.pending_scoring()] == ["с-описанием"]
+    assert [v.id for v in repo.pending_enrichment(max_attempts=3)] == ["без-описания"]
+
+
+def test_forget_descriptions_is_idempotent(repo: SqliteRepository) -> None:
+    """Повторный вызов возвращает 0, а не число уже пустых строк.
+
+    Иначе вывод команды врал бы человеку: «убрано 152» на второй прогон
+    подряд означало бы, что уборка что-то делает, хотя делать ей нечего.
+    """
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["1"])
+    _backdate_reported_at(repo, datetime(2026, 1, 1, tzinfo=UTC), "1")
+    cutoff = datetime(2026, 5, 1, tzinfo=UTC)
+
+    assert repo.forget_descriptions(cutoff) == 1
+    assert repo.forget_descriptions(cutoff) == 0
+
+
+def test_a_cleaned_vacancy_is_never_fetched_again(repo: SqliteRepository) -> None:
+    """Обнулённое описание не возвращает вакансию в очередь обогащения.
+
+    Самый дорогой из инвариантов уборки: очередь отбирает
+    `status='new' AND description IS NULL`, и промах здесь означал бы
+    повторный запрос к hh.ru за каждой убранной вакансией плюс повторную
+    отправку в Telegram.
+    """
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_enriched("1", VacancyDetails(description="Yocto"), make_score())
+    repo.mark_reported(["1"])
+    _backdate_reported_at(repo, datetime(2026, 1, 1, tzinfo=UTC), "1")
+    cutoff = datetime(2026, 5, 1, tzinfo=UTC)
+
+    repo.forget_descriptions(cutoff)
+    assert repo.pending_enrichment(3, 100) == []
+
+
+def test_forget_runs_keeps_the_row_that_never_finished(repo: SqliteRepository) -> None:
+    """Незакрытая строка журнала переживает уборку.
+
+    `running` без `finished_at` — след убитого процесса, то есть улика
+    отказа, ради которой журнал и ведётся. Закроет её
+    `close_abandoned_runs()`, и удалит уже следующая уборка.
+    """
+    old_run = repo.start_run()
+    repo.finish_run(old_run, "ok", finished_at=datetime(2024, 1, 1, tzinfo=UTC))
+    unfinished_run = repo.start_run()  # никогда не закрыт: процесс убит на середине
+
+    cutoff = datetime(2026, 1, 1, tzinfo=UTC)
+    assert repo.count_runs_before(cutoff) == 1
+    assert repo.forget_runs(cutoff) == 1
+
+    remaining = repo._connection.execute("SELECT id FROM run").fetchall()  # noqa: SLF001
+    assert {int(row["id"]) for row in remaining} == {unfinished_run}
+
+
+def test_descriptions_before_counts_bytes_not_characters(repo: SqliteRepository) -> None:
+    """Байты, а не символы: описания кириллические, разница вдвое.
+
+    Число уезжает человеку в вывод команды как «освободится N МБ», и
+    ошибка вдвое сделала бы его бесполезным.
+    """
+    repo.add_discovered(make_vacancy("1"), "embedded", 9)
+    repo.save_description("1", VacancyDetails(description="ЖЖЖ"))
+    repo.mark_reported(["1"])
+    _backdate_reported_at(repo, datetime(2026, 1, 1, tzinfo=UTC), "1")
+
+    cutoff = datetime(2026, 5, 1, tzinfo=UTC)
+    rows, size = repo.descriptions_before(cutoff)
+    assert (rows, size) == (1, 6)
+
+
+def test_vacuum_shrinks_the_file_after_descriptions_are_cleared(tmp_path: Path) -> None:
+    """Без VACUUM файл не ужимается вовсе — и уборка выглядит сломанной.
+
+    Проверяется на ФАЙЛОВОЙ базе: у `:memory:` размера нет, и сторож был
+    бы зелен вакуумно.
+    """
+    path = tmp_path / "hh.db"
+    disk = SqliteRepository(path)
+    disk.init_schema()
+
+    ids = [str(index) for index in range(200)]
+    for vacancy_id in ids:
+        disk.add_discovered(make_vacancy(vacancy_id), "embedded", 9)
+        disk.save_description(vacancy_id, VacancyDetails(description="x" * 4096))
+        disk.mark_reported([vacancy_id])
+    _backdate_reported_at(disk, datetime(2026, 1, 1, tzinfo=UTC), *ids)
+    cutoff = datetime(2026, 5, 1, tzinfo=UTC)
+
+    before = path.stat().st_size
+    disk.forget_descriptions(cutoff)
+    after_update = path.stat().st_size
+    disk.vacuum()
+    after_vacuum = path.stat().st_size
+    assert after_update >= before, "UPDATE ... = NULL сам по себе файл не ужимает"
+    assert after_vacuum < before
+    disk.close()
+
+
+def _as_housekeeper(repo: Housekeeper) -> Housekeeper:
+    """Совместимость с протоколом уборки, зафиксированная для `mypy --strict`."""
+    return repo
+
+
+def test_sqlite_repository_satisfies_the_housekeeper_protocol(repo: SqliteRepository) -> None:
+    """Доказательство — пара «тест зелёный» и «файл проходит mypy --strict».
+
+    Рантайм здесь не доказывает ничего: протоколы структурные, и
+    несовпадение сигнатуры видит только проверка типов.
+    """
+    assert _as_housekeeper(repo) is repo

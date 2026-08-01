@@ -23,6 +23,7 @@ from hh_search.storage.base import (
 from hh_search.storage.mappers import to_discovered, to_id_and_title, to_scored, to_scoring_task
 from hh_search.storage.migrations import apply_schema
 from hh_search.storage.quarantine import Quarantine, safe_rows
+from hh_search.storage.retention import Retention
 from hh_search.storage.run_log import RunLog, RunSummary
 from hh_search.storage.time_utils import now_iso, to_utc_iso, to_utc_iso_optional
 
@@ -102,6 +103,7 @@ class SqliteRepository:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._run_log = RunLog(self._connection)
         self._quarantine = Quarantine(self._connection)
+        self._retention = Retention(self._connection)
 
     def __enter__(self) -> "SqliteRepository":
         return self
@@ -741,3 +743,20 @@ class SqliteRepository:
 
     def reset_cache(self, url: str) -> None:
         self._run_log.reset_cache(url)
+
+    # --- уборка: делегируется в Retention -------------------------------
+
+    def descriptions_before(self, cutoff: datetime) -> tuple[int, int]:
+        return self._retention.descriptions_before(cutoff)
+
+    def forget_descriptions(self, cutoff: datetime) -> int:
+        return self._retention.forget_descriptions(cutoff)
+
+    def count_runs_before(self, cutoff: datetime) -> int:
+        return self._retention.count_runs_before(cutoff)
+
+    def forget_runs(self, cutoff: datetime) -> int:
+        return self._retention.forget_runs(cutoff)
+
+    def vacuum(self) -> None:
+        self._retention.vacuum()
