@@ -522,14 +522,16 @@ def test_document_is_redelivered_when_suppressed_only_by_the_previous_day_file(
     tmp_path: Path,
 ) -> None:
     """`send_document` упал вечером — сообщение ушло, файл написан, но не
-    доставлен. Следующий прогон обязан довезти именно ЭТОТ файл, а не
+    доставлен. Следующий `maintain` обязан довезти именно ЭТОТ файл, а не
     молчать (спека §5, item 1): сообщение при этом не повторяется — оно
     уже ушло, и повтор был бы ровно тем дублем, которого избегает дедуп.
+    Довозка переехала в `maintain` (T-2) и к дедупликации `emit` по
+    свежим вакансиям больше отношения не имеет.
     """
     with pytest.raises(TelegramError):
         sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
     client = FakeClient()
-    assert sink(tmp_path, client).emit([vacancy()], NEXT_MORNING) == 0
+    sink(tmp_path, client).maintain(NEXT_MORNING)
     assert not client.messages
     assert len(client.documents) == 1
     filename, content, caption = client.documents[0]
@@ -541,7 +543,7 @@ def test_document_is_redelivered_when_suppressed_only_by_the_previous_day_file(
 def test_a_redelivered_day_is_not_delivered_a_second_time(tmp_path: Path) -> None:
     """Довозка обязана отметить день, который довезла.
 
-    Иначе она повторяет себя при каждом следующем прогоне без свежих
+    Иначе она повторяет себя при каждом следующем `maintain` без свежих
     вакансий — а `report --since 7d` даёт такой прогон сколько угодно раз
     подряд, потому что вакансии в нём уже отправлены и ничего не
     помечается.
@@ -549,11 +551,11 @@ def test_a_redelivered_day_is_not_delivered_a_second_time(tmp_path: Path) -> Non
     with pytest.raises(TelegramError):
         sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
     first = FakeClient()
-    assert sink(tmp_path, first).emit([vacancy()], NEXT_MORNING) == 0
+    sink(tmp_path, first).maintain(NEXT_MORNING)
     assert len(first.documents) == 1
 
     second = FakeClient()
-    assert sink(tmp_path, second).emit([vacancy()], NEXT_MORNING) == 0
+    sink(tmp_path, second).maintain(NEXT_MORNING)
     assert not second.documents, "довозка не отметила день — документ поехал второй раз"
 
 
@@ -599,11 +601,11 @@ def test_both_stuck_days_are_redelivered_not_just_the_nearest(tmp_path: Path) ->
     """Находка I1: `return` внутри цикла терял ДАЛЬНИЙ застрявший день.
 
     29-го `sendDocument` упал; 30-го пришли непомеченная вакансия 29-го и
-    новая, файл 30-го опубликован, `sendDocument` упал снова. 31-го
-    довозился только 30-й — и раз все приёмники отработали, `report()`
-    пометил обе вакансии, то есть документ 29-го не приезжал НИКОГДА.
-    Механизм довозки для него формально работал: это шире известного
-    остатка T-2, где теряется отказ последнего прогона суток.
+    новая, файл 30-го опубликован, `sendDocument` упал снова. `maintain`
+    31-го обязан довезти оба застрявших дня, а не только ближайший —
+    иначе документ 29-го не приезжал бы НИКОГДА, хотя механизм довозки
+    для него формально работает. Это шире известного остатка T-2, где
+    терялся отказ последнего прогона суток.
     """
     day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
     first, second = vacancy(vacancy_id="1"), vacancy(vacancy_id="2")
@@ -613,7 +615,7 @@ def test_both_stuck_days_are_redelivered_not_just_the_nearest(tmp_path: Path) ->
         sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([first, second], NEXT_MORNING)
 
     client = FakeClient()
-    assert sink(tmp_path, client).emit([first, second], day31) == 0
+    sink(tmp_path, client).maintain(day31)
     assert not client.messages
     assert [name for name, _, _ in client.documents] == [
         "2026-07-29-new.html",
@@ -623,28 +625,29 @@ def test_both_stuck_days_are_redelivered_not_just_the_nearest(tmp_path: Path) ->
 
 def test_upgrade_without_markers_redelivers_the_window_once(tmp_path: Path) -> None:
     """Путь обновления (спека §5, «цена отметки»): файл дня, написанный версией
-    БЕЗ отметок, выглядит СТАРЫМ. Первый прогон новой версии обязан довезти его
-    ровно один раз, второй прогон тех же суток — промолчать: отметка уже стоит.
+    БЕЗ отметок, выглядит СТАРЫМ. Первый `maintain` новой версии обязан довезти
+    его ровно один раз, второй `maintain` тех же суток — промолчать: отметка
+    уже стоит.
     """
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "2026-07-30-new.html").write_text(
         '<a href="https://hh.ru/vacancy/1">запись версии без отметок</a>', encoding="utf-8"
     )
     day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
-    stale = vacancy(vacancy_id="1")
 
     first = FakeClient()
-    assert sink(tmp_path, first).emit([stale], day31) == 0
+    sink(tmp_path, first).maintain(day31)
     assert [name for name, _, _ in first.documents] == ["2026-07-30-new.html"]
 
     second = FakeClient()
-    assert sink(tmp_path, second).emit([stale], day31) == 0
+    sink(tmp_path, second).maintain(day31)
     assert not second.documents, "второй прогон тех же суток довёз файл повторно"
 
 
 def test_partial_redelivery_failure_repeats_only_the_day_that_failed(tmp_path: Path) -> None:
-    """Из двух застрявших дней первый доехал, второй упал — повтор шлёт
-    только второй: первый успел получить отметку до падения второго.
+    """Из двух застрявших дней первый доехал, второй упал — повторный
+    `maintain` шлёт только второй: первый успел получить отметку до
+    падения второго.
     """
     with pytest.raises(TelegramError):
         sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy(vacancy_id="1")], EVENING)
@@ -653,15 +656,14 @@ def test_partial_redelivery_failure_repeats_only_the_day_that_failed(tmp_path: P
             [vacancy(vacancy_id="1"), vacancy(vacancy_id="2")], NEXT_MORNING
         )
     day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
-    both = [vacancy(vacancy_id="1"), vacancy(vacancy_id="2")]
 
     first_attempt = FakeClient(fail_document_after=1)
     with pytest.raises(TelegramError):
-        sink(tmp_path, first_attempt).emit(both, day31)
+        sink(tmp_path, first_attempt).maintain(day31)
     assert [name for name, _, _ in first_attempt.documents] == ["2026-07-29-new.html"]
 
     retry = FakeClient()
-    assert sink(tmp_path, retry).emit(both, day31) == 0
+    sink(tmp_path, retry).maintain(day31)
     assert [name for name, _, _ in retry.documents] == ["2026-07-30-new.html"]
 
 
@@ -673,7 +675,8 @@ def test_republished_day_file_is_redelivered_after_a_failed_document(tmp_path: P
     пережила публикацию новой версии, день считался бы доставленным — и
     вечерние записи, уже анонсированные сообщением, не приехали бы никогда.
     Поэтому публикация отметку снимает, а ставит её заново только успешная
-    отправка.
+    отправка. Довозка переехала в `maintain` (T-2), поэтому проверяется
+    вызовом `maintain`, а не третьим `emit`.
     """
     morning29 = datetime(2026, 7, 29, 10, 15, tzinfo=UTC)
     first, second = vacancy(vacancy_id="1"), vacancy(vacancy_id="2")
@@ -682,18 +685,18 @@ def test_republished_day_file_is_redelivered_after_a_failed_document(tmp_path: P
         sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([second], EVENING)
 
     client = FakeClient()
-    assert sink(tmp_path, client).emit([first, second], NEXT_MORNING) == 0
+    sink(tmp_path, client).maintain(NEXT_MORNING)
     assert not client.messages
     assert [name for name, _, _ in client.documents] == ["2026-07-29-new.html"]
 
 
 def test_redelivery_raises_when_send_document_fails_again(tmp_path: Path) -> None:
     """Продолжение: вторая неудача не имеет права молчать — следующий
-    прогон обязан попробовать ещё раз (спека §5, item 1)."""
+    `maintain` обязан попробовать ещё раз (спека §5, item 1)."""
     with pytest.raises(TelegramError):
         sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
     with pytest.raises(TelegramError):
-        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], NEXT_MORNING)
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).maintain(NEXT_MORNING)
     # Файл вчерашних суток остался на месте — есть, что довозить дальше.
     assert (tmp_path / "2026-07-29-new.html").exists()
     assert not (tmp_path / "2026-07-30-new.html").exists()
@@ -731,28 +734,32 @@ def test_os_replace_failure_removes_the_draft_and_raises(
     assert list(tmp_path.iterdir()) == [], "черновик остался после отказа os.replace"
 
 
-def test_orphaned_draft_from_a_killed_process_is_swept_on_the_next_emit(
+def test_orphaned_draft_from_a_killed_process_is_swept_on_the_next_maintain(
     tmp_path: Path,
 ) -> None:
     """`SIGKILL` между `mkstemp` и `os.replace` предыдущего прогона
     оставляет черновик навсегда — уборка обязана случиться на следующем
-    `emit`, а не ждать человека (item 2)."""
+    `maintain`, а не ждать человека (item 2). Уборка переехала из `emit` в
+    `maintain` (T-2): она случается независимо от того, есть ли что
+    отправлять.
+    """
     tmp_path.mkdir(exist_ok=True)
     orphan = tmp_path / "2026-07-28-new.htmlDEADBEEF.part"
     orphan.write_text("<html>обрывок прошлого прогона</html>", encoding="utf-8")
     client = FakeClient()
-    sink(tmp_path, client).emit([vacancy()], NOW)
+    sink(tmp_path, client).maintain(NOW)
     assert not orphan.exists()
-    assert (tmp_path / "2026-07-29-new.html").exists()
 
 
 @pytest.mark.skipif(os.getuid() == 0, reason="от root каталог только для чтения не бывает")
-def test_unremovable_draft_does_not_break_an_otherwise_empty_run(tmp_path: Path) -> None:
-    """Уборка черновиков стоит ДО `if not vacancies` и не имеет права
-    ронять прогон, который без неё вернул бы 0.
+def test_unremovable_draft_does_not_break_an_otherwise_empty_maintain(tmp_path: Path) -> None:
+    """Уборка черновиков не имеет права ронять `maintain`, вызываемый
+    прогоном, которому нечего отправлять (T-2: уборка переехала сюда из
+    `emit`, и звать её теперь надо именно так — прогон без свежих
+    вакансий раньше не звал `emit` вовсе).
 
     Каталог отчётов `0o500` с осиротевшим `.part` внутри: `unlink` даёт
-    `PermissionError`, и пустой прогон — тот, что раньше не касался ни
+    `PermissionError`, и такой прогон — тот, что раньше не касался ни
     сети, ни диска, — падал новым классом отказа, который лечится только
     руками. Черновик подождёт следующего прогона, это мусор, а не данные.
     """
@@ -762,7 +769,7 @@ def test_unremovable_draft_does_not_break_an_otherwise_empty_run(tmp_path: Path)
     reports.chmod(0o500)
     client = FakeClient()
     try:
-        assert sink(reports, client).emit([], NOW) == 0
+        sink(reports, client).maintain(NOW)
     finally:
         reports.chmod(0o700)
     assert not client.messages
@@ -813,16 +820,16 @@ def test_sweep_does_not_touch_a_published_day_file(tmp_path: Path) -> None:
 def test_two_consecutive_failed_midnights_still_do_not_repeat_the_message(
     tmp_path: Path,
 ) -> None:
-    """Отказ 29-го, отказ 30-го (повторная неудачная довозка), прогон
+    """Отказ 29-го, отказ 30-го (повторная неудачная довозка), `maintain`
     31-го обязан довезти документ 29-го и не повторить сообщение (item 3:
     окно в одни сутки этого не переживало бы — воспроизведение находки)."""
     day31 = datetime(2026, 7, 31, 3, 50, tzinfo=UTC)
     with pytest.raises(TelegramError):
         sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], EVENING)
     with pytest.raises(TelegramError):
-        sink(tmp_path, FakeClient(fail_on="sendDocument")).emit([vacancy()], NEXT_MORNING)
+        sink(tmp_path, FakeClient(fail_on="sendDocument")).maintain(NEXT_MORNING)
     client = FakeClient()
-    assert sink(tmp_path, client).emit([vacancy()], day31) == 0
+    sink(tmp_path, client).maintain(day31)
     assert not client.messages
     assert len(client.documents) == 1
     assert client.documents[0][0] == "2026-07-29-new.html"

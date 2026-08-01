@@ -104,6 +104,9 @@ class MarkdownSink:
             handle.write("\n".join(lines).rstrip() + "\n\n")
         return len(ordered)
 
+    def maintain(self, now: datetime) -> None:
+        """Обслуживать нечего: файл дня пишется целиком в `emit`."""
+
     def _read_day_file(self, path: Path) -> str:
         """Содержимое отчёта текущего дня; пусто, если файла нет.
 

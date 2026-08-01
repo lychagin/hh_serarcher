@@ -503,6 +503,53 @@ def test_report_rejects_an_unparsable_period(tmp_path: Path) -> None:
     assert "Traceback" not in result.output
 
 
+@respx.mock
+def test_report_since_redelivers_a_stuck_telegram_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`report --since` обязан довозить застрявшие документы telegram, как и `run`.
+
+    `report_command` зовёт `emit_to_sinks` напрямую, минуя `report()` из
+    `pipeline/reporting.py`, — то есть без явного вызова `maintain_sinks`
+    ручной `report --since` перестал бы и убирать черновики telegram, и
+    довозить документы, застрявшие без отметки о доставке, хотя раньше
+    делал и то и другое через `emit`. Докстринг `emit_to_sinks` называет
+    это правилом прямо: «`report` в CLI обязан вести себя ровно так же».
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1234567890:AAHtestTOKENvalueMUSTneverLEAK")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-1001234567890")
+    # `prepare()` уже развела пути `/data/...` по `tmp_path` — правим только
+    # список приёмников поверх готового файла, а не собираем пути заново.
+    config_dir = prepare(tmp_path)
+    app_file = config_dir / "app.yaml"
+    app_file.write_text(
+        app_file.read_text(encoding="utf-8").replace("sinks: [csv, markdown]", "sinks: [telegram]"),
+        encoding="utf-8",
+    )
+    mock_source()
+    respx.post(url__regex=r"https://api\.telegram\.org/bot.*/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    document_route = respx.post(url__regex=r"https://api\.telegram\.org/bot.*/sendDocument").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+
+    assert invoke(config_dir, "run").exit_code == 0
+    assert document_route.call_count == 1
+
+    # Застрявший документ: вчерашний файл дня без отметки `.sent` — ровно
+    # то, что оставляет вечерний прогон, у которого `send_document` упал.
+    yesterday = f"{datetime.now(UTC) - timedelta(days=1):%Y-%m-%d}"
+    stuck = tmp_path / "reports" / f"{yesterday}-new.html"
+    stuck.write_text("<html>вчерашний отчёт</html>", encoding="utf-8")
+
+    result = invoke(config_dir, "report", "--since", "7d")
+
+    assert result.exit_code == 0
+    assert document_route.call_count == 2, "report --since обязан довезти застрявший документ"
+    assert (stuck.parent / f"{stuck.name}.sent").exists()
+
+
 def test_report_says_when_there_is_nothing(tmp_path: Path) -> None:
     config_dir = prepare(tmp_path)
     invoke(config_dir, "init-db")

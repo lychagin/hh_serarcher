@@ -120,6 +120,10 @@ class RecordingSink:
         # уже ПОСЛЕ обратного чтения из базы.
         self.items: list[ScoredVacancy] = []
         self._fail = fail
+        self.maintained = 0
+
+    def maintain(self, now: datetime) -> None:
+        self.maintained += 1
 
     def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
         if self._fail:
@@ -772,6 +776,93 @@ def test_telegram_redelivers_the_stuck_document_exactly_once(
     assert (stats3.status, stats3.reported) == ("ok", 0)
     assert not third.messages
     assert not third.documents, "вакансия уже помечена — довозить нечего"
+
+
+# --- T-2: обслуживание приёмника не зависит от наличия работы --------------
+
+
+@respx.mock
+def test_a_run_with_nothing_to_report_still_redelivers_a_stuck_document(
+    config: Config, repo: SqliteRepository, tmp_path: Path
+) -> None:
+    """Прогон, которому отправлять нечего, чинит вчерашний застрявший документ.
+
+    До починки этот путь был недостижим по построению: `report()`
+    возвращался при пустой очереди, не позвав ни одного приёмника, а
+    довозка жила внутри `emit`, за веткой «вакансии пришли, но все
+    дубли». Тихие сутки — лучшее время чинить застрявшее, а были
+    единственным временем не чинить.
+    """
+    mock_source(listing_html(("111", "Senior Embedded Engineer")))
+    client = FakeClient()
+    telegram = TelegramSink(tmp_path, config.profile.report_threshold, client)  # type: ignore[arg-type]
+
+    run(config, repo, [telegram])
+    assert [name for name, _, _ in client.documents] == ["2026-07-28-new.html"]
+
+    stuck = tmp_path / "2026-07-27-new.html"
+    stuck.write_text("<html>вчерашний отчёт</html>", encoding="utf-8")
+
+    second = run(config, repo, [telegram])
+
+    assert (second.status, second.reported) == ("ok", 0)
+    assert [name for name, _, _ in client.documents] == [
+        "2026-07-28-new.html",
+        "2026-07-27-new.html",
+    ]
+
+
+@respx.mock
+def test_the_stuck_document_arrives_before_todays(
+    config: Config, repo: SqliteRepository, tmp_path: Path
+) -> None:
+    """Довозка идёт ПЕРЕД отправкой сегодняшнего, а не после.
+
+    Иначе документы легли бы в канале задом наперёд: сначала сегодняшний,
+    потом вчерашний.
+    """
+    mock_source(listing_html(("111", "Senior Embedded Engineer")))
+    client = FakeClient()
+    telegram = TelegramSink(tmp_path, config.profile.report_threshold, client)  # type: ignore[arg-type]
+    stuck = tmp_path / "2026-07-27-new.html"
+    stuck.write_text("<html>вчерашний отчёт</html>", encoding="utf-8")
+
+    run(config, repo, [telegram])
+
+    assert [name for name, _, _ in client.documents] == [
+        "2026-07-27-new.html",
+        "2026-07-28-new.html",
+    ]
+
+
+@respx.mock
+def test_a_failing_maintain_does_not_degrade_the_run(
+    config: Config, repo: SqliteRepository, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Недоступный Telegram не красит прогон, которому и отправлять нечего.
+
+    Понижение до `partial` означало бы, что отказ транспорта красит каждый
+    прогон подряд, — ровно та болезнь, от которой R-3 лечит `partial`.
+    Самоизлечение остаётся: отсутствующая отметка о доставке — факт на
+    диске, и следующий прогон попробует снова.
+    """
+    mock_source(listing_html(("111", "Senior Embedded Engineer")))
+    healthy = TelegramSink(tmp_path, config.profile.report_threshold, FakeClient())  # type: ignore[arg-type]
+    run(config, repo, [healthy])
+
+    stuck = tmp_path / "2026-07-27-new.html"
+    stuck.write_text("<html>вчерашний отчёт</html>", encoding="utf-8")
+    broken = FakeClient(fail_on="sendDocument")
+    sink = TelegramSink(tmp_path, config.profile.report_threshold, broken)  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.ERROR):
+        stats = run(config, repo, [sink])
+
+    assert (stats.status, stats.error) == ("ok", None)
+    assert "telegram" in caplog.text
+    assert not (tmp_path / "2026-07-27-new.html.sent").exists(), (
+        "отметка не ставится при отказе — иначе документ считался бы доставленным"
+    )
 
 
 @respx.mock

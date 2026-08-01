@@ -663,6 +663,19 @@ def test_sinks_do_nothing_on_empty_input(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_file_sinks_maintain_without_touching_the_disk(tmp_path: Path) -> None:
+    """Пустой `maintain` обязан остаться пустым: он зовётся каждый прогон.
+
+    Сторож на случай, если однажды в него положат работу «заодно»:
+    `report()` зовёт его в том числе тогда, когда отправлять нечего, и
+    запись на диск оттуда была бы работой без повода.
+    """
+    before = sorted(path.name for path in tmp_path.iterdir())
+    CsvSink(tmp_path).maintain(NOW)
+    MarkdownSink(tmp_path, 60.0).maintain(NOW)
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+
 def test_build_sinks_resolves_names(tmp_path: Path) -> None:
     sinks = build_sinks(["csv", "markdown"], tmp_path, threshold=60.0)
     assert [sink.name for sink in sinks] == ["csv", "markdown"]

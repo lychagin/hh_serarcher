@@ -24,7 +24,7 @@ from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden, StorageUnavailable
 from hh_search.logging_setup import setup_logging
 from hh_search.pipeline import EXIT_CODES, OK, PARTIAL, RunStats, run_once
-from hh_search.pipeline.reporting import emit_to_sinks
+from hh_search.pipeline.reporting import emit_to_sinks, maintain_sinks
 from hh_search.runlock import RunInProgress, single_run
 from hh_search.scheduler import EXIT_FORBIDDEN, StopSignal, serve
 from hh_search.scoring.keyword import KeywordScorer
@@ -456,11 +456,19 @@ def report_command(ctx: typer.Context, since: Since = "7d") -> None:
     # прогоном ровно так же, как два прогона гонятся между собой.
     try:
         with single_run(_lock_path(config)):
+            # `maintain_sinks` — тем же порядком, что и в `report()` из
+            # конвейера (`pipeline/reporting.py`): без неё `report --since`
+            # перестал бы и убирать черновики telegram, и довозить
+            # застрявшие документы, хотя раньше делал и то и другое через
+            # `emit`. Докстринг `emit_to_sinks` называет это явно: `report`
+            # в CLI обязан вести себя ровно так же, как `run`.
+            #
             # Через тот же `emit_to_sinks`, что и конвейер: недоступный
             # каталог отчётов давал здесь голый traceback, тогда как `run`
             # в этой же ситуации отдаёт внятный текст и ненулевой код. По
             # выводу `report` человек решает, чинить ему конфиг или том, —
             # двух разных ответов на один отказ у CLI быть не должно.
+            maintain_sinks(sinks, datetime.now(UTC))
             written, failed = emit_to_sinks(sinks, vacancies, datetime.now(UTC))
     except RunInProgress as error:
         _die(f"{error}. Отчёт пишется в тот же файл дня, поэтому ждём", EXIT_FAILED)

@@ -39,6 +39,10 @@ def report(
     moment: datetime,
     limit: int,
 ) -> None:
+    # ДО раннего возврата при пустой очереди и до `emit`: обслуживание не
+    # зависит от наличия работы (T-2), а довезённый вчерашний документ
+    # обязан лечь в канале раньше сегодняшнего.
+    maintain_sinks(sinks, moment)
     ready = _collect(repo, scorer, stats, limit)
     if not ready:
         return
@@ -93,6 +97,28 @@ def _collect(repo: Repository, scorer: Scorer, stats: RunStats, limit: int) -> l
             tail,
         )
     return ready
+
+
+def maintain_sinks(sinks: Sequence[Sink], moment: datetime) -> None:
+    """Дать каждому приёмнику обслужиться. Отказ громкий, но не заразный.
+
+    Статус прогона не понижается сознательно: недоступный Telegram иначе
+    красил бы `partial` каждые четыре часа, обесценивая статус ровно так
+    же, как это делала вырожденная страница листинга до R-3. Потеря при
+    отказе ограничена: признак застрявшего документа — файл на диске, и
+    следующий прогон попробует снова.
+    """
+    for sink in sinks:
+        try:
+            sink.maintain(moment)
+        except Exception as error:  # noqa: BLE001 — обслуживание не роняет прогон
+            logger.error(
+                "приёмник %s не обслужен: %s. Статус прогона не понижен, "
+                "следующий прогон попробует снова",
+                sink.name,
+                error,
+                exc_info=True,
+            )
 
 
 def emit_to_sinks(

@@ -108,8 +108,19 @@ class TelegramSink:
         self._threshold = threshold
         self._client = client
 
-    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
+    def maintain(self, now: datetime) -> None:
+        """Уборка черновиков и довозка застрявших документов (спека §5, item 1).
+
+        Обе вещи жили внутри `emit` и потому не случались там, где нужнее
+        всего: в прогоне, которому отправлять нечего. `emit` при пустом
+        списке вакансий возвращается раньше, а `report()` при пустой
+        очереди не зовёт приёмников вовсе, — то есть тихие сутки не чинили
+        ничего, хотя именно в них демон свободен.
+        """
         self._sweep_orphaned_drafts()
+        self._redeliver(self._previous_days(now.date()))
+
+    def emit(self, vacancies: Sequence[ScoredVacancy], now: datetime) -> int:
         if not vacancies:
             return 0
         path = self._day_file(now.date())
@@ -129,7 +140,11 @@ class TelegramSink:
             already.add(url)
             fresh.append(item)
         if not fresh:
-            return self._redeliver(previous)
+            # Довозка отсюда ушла в `maintain`: она к «все вакансии
+            # оказались дублями» отношения не имеет и запускалась этим
+            # признаком случайно. Ноль здесь верен буквально — записано
+            # ничего не было.
+            return 0
 
         document = (existing or document_header(now)) + render_section(fresh, now, self._threshold)
         payload = document.encode("utf-8")
@@ -159,7 +174,7 @@ class TelegramSink:
         marker.touch()
         return len(fresh)
 
-    def _redeliver(self, previous: Sequence[tuple[date, str, set[str]]]) -> int:
+    def _redeliver(self, previous: Sequence[tuple[date, str, set[str]]]) -> None:
         """Довезти документы предыдущих суток, застрявшие без отметки (item 1).
 
         Свежих вакансий нет — обычно это либо пустой прогон, либо повтор
@@ -187,7 +202,6 @@ class TelegramSink:
                 self._day_file(day).name, content.encode("utf-8"), f"Отчёт за {day:%Y-%m-%d}"
             )
             marker.touch()
-        return 0
 
     def _marker(self, path: Path) -> Path:
         """Отметка о доставке файла дня — пустой файл рядом с ним."""

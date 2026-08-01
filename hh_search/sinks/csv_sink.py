@@ -133,6 +133,9 @@ class CsvSink:
                 writer.writerow(self._row(item))
         return len(fresh)
 
+    def maintain(self, now: datetime) -> None:
+        """Обслуживать нечего: файл дня пишется целиком в `emit`."""
+
     def _row(self, item: ScoredVacancy) -> dict[str, str]:
         discovered = item.discovered
         salary = discovered.salary
