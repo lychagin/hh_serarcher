@@ -8,6 +8,7 @@ import pytest
 
 from hh_search.domain.models import DiscoveredVacancy, Salary, ScoreBreakdown, VacancyDetails
 from hh_search.pipeline.cleanup import (
+    HORIZON_CLOCK_SKEW_TOLERANCE,
     HORIZON_FILE,
     PROTECTED_DAYS,
     CleanupDays,
@@ -663,6 +664,91 @@ def test_a_future_horizon_on_disk_does_not_block_an_honest_write(tmp_path: Path)
     execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
 
     assert horizon(state) == date(2026, 5, 3)  # не застрял на 2099-01-01
+
+
+def test_horizon_equal_to_today_is_trusted_and_not_rolled_back(tmp_path: Path) -> None:
+    """Раунд починки 3 (ревью Task 4, Important-1): граница `existing == now.date()`.
+
+    Собственное сомнение прошлого раунда оказалось верным: нестрогое
+    сравнение (`<=`) выбрано правильно, но ни один тест не проверял
+    именно РАВЕНСТВО — только заведомо будущую (`2099-01-01`) и заведомо
+    прошлую (`test_horizon_never_moves_backward`) даты. Ревьюер проверил
+    исполнением, что мутация `<=` → `<` на этой границе реально ломает
+    монотонность: сохранённый горизонт, совпадающий с сегодняшним днём,
+    обязан участвовать в `max`, а не отбрасываться как «будущий» и
+    откатываться на более раннюю честную дату.
+    """
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / HORIZON_FILE).write_text(f"{NOW.date():%Y-%m-%d}\n", encoding="utf-8")
+
+    execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
+
+    assert horizon(state) == NOW.date()  # не откатился на 2026-05-03
+
+
+def test_horizon_exactly_at_the_clock_skew_tolerance_edge_is_still_trusted(tmp_path: Path) -> None:
+    """Раунд починки 3: сторож обязан целиться в ДЕЙСТВУЮЩУЮ границу кода.
+
+    Допуск `HORIZON_CLOCK_SKEW_TOLERANCE`, добавленный этим же раундом
+    (Important-2), сдвинул фактическую границу сравнения с `now.date()`
+    на `now.date() + HORIZON_CLOCK_SKEW_TOLERANCE`. Соседний тест
+    (`..._equal_to_today_...`) проверяет реалистичный, но уже не
+    предельный случай — после появления допуска `existing == now.date()`
+    лежит безопасно ВНУТРИ диапазона, а не на его краю, и мутация `<=` →
+    `<` его не красит (проверено). Только сторож на равенство РОВНО
+    краю допуска ловит эту мутацию — используется сама константа, а не
+    захардкоженное число дней, поэтому тест не протухнет, если допуск
+    когда-нибудь изменится.
+    """
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    saved = NOW.date() + HORIZON_CLOCK_SKEW_TOLERANCE
+    (state / HORIZON_FILE).write_text(f"{saved:%Y-%m-%d}\n", encoding="utf-8")
+
+    execute(repo, reports, state, NOW, CleanupDays(descriptions=90))
+
+    assert horizon(state) == saved  # не откатился на 2026-05-03
+
+
+def test_a_small_clock_rollback_still_trusts_the_saved_horizon(tmp_path: Path) -> None:
+    """Раунд починки 3 (ревью Task 4, Important-2): защита от будущего не
+    имеет права ломать монотонность при обычном дрожании часов.
+
+    `execute()` получает `now` аргументом, и ничто не гарантирует, что
+    между вызовами он растёт (коррекция NTP, ручная правка времени
+    хоста — тот же класс события, ради которого в `storage/run_log.py`
+    уже живёт `CLOCK_SKEW_TOLERANCE`). Часы здесь откатились на 20 часов
+    назад — сохранённый горизонт при этом выглядит «из будущего»
+    относительно нового `now` ровно на календарные сутки, но такой
+    откат — рядовое дрожание часов, а не порча диска, и допуск обязан
+    его прощать: сохранённая дата остаётся в силе, а не заменяется более
+    ранней честной датой.
+    """
+    db = tmp_path / "hh.db"
+    repo = SqliteRepository(db)
+    repo.init_schema()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    saved = date(2026, 8, 1)
+    (state / HORIZON_FILE).write_text(f"{saved:%Y-%m-%d}\n", encoding="utf-8")
+    rolled_back_now = datetime(2026, 7, 31, 14, 0, tzinfo=UTC)  # на 20 часов раньше saved-дня
+
+    execute(repo, reports, state, rolled_back_now, CleanupDays(descriptions=30))
+
+    assert horizon(state) == saved  # не откатился на 2026-07-01
 
 
 # --- I-5: горизонт пишется ПОСЛЕ уборки, не до ------------------------------
