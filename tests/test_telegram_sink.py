@@ -1306,3 +1306,36 @@ def test_no_tail_when_everything_new_is_in_the_message(tmp_path: Path) -> None:
         [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=80.0)], NOW
     )
     assert "в файле" not in client.messages[0]
+
+
+def test_seven_giant_titles_still_fit_the_limit(tmp_path: Path) -> None:
+    """Семь записей — не гарантия длины: заголовок пишет работодатель.
+
+    Перебор сверху вниз обязан показать столько, сколько влезает, и честно
+    назвать остаток.
+    """
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index} " + "длинная " * 120, total=90.0)
+        for index in range(20)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    assert message_length(message) <= MESSAGE_LIMIT
+    assert "выше порога — в файле" in message
+    assert "<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ" in message
+
+
+def test_tail_after_length_truncation_counts_the_dropped_entries(tmp_path: Path) -> None:
+    """Запись, выброшенная потолком ДЛИНЫ, попадает в тот же хвост, что и
+    выброшенная потолком в семь штук: для читателя это один остаток."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index} " + "длинная " * 200, total=90.0)
+        for index in range(9)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    shown = message.count('<a href="https://hh.ru/vacancy/')
+    assert shown < 7, "сообщение с такими заголовками не может вместить семь записей"
+    assert f"📄 Ещё <b>{9 - shown}</b> выше порога — в файле" in message
