@@ -101,10 +101,26 @@ def _tail(hidden_above: int, below: int) -> str:
     return ""
 
 
+def _link(item: ScoredVacancy, title: str | None = None) -> str:
+    """Ссылка на вакансию — ЕДИНСТВЕННОЕ место, где экранируется заголовок.
+
+    Три позиции макета (карточка, запись секции «ЕЩЁ», запасной вариант с
+    усечённым заголовком) собирали этот тег тремя отдельными выражениями, и
+    снятое экранирование в любом из них было бы `400 can't parse entities`
+    на живом заголовке с `&`. Пока выражение одно, следующее переименование
+    не может увести сторожа за одной веткой из трёх.
+
+    `title` задаётся только запасным вариантом: он показывает усечённый
+    префикс исходного заголовка, а не заголовок целиком.
+    """
+    discovered = item.discovered
+    text = discovered.title if title is None else title
+    return f'<a href="{escape_attr(discovered.url)}">{escape_html(text)}</a>'
+
+
 def _entry(item: ScoredVacancy) -> str:
     """Одна запись секции «ЕЩЁ»: балл со значком и мета-строка."""
-    discovered = item.discovered
-    link = f'<a href="{escape_attr(discovered.url)}">{escape_html(discovered.title)}</a>'
+    link = _link(item)
     line = f"<b>{item.score.total:.1f}</b> {_tier(item.score.total)} {link}"
     meta = _meta(item)
     return f"{line}\n{meta}" if meta else line
@@ -124,12 +140,14 @@ def _card(item: ScoredVacancy, now: datetime) -> str:
     Значка тира здесь нет намеренно: его место занимает `★`, а первой
     записи значок «она лучшая» ничего не добавляет.
     """
-    discovered = item.discovered
-    link = f'<a href="{escape_attr(discovered.url)}">{escape_html(discovered.title)}</a>'
-    meta = _meta(item, published=format_published(discovered.published_at, now))
+    link = _link(item)
+    meta = _meta(item, published=format_published(item.discovered.published_at, now))
     body = f"<b>{link}</b>\n{meta}" if meta else f"<b>{link}</b>"
-    subheader = f"<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ · {item.score.total:.1f}</code>"
-    return f"{subheader}\n<blockquote>{body}</blockquote>"
+    return f"{_subheader(item)}\n<blockquote>{body}</blockquote>"
+
+
+def _subheader(item: ScoredVacancy) -> str:
+    return f"<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ · {item.score.total:.1f}</code>"
 
 
 def _meta(item: ScoredVacancy, published: str | None = None) -> str:
@@ -162,18 +180,15 @@ def _minimal_message(item: ScoredVacancy, head: str, above: int, below: int) -> 
     не укорачивает текст: экранированная длина префикса растёт вместе с
     длиной префикса.
     """
-    prefix = (
-        f"<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ · {item.score.total:.1f}</code>\n"
-        f'<blockquote><b><a href="{escape_attr(item.discovered.url)}">'
-    )
-    suffix = "</a></b></blockquote>"
     title = item.discovered.title
     tail = _tail(above - 1, below)
     trailer = f"\n\n{tail}" if tail else ""
 
+    def card(length: int) -> str:
+        return f"{_subheader(item)}\n<blockquote><b>{_link(item, title[:length])}</b></blockquote>"
+
     def fits(length: int) -> bool:
-        card = prefix + escape_html(title[:length]) + suffix
-        return message_length(f"{head}\n\n{card}{trailer}") <= MESSAGE_LIMIT
+        return message_length(f"{head}\n\n{card(length)}{trailer}") <= MESSAGE_LIMIT
 
     if not fits(0):
         # Не влезает даже пустой заголовок: показана НИ ОДНА запись, и
@@ -187,4 +202,4 @@ def _minimal_message(item: ScoredVacancy, head: str, above: int, below: int) -> 
             low = mid
         else:
             high = mid - 1
-    return f"{head}\n\n{prefix}{escape_html(title[:low])}{suffix}{trailer}"
+    return f"{head}\n\n{card(low)}{trailer}"
