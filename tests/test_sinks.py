@@ -1,7 +1,7 @@
 import csv
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,13 @@ from hh_search.domain.models import (
 from hh_search.sinks import build_sinks
 from hh_search.sinks.csv_sink import COLUMNS, CsvSink
 from hh_search.sinks.markdown_sink import MarkdownSink
-from hh_search.sinks.text import SNIPPET_LENGTH, format_salary_short, format_work_formats
+from hh_search.sinks.text import (
+    SNIPPET_LENGTH,
+    format_day,
+    format_published,
+    format_salary_short,
+    format_work_formats,
+)
 
 # Данные тестов повторяют то, что приходит из хранилища: даты — aware UTC с
 # микросекундами (`storage/time_utils.py`), а зарплата и дата публикации
@@ -825,3 +831,49 @@ def test_short_salary_is_none_when_no_amount_was_parsed() -> None:
     мета-строки целиком вместе с разделителем."""
     assert format_salary_short(Salary()) is None
     assert format_salary_short(Salary(raw="по договорённости")) is None
+
+
+def test_format_day_prints_the_russian_month_in_genitive() -> None:
+    """Не `strftime("%B")`: в образе локали нет, и он дал бы «July»."""
+    assert format_day(datetime(2026, 7, 30, tzinfo=UTC)) == "30 июля"
+    assert format_day(datetime(2026, 1, 1, tzinfo=UTC)) == "1 января"
+    assert format_day(datetime(2026, 12, 31, tzinfo=UTC)) == "31 декабря"
+
+
+def test_published_today_and_yesterday_are_named_by_words() -> None:
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(datetime(2026, 7, 30, 9, 0, tzinfo=UTC), now) == "опубликовано сегодня"
+    assert format_published(datetime(2026, 7, 29, 23, 0, tzinfo=UTC), now) == "опубликовано вчера"
+
+
+def test_older_publication_is_named_by_the_date() -> None:
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(datetime(2026, 7, 28, 9, 0, tzinfo=UTC), now) == "опубликовано 28 июля"
+
+
+def test_publication_day_is_counted_in_the_zone_of_now() -> None:
+    """Сутки считаются в зоне `now` — той же, в которой именуется файл дня.
+
+    Вакансия, вышедшая в 01:00 МСК 30-го, по UTC вышла 29-го и назовётся
+    вчерашней. Цена названа в спеке: вторая шкала суток в одном сообщении
+    поставила бы «Отчёт за 2026-07-30» рядом с «опубликовано сегодня» про
+    разные сутки.
+    """
+    moscow = timezone(timedelta(hours=3))
+    now = datetime(2026, 7, 30, 5, 0, tzinfo=UTC)
+    published = datetime(2026, 7, 30, 1, 0, tzinfo=moscow)
+    assert format_published(published, now) == "опубликовано вчера"
+
+
+def test_naive_publication_date_is_dropped_instead_of_guessed() -> None:
+    """Смещение hh.ru отдаёт (замер 2026-07-27, фикстура vacancy.html.gz:
+    "datePosted": "2026-07-27T09:21:20.933+03:00"). Ветка нужна на случай
+    смены формата: пропасть обязана одна строка, а не отправка целиком.
+    """
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(datetime(2026, 7, 30, 9, 0), now) is None
+
+
+def test_missing_publication_date_is_dropped() -> None:
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(None, now) is None

@@ -8,6 +8,7 @@
 """
 
 import re
+from datetime import date, datetime
 
 from hh_search.domain.models import Salary, WorkFormat
 
@@ -28,6 +29,24 @@ _WORK_FORMAT_LABELS: dict[WorkFormat, str] = {
 # Порог, с которого сумма печатается тысячами. Ниже него «900 $»
 # превратилось бы в «0k $», то есть в неправду.
 _THOUSAND = 1000
+
+# Месяцы в родительном падеже: «30 июля». Не `strftime("%B")` — он берёт
+# название из локали процесса, а в образе локали нет (`LANG` не задан), то
+# есть в русском сообщении стояло бы «July».
+_MONTHS = (
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
 
 # Управляющие символы, которые не несут текста, но доезжают до файла:
 # нулевой байт и прочие C0/C1 ломают grep и часть редакторов, а
@@ -108,3 +127,32 @@ def format_salary_short(salary: Salary) -> str | None:
     if high is not None:
         return f"до {amount(high)}{suffix}{currency}"
     return None
+
+
+def format_day(moment: date) -> str:
+    """«30 июля»: день и месяц, без года и без ведущего нуля."""
+    return f"{moment.day} {_MONTHS[moment.month - 1]}"
+
+
+def format_published(published_at: datetime | None, now: datetime) -> str | None:
+    """«опубликовано сегодня» / «вчера» / «28 июля», либо `None`.
+
+    Сутки считаются в зоне `now`, то есть в UTC: имя файла дня и
+    `reported_at` считаются так же, а вторая шкала суток в одном сообщении
+    поставила бы «Отчёт за 2026-07-30» рядом с «опубликовано сегодня» про
+    разные сутки. Цена принята сознательно: вакансия, вышедшая в 01:00 МСК,
+    в ночном отчёте называется вчерашней.
+
+    Наивная дата (без смещения) даёт `None`, а не догадку о зоне: сравнивать
+    её с aware `now` — `TypeError` посреди отправки, а выдуманная зона врала
+    бы молча.
+    """
+    if published_at is None or published_at.tzinfo is None:
+        return None
+    day = published_at.astimezone(now.tzinfo).date()
+    distance = (now.date() - day).days
+    if distance == 0:
+        return "опубликовано сегодня"
+    if distance == 1:
+        return "опубликовано вчера"
+    return f"опубликовано {format_day(day)}"
