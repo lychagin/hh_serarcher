@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from hh_search import logging_setup
+from hh_search.domain.models import Salary, ScoredVacancy
 from hh_search.logging_setup import setup_logging
 from hh_search.sinks import build_sinks
 from hh_search.sinks.html_report import VACANCY_HREF_RE
@@ -969,7 +970,13 @@ def test_a_single_oversized_entry_falls_back_to_a_minimal_link(tmp_path: Path) -
     assert '<a href="https://hh.ru/vacancy/1">' in message
     assert "</a>" in message
     assert "Заголовок " * 800 not in message
-    assert "…ещё" not in message, "запись показана — хвост про остаток не нужен"
+    # Хвост называется по-своему в каждой из четырёх форм (§4 спеки вида
+    # сообщения), и общего у них ровно «в файле». Прежнее утверждение
+    # искало строку «…ещё», которой в `hh_search/` нет нигде: мутация
+    # `_minimal_message`, считающая показанную запись спрятанной, его
+    # переживала — то есть свойство item-9 «не ноль показанных записей при
+    # честном „ещё 1“» не сторожилось ничем.
+    assert "в файле" not in message, "запись показана — хвост про остаток не нужен"
 
 
 def test_minimal_fallback_survives_a_title_that_expands_five_times_on_escape(
@@ -1006,23 +1013,24 @@ def test_message_length_counts_utf16_code_units_not_code_points() -> None:
 
 
 def test_top_with_emoji_fits_the_limit_telegram_actually_counts(tmp_path: Path) -> None:
-    """Счёт в кодовых точках занижал длину: 300 вакансий с эмодзи дают
-    `len = 3994` при 5494 по счёту Telegram, и Bot API отвечает 400.
-
-    Дальше яд с самоподдержкой: `send_message` падает — файл не
-    публикуется — следующий прогон собирает то же сообщение — падает
+    """Счёт в кодовых точках занижает длину вдвое на эмодзи, и Bot API
+    отвечает 400. Дальше яд с самоподдержкой: `send_message` падает — файл
+    не публикуется — следующий прогон собирает то же сообщение — падает
     снова, и канал не получает НИЧЕГО.
 
-    Длина здесь считается ВРУЧНУЮ, а не через `message_length`: сторож,
-    зовущий проверяемую функцию, порчу этой функции переживает — мутация
-    `message_length` до `len` красила только её собственный юнит-тест, а
-    этот оставался зелёным.
+    Длину здесь гонит ЗАГОЛОВОК, а не количество вакансий. Прежняя редакция
+    брала 300 вакансий с заголовком в 40 эмодзи, и `TOP_LIMIT = 7` её
+    обезвредил: рендерились семь заголовков, 1460 кодовых единиц против
+    4096, — мутация `message_length` до `len` оставляла её зелёной.
+    Количество потолком прибито, длину им больше не разогнать; десять
+    вакансий по 300 эмодзи дают при счёте кодовыми точками 2990 против 5097
+    кодовых единиц UTF-16, то есть ровно тот отказ.
+
+    Длина считается ВРУЧНУЮ, а не через `message_length`: сторож, зовущий
+    проверяемую функцию, порчу этой функции переживает.
     """
     client = FakeClient()
-    many = [
-        vacancy(vacancy_id=str(index), title="🚀" * 40 + f" номер {index}", total=90.0)
-        for index in range(300)
-    ]
+    many = [vacancy(vacancy_id=str(index), title="🚀" * 300, total=90.0) for index in range(10)]
     sink(tmp_path, client).emit(many, NOW)
     assert len(client.messages[0].encode("utf-16-le")) // 2 <= MESSAGE_LIMIT
 
@@ -1031,6 +1039,84 @@ def test_message_escapes_dangerous_characters_in_the_title(tmp_path: Path) -> No
     client = FakeClient()
     sink(tmp_path, client).emit([vacancy(title="R&D <b>", total=90.0)], NOW)
     assert "R&amp;D &lt;b&gt;" in client.messages[0]
+
+
+# --- экранирование чужого текста во всех трёх позициях макета --------------
+#
+# Значение у каждого поля своё, чтобы упавшее утверждение называло ровно то
+# поле, которое перестало экранироваться, а не «где-то в сообщении».
+_HOSTILE: dict[str, tuple[str, str]] = {
+    "заголовок": ("Тимлид R&D <b>", "Тимлид R&amp;D &lt;b&gt;"),
+    "компания": ("Р&Софт <i>", "Р&amp;Софт &lt;i&gt;"),
+    "регион": ("Нижний <Новгород> & область", "Нижний &lt;Новгород&gt; &amp; область"),
+    "валюта": ("<₽>", "&lt;₽&gt;"),
+}
+# Запасной вариант показывает ОДИН заголовок и ни одной части мета-строки:
+# случай «компания в запасном варианте» был бы истинным по построению.
+_ESCAPING_CASES = [
+    pytest.param(position, field, id=f"{position}-{field}")
+    for position, fields in (
+        ("карточка", tuple(_HOSTILE)),
+        ("секция-ещё", tuple(_HOSTILE)),
+        ("запасной-вариант", ("заголовок",)),
+    )
+    for field in fields
+]
+
+
+def _hostile(vacancy_id: str, total: float, padding: str = "") -> ScoredVacancy:
+    """Вакансия, у которой ВСЕ чужие поля несут разметку.
+
+    Достижимость не экзотична: «Руководитель R&D» цитируют комментарии
+    фикстур этого же репозитория, а токен валюты приходит с разметки hh.ru —
+    вторая альтернатива `_CURRENCY_TOKEN_RE` (`sources/salary.py`) пропускает
+    и `<`, и `>`, и `&`.
+    """
+    item = vacancy(vacancy_id=vacancy_id, title=_HOSTILE["заголовок"][0] + padding, total=total)
+    item.discovered.company = _HOSTILE["компания"][0]
+    item.discovered.area = _HOSTILE["регион"][0]
+    item.discovered.salary = Salary(
+        raw="от 300 000", amount_from=300000, amount_to=None, currency=_HOSTILE["валюта"][0]
+    )
+    return item
+
+
+def _hostile_batch(position: str) -> list[ScoredVacancy]:
+    if position == "секция-ещё":
+        return [vacancy(vacancy_id="1", title="Лучшая", total=95.0), _hostile("2", 90.0)]
+    if position == "запасной-вариант":
+        # Заголовок длиннее лимита уводит сборку в `_minimal_message`;
+        # враждебная часть стоит в НАЧАЛЕ, чтобы пережить усечение.
+        return [_hostile("1", 90.0, padding="Заголовок " * 800)]
+    return [_hostile("1", 90.0)]
+
+
+@pytest.mark.parametrize(("position", "field"), _ESCAPING_CASES)
+def test_foreign_text_is_escaped_in_every_position_of_the_layout(
+    tmp_path: Path, position: str, field: str
+) -> None:
+    """Заголовок, компания, регион и валюта — чужой текст в КАЖДОЙ позиции.
+
+    Прежние два сторожа экранирования отдавали одну вакансию, то есть
+    исполняли только путь карточки: мутация «снять `escape_html` в `_entry`»
+    оставляла весь набор зелёным. Переименование `_entry`/`_minimal_entry` →
+    `_card`/`_entry`/`_minimal_message` превратило две ветки сборки ссылки в
+    три, а сторож поехал за одной — поэтому позиция здесь параметр, а не
+    выбранный руками случай.
+
+    Второе утверждение так же обязательно, как первое: без него случай,
+    в котором поле вообще не отрендерилось, был бы зелен по построению.
+
+    Цена, когда сработает: `400 can't parse entities`, и по спеке приёмника
+    канал не получает НИЧЕГО — ни сообщения, ни файла, — а следующий прогон
+    соберёт то же сообщение и упадёт снова.
+    """
+    client = FakeClient()
+    sink(tmp_path, client).emit(_hostile_batch(position), NOW)
+    message = client.messages[0]
+    raw, escaped = _HOSTILE[field]
+    assert raw not in message, f"{field}: чужая разметка ушла в канал как есть"
+    assert escaped in message, f"{field}: экранированного текста нет — позиция не отрендерена"
 
 
 @pytest.mark.parametrize(
@@ -1043,20 +1129,23 @@ def test_message_escapes_dangerous_characters_in_the_title(tmp_path: Path) -> No
 def test_message_href_with_a_quote_cannot_break_out_of_the_attribute(
     tmp_path: Path, title: str
 ) -> None:
-    """Item 9 на пути СООБЩЕНИЯ, а не файла: `escape_attr` в `_entry`.
+    """Item 9 на пути СООБЩЕНИЯ, а не файла: `escape_attr` в `_link`.
 
     Живые тесты про экранирование `href` сторожили `render_section`, то есть
-    путь файла; мутация «в `telegram_message._entry` вместо `escape_attr`
-    стоит `escape_html`» не красила ни одного теста из всего набора. Цена
-    мутации не косметическая: кавычка обрывает атрибут, `VACANCY_HREF_RE`
-    читает из него огрызок — а этим же регэкспом идёт дедупликация, то
-    есть ложное несрабатывание означает дубль в канале.
+    путь файла; мутация «в `telegram_message` вместо `escape_attr` стоит
+    `escape_html`» не красила ни одного теста из всего набора. Цена мутации
+    не косметическая: кавычка обрывает атрибут, `VACANCY_HREF_RE` читает из
+    него огрызок — а этим же регэкспом идёт дедупликация, то есть ложное
+    несрабатывание означает дубль в канале.
 
     Оба свойства проверяются здесь одним тестом: разметка сообщения цела И
-    регэксп находит ссылку целиком. Второй заголовок — длиннее лимита: он
-    уводит сборку в запасной `_minimal_entry`, где тот же `href` строится
-    вторым, отдельным выражением, и та же мутация в нём иначе осталась бы
-    незамеченной.
+    регэксп находит ссылку целиком. Позиций макета три — карточка (`_card`),
+    запись секции «ЕЩЁ» (`_entry`) и запасной вариант (`_minimal_message`),
+    — и все три собирают тег `<a>` одним выражением `_link`. Так стало
+    после находки I1: пока выражений было три, сторож экранирования ехал за
+    одним из них, а мутация в остальных оставалась незамеченной. Второй
+    заголовок здесь длиннее лимита именно поэтому: он уводит сборку в
+    запасной вариант, у которого своя, усечённая, ветка вызова `_link`.
     """
     malicious = vacancy(vacancy_id="1", title=title, total=90.0)
     malicious.discovered.url = 'https://hh.ru/vacancy/1"><script>alert(1)</script>'
@@ -1117,3 +1206,263 @@ def test_unknown_sink_still_refused(tmp_path: Path) -> None:
     # «sink» латиницей давало на выходе заикание «в app.yaml неизвестный
     # приёмник: неизвестный sink: карандаш» (находка I4).
     assert "неизвестный приёмник: карандаш" == str(caught.value)
+
+
+# --- новый вид сообщения (спека 2026-08-02-telegram-digest-layout-design) ---
+
+
+def test_message_head_names_the_day_and_both_counts(tmp_path: Path) -> None:
+    """Шапка: «30 июля · новых 2, выше порога 1».
+
+    «новых», а не «просмотрено»: приёмник не получает `RunStats` и знает
+    только то, что дописал сам.
+    """
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=10.0)], NOW
+    )
+    assert "29 июля · новых <b>2</b>, выше порога <b>1</b>" in client.messages[0]
+
+
+def test_best_match_is_a_card_with_a_subheader(tmp_path: Path) -> None:
+    """Вакансия №1 — подзаголовок в `<code>` и цитата со ссылкой в `<b>`."""
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", title="Лучшая", total=87.3)], NOW)
+    message = client.messages[0]
+    assert "<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ · 87.3</code>" in message
+    assert '<blockquote><b><a href="https://hh.ru/vacancy/1">Лучшая</a></b>' in message
+    assert "</blockquote>" in message
+
+
+def test_best_match_card_carries_company_area_salary_and_publication_date(
+    tmp_path: Path,
+) -> None:
+    """Мета-строка карточки — четыре части через « · », дата последней."""
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", total=87.3)], NOW)
+    assert "Р-Софт · Нижний Новгород · от 300k RUR · опубликовано сегодня" in client.messages[0]
+
+
+def test_only_the_card_carries_the_publication_date(tmp_path: Path) -> None:
+    """В семи строках подряд дата — шум; у находки дня она отвечает на
+    первый вопрос: не протухла ли она."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=80.0)], NOW
+    )
+    assert client.messages[0].count("опубликовано") == 1
+
+
+def test_card_without_company_does_not_double_the_separator(tmp_path: Path) -> None:
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", company=None, total=87.3)], NOW)
+    assert " ·  · " not in client.messages[0]
+    assert "Нижний Новгород · от 300k RUR" in client.messages[0]
+
+
+def test_card_without_area_does_not_double_the_separator(tmp_path: Path) -> None:
+    """Строка «нет региона» таблицы §5 — своим сторожем: до сих пор из двух
+    полей мета-строки покрывалось только одно."""
+    client = FakeClient()
+    item = vacancy(vacancy_id="1", total=87.3)
+    item.discovered.area = None
+    sink(tmp_path, client).emit([item], NOW)
+    message = client.messages[0]
+    assert " ·  · " not in message
+    assert "Р-Софт · от 300k RUR" in message
+
+
+def test_card_without_a_parsed_salary_omits_the_line_instead_of_a_placeholder(
+    tmp_path: Path,
+) -> None:
+    """Ни одной суммы — часть опускается ЦЕЛИКОМ (§5 спеки вида сообщения).
+
+    В сообщении из семи строк «зарплата не указана» — семь строк шума;
+    `format_salary_short` отдаёт `None` именно поэтому, и заглушка вместо
+    `None` не красила ни одного теста набора.
+    """
+    client = FakeClient()
+    item = vacancy(vacancy_id="1", total=87.3)
+    item.discovered.salary = Salary(raw="по договорённости")
+    sink(tmp_path, client).emit([item], NOW)
+    message = client.messages[0]
+    assert "Р-Софт · Нижний Новгород · опубликовано сегодня" in message
+    assert "зарплата" not in message
+
+
+def test_empty_top_keeps_the_head_and_says_where_to_look(tmp_path: Path) -> None:
+    """Ничего выше порога — сообщение всё равно уходит: файл-то есть."""
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", total=10.0)], NOW)
+    message = client.messages[0]
+    assert "новых <b>1</b>, выше порога <b>0</b>" in message
+    assert "<i>ничего выше порога — подробности в файле</i>" in message
+    assert "ЛУЧШЕЕ СОВПАДЕНИЕ" not in message
+
+
+def test_rest_of_the_top_goes_under_a_counted_subheader(tmp_path: Path) -> None:
+    """«ЕЩЁ 2» цифрой: прописью потребовало бы склонения числительного."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [
+            vacancy(vacancy_id="1", total=87.3),
+            vacancy(vacancy_id="2", title="Вторая", total=80.0),
+            vacancy(vacancy_id="3", title="Третья", total=73.0),
+        ],
+        NOW,
+    )
+    message = client.messages[0]
+    assert "<code>ЕЩЁ 2</code>" in message
+    assert '<b>80.0</b> 🔥 <a href="https://hh.ru/vacancy/2">Вторая</a>' in message
+    assert '<b>73.0</b> ⚡ <a href="https://hh.ru/vacancy/3">Третья</a>' in message
+
+
+def test_entries_of_the_rest_are_not_separated_by_a_blank_line(tmp_path: Path) -> None:
+    """Пустая строка между вакансиями съедала половину экрана — из-за неё
+    макет и переделывался."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [
+            vacancy(vacancy_id="1", total=87.3),
+            vacancy(vacancy_id="2", title="Вторая", total=80.0),
+            vacancy(vacancy_id="3", title="Третья", total=73.0),
+        ],
+        NOW,
+    )
+    message = client.messages[0]
+    assert "\n\n<b>73.0</b>" not in message, "между записями секции появилась пустая строка"
+
+
+def test_a_single_vacancy_above_threshold_has_no_rest_section(tmp_path: Path) -> None:
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=10.0)], NOW
+    )
+    assert "ЕЩЁ" not in client.messages[0]
+
+
+@pytest.mark.parametrize(
+    ("total", "tier"),
+    [(87.3, "🔥"), (80.0, "🔥"), (79.9, "⚡"), (70.0, "⚡"), (69.9, "▫️")],
+)
+def test_tier_marker_follows_the_absolute_score(tmp_path: Path, total: float, tier: str) -> None:
+    """Границы 80 и 70 — из макета, включённые снизу."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=95.0), vacancy(vacancy_id="2", title="Вторая", total=total)],
+        NOW,
+    )
+    assert f"{total:.1f}</b> {tier} " in client.messages[0]
+
+
+def test_top_is_capped_at_seven_entries(tmp_path: Path) -> None:
+    """Сорок вакансий выше порога дают ровно семь записей: карточку и «ЕЩЁ 6»."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=90.0 - index)
+        for index in range(40)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    assert "<code>ЕЩЁ 6</code>" in message
+    assert message.count('<a href="https://hh.ru/vacancy/') == 7
+
+
+def test_capped_top_keeps_the_highest_scores(tmp_path: Path) -> None:
+    """Режется хвост списка, а не его начало: в сообщении — лучшие семь."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=60.0 + index)
+        for index in range(20)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    assert "Вакансия 19" in message
+    assert "Вакансия 13" in message
+    assert "Вакансия 12" not in message
+
+
+# --- Task 5: хвост, честно называющий остаток выше порога и ниже -----------
+
+
+def test_tail_counts_only_what_is_below_the_threshold(tmp_path: Path) -> None:
+    """Всё выше порога влезло — хвост про остальных."""
+    client = FakeClient()
+    batch = [vacancy(vacancy_id="1", total=87.3)]
+    batch += [vacancy(vacancy_id=str(index), total=10.0) for index in range(2, 12)]
+    sink(tmp_path, client).emit(batch, NOW)
+    assert "📄 Ещё <b>10</b> ниже порога — в файле" in client.messages[0]
+
+
+def test_tail_counts_only_what_did_not_fit_above_the_threshold(tmp_path: Path) -> None:
+    """Ниже порога никого, но выше — больше семи.
+
+    Шапка проверяется здесь же и именно на этом случае: она обязана назвать
+    ВСЕХ прошедших порог, а не показанных. В остальных сторожах шапки два
+    этих числа совпадают, и мутация «печатать в шапке число показанных»
+    оставалась незамеченной — «выше порога 7 … ещё 3 выше порога» врало бы
+    про десять как про семь.
+    """
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=90.0 - index)
+        for index in range(10)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    assert "выше порога <b>10</b>" in client.messages[0]
+    assert "📄 Ещё <b>3</b> выше порога — в файле" in client.messages[0]
+
+
+def test_tail_counts_both_remainders_separately(tmp_path: Path) -> None:
+    """Два разных остатка не складываются в одно число: «выше порога» —
+    это то, что человек хотел бы увидеть, а не увидел."""
+    client = FakeClient()
+    batch = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=90.0 - index)
+        for index in range(10)
+    ]
+    batch += [vacancy(vacancy_id=f"low{index}", total=10.0) for index in range(5)]
+    sink(tmp_path, client).emit(batch, NOW)
+    assert "📄 Ещё <b>3</b> выше порога и <b>5</b> ниже — в файле" in client.messages[0]
+
+
+def test_no_tail_when_everything_new_is_in_the_message(tmp_path: Path) -> None:
+    """Прятать нечего — строки нет вовсе, а не «Ещё 0»."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=80.0)], NOW
+    )
+    assert "в файле" not in client.messages[0]
+
+
+def test_giant_titles_shrink_the_top_below_the_cap_of_seven(tmp_path: Path) -> None:
+    """Семь записей — не гарантия длины: заголовок пишет работодатель.
+
+    Перебор сверху вниз обязан показать столько, сколько влезает, и честно
+    назвать остаток.
+    """
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index} " + "длинная " * 120, total=90.0)
+        for index in range(20)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    assert message_length(message) <= MESSAGE_LIMIT
+    assert "выше порога — в файле" in message
+    assert "<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ" in message
+
+
+def test_tail_after_length_truncation_counts_the_dropped_entries(tmp_path: Path) -> None:
+    """Запись, выброшенная потолком ДЛИНЫ, попадает в тот же хвост, что и
+    выброшенная потолком в семь штук: для читателя это один остаток."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index} " + "длинная " * 200, total=90.0)
+        for index in range(9)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    shown = message.count('<a href="https://hh.ru/vacancy/')
+    assert shown < 7, "сообщение с такими заголовками не может вместить семь записей"
+    assert f"📄 Ещё <b>{9 - shown}</b> выше порога — в файле" in message

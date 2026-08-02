@@ -32,6 +32,7 @@ import yaml
 from hh_search.__main__ import cleanup_command
 from hh_search.config.models import LocationConfig
 from hh_search.domain.models import WorkFormat
+from hh_search.sinks.telegram_message import TIER_HOT, TIER_WARM, TOP_LIMIT
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "docs/superpowers/specs/2026-07-27-hh-autosearch-design.md"
@@ -570,6 +571,7 @@ def test_readme_recipe_for_a_repeat_delivery_matches_the_real_lookback_window() 
 
 
 TELEGRAM_SPEC = ROOT / "docs/superpowers/specs/2026-07-29-telegram-sink-design.md"
+LAYOUT_SPEC = ROOT / "docs/superpowers/specs/2026-08-02-telegram-digest-layout-design.md"
 
 # Ссылка на код номером строки: `__main__.py:458`, «на строке 55». Обе формы
 # протухают молча — от любой правки выше по файлу, и без единого красного
@@ -638,3 +640,42 @@ def test_spec_cleanup_defaults_match_the_command() -> None:
     assert f"вакансий старше {defaults['descriptions_days']} дней" in section
     assert f"прогонов старше {defaults['runs_days']} дней" in section
     assert f"отчётов старше {defaults['reports_days']} дней" in section
+
+
+# --- вид сообщения: числа документа обязаны совпадать с константами кода ---
+#
+# Тот же класс дыры, что уже чинили `test_readme_cleanup_defaults_match_the_command`:
+# число, переписанное в документ руками, расходится с кодом молча.
+
+
+def test_documents_name_the_real_top_limit() -> None:
+    """Потолок топа назван в спеке и README тем же числом, что в коде."""
+    spec = LAYOUT_SPEC.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+    assert f"не больше **{TOP_LIMIT}**" in spec, "спека называет другой потолок, чем TOP_LIMIT"
+    assert f"ЕЩЁ {TOP_LIMIT - 1}" in spec, "макет в спеке разошёлся с потолком TOP_LIMIT"
+    assert f"первые {TOP_LIMIT}" in readme, "README называет другой потолок, чем TOP_LIMIT"
+
+
+def test_spec_names_the_real_tier_thresholds() -> None:
+    """Границы значков 80/70 — из кода, а не переписанные в документ."""
+    spec = LAYOUT_SPEC.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+    assert f"`🔥` при {TIER_HOT:.0f} и выше" in spec
+    assert f"`⚡` при {TIER_WARM:.0f}–{TIER_HOT - 0.1:.1f}" in spec
+    assert f"`▫️` ниже {TIER_WARM:.0f}" in spec
+    assert f"{TIER_HOT:.0f} и выше, {TIER_WARM:.0f}–{TIER_HOT - 0.1:.1f}" in readme
+
+
+def test_readme_does_not_describe_the_retired_message_head() -> None:
+    """«Новых вакансий: N» — прежняя шапка. Документ, переживший код,
+    врёт молча."""
+    assert "Новых вакансий: N" not in README.read_text(encoding="utf-8")
+
+
+def test_telegram_sink_spec_points_at_the_layout_spec() -> None:
+    """§2 старой спеки описывал прежнюю разметку. Два документа,
+    утверждающих разное, хуже одного устаревшего."""
+    text = TELEGRAM_SPEC.read_text(encoding="utf-8")
+    assert "2026-08-02-telegram-digest-layout-design.md" in text
+    assert "Новых вакансий: N" not in text

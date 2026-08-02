@@ -1,7 +1,7 @@
 import csv
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,13 @@ from hh_search.domain.models import (
 from hh_search.sinks import build_sinks
 from hh_search.sinks.csv_sink import COLUMNS, CsvSink
 from hh_search.sinks.markdown_sink import MarkdownSink
-from hh_search.sinks.text import SNIPPET_LENGTH, format_work_formats
+from hh_search.sinks.text import (
+    SNIPPET_LENGTH,
+    format_day,
+    format_published,
+    format_salary_short,
+    format_work_formats,
+)
 
 # Данные тестов повторяют то, что приходит из хранилища: даты — aware UTC с
 # микросекундами (`storage/time_utils.py`), а зарплата и дата публикации
@@ -777,3 +783,97 @@ def test_markdown_dedup_survives_a_title_ending_with_a_backslash(tmp_path: Path)
     sink.emit([make_scored(vacancy_id="1", title="Инженер C++ \\")], NOW)
     text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
     assert text.count("https://hh.ru/vacancy/1") == 1
+
+
+def test_short_salary_prints_a_range_in_thousands() -> None:
+    """Диапазон — «450–600k ₽»: суффикс один раз в конце, тире короткое."""
+    salary = Salary(
+        raw="от 450 000 до 600 000 ₽", amount_from=450000, amount_to=600000, currency="₽"
+    )
+    assert format_salary_short(salary) == "450–600k ₽"
+
+
+def test_short_salary_drops_the_remainder_instead_of_rounding_it_up() -> None:
+    """487 500 даёт «от 487k», а не «от 488k».
+
+    Округление вниз всегда в сторону скромности: «от 488k» обещало бы
+    больше, чем написал работодатель, и обнаружилось бы это на собеседовании.
+    """
+    salary = Salary(raw="от 487 500 ₽", amount_from=487500, amount_to=None, currency="₽")
+    assert format_salary_short(salary) == "от 487k ₽"
+
+
+def test_short_salary_prints_only_the_upper_bound_when_there_is_no_lower() -> None:
+    salary = Salary(raw="до 600 000 ₽", amount_from=None, amount_to=600000, currency="₽")
+    assert format_salary_short(salary) == "до 600k ₽"
+
+
+def test_short_salary_keeps_small_amounts_whole() -> None:
+    """900 не превращается в «0k»: суффикс ставится, только если ОБЕ
+    печатаемые суммы не меньше тысячи."""
+    salary = Salary(raw="от 900 $", amount_from=900, amount_to=None, currency="$")
+    assert format_salary_short(salary) == "от 900 $"
+
+
+def test_short_salary_separates_thousands_with_a_space_when_it_prints_them_whole() -> None:
+    salary = Salary(raw="от 900 до 5 000 ₽", amount_from=900, amount_to=5000, currency="₽")
+    assert format_salary_short(salary) == "900–5 000 ₽"
+
+
+def test_short_salary_without_currency_prints_the_amounts_alone() -> None:
+    """Валюта не разобралась — суммы всё равно осмысленны."""
+    salary = Salary(raw="от 450 000", amount_from=450000, amount_to=None, currency=None)
+    assert format_salary_short(salary) == "от 450k"
+
+
+def test_short_salary_is_none_when_no_amount_was_parsed() -> None:
+    """`None`, а не «зарплата не указана»: вызывающий опускает часть
+    мета-строки целиком вместе с разделителем."""
+    assert format_salary_short(Salary()) is None
+    assert format_salary_short(Salary(raw="по договорённости")) is None
+
+
+def test_format_day_prints_the_russian_month_in_genitive() -> None:
+    """Не `strftime("%B")`: в образе локали нет, и он дал бы «July»."""
+    assert format_day(datetime(2026, 7, 30, tzinfo=UTC)) == "30 июля"
+    assert format_day(datetime(2026, 1, 1, tzinfo=UTC)) == "1 января"
+    assert format_day(datetime(2026, 12, 31, tzinfo=UTC)) == "31 декабря"
+
+
+def test_published_today_and_yesterday_are_named_by_words() -> None:
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(datetime(2026, 7, 30, 9, 0, tzinfo=UTC), now) == "опубликовано сегодня"
+    assert format_published(datetime(2026, 7, 29, 23, 0, tzinfo=UTC), now) == "опубликовано вчера"
+
+
+def test_older_publication_is_named_by_the_date() -> None:
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(datetime(2026, 7, 28, 9, 0, tzinfo=UTC), now) == "опубликовано 28 июля"
+
+
+def test_publication_day_is_counted_in_the_zone_of_now() -> None:
+    """Сутки считаются в зоне `now` — той же, в которой именуется файл дня.
+
+    Вакансия, вышедшая в 01:00 МСК 30-го, по UTC вышла 29-го и назовётся
+    вчерашней. Цена названа в спеке: вторая шкала суток в одном сообщении
+    поставила бы «Отчёт за 2026-07-30» рядом с «опубликовано сегодня» про
+    разные сутки.
+    """
+    moscow = timezone(timedelta(hours=3))
+    now = datetime(2026, 7, 30, 5, 0, tzinfo=UTC)
+    published = datetime(2026, 7, 30, 1, 0, tzinfo=moscow)
+    assert format_published(published, now) == "опубликовано вчера"
+
+
+def test_naive_publication_date_is_dropped_instead_of_guessed() -> None:
+    """Смещение hh.ru отдаёт (замер 2026-07-27, фикстура vacancy.html.gz:
+    "datePosted": "2026-07-27T09:21:20.933+03:00"). Ветка нужна на случай
+    смены формата: пропасть обязана одна строка, а не отправка целиком.
+    """
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(datetime(2026, 7, 30, 9, 0), now) is None
+
+
+def test_missing_publication_date_is_dropped() -> None:
+    now = datetime(2026, 7, 30, 10, 0, tzinfo=UTC)
+    assert format_published(None, now) is None
