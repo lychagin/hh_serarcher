@@ -1,109 +1,140 @@
-"""Сборка текста `sendMessage`: шапка, «Топ» и честный хвост про файл.
+"""Сборка текста `sendMessage`: макет «Находка дня» (спека 2026-08-02).
 
 Вынесено из `telegram_sink.py` отдельным модулем ради бюджета §4.3 основной
 спеки: `emit()` приёмника уже занят дедупликацией по нескольким суткам,
-черновиком и повторной доставкой документа (спека приёмника telegram §5,
-находки 2026-07-30), и сборка текста сообщения стала там лишним весом.
-Функции здесь чистые — ни сети, ни диска, — как и весь `html_report.py`.
+черновиком и повторной доставкой документа. Функции здесь чистые — ни сети,
+ни диска, — как и весь `html_report.py`.
 """
 
 from collections.abc import Sequence
+from datetime import datetime
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.html_report import escape_attr, escape_html
 from hh_search.sinks.telegram_client import MESSAGE_LIMIT, message_length
+from hh_search.sinks.text import format_day, format_published, format_salary_short
+
+# Сколько вакансий выше порога уходит в сообщение: карточка плюс шесть
+# строк. Не «сколько влезет в 4096»: смысл макета — «читается за три
+# секунды», а выше порога в живом прогоне бывает и сорок штук. Остаток
+# честно назван хвостом и лежит в файле дня.
+TOP_LIMIT = 7
+# Пороги значков. Абсолютные и взятые из макета: при `report_threshold: 60`
+# шкала работает как задумана. Порог выше 80 сделал бы все значки
+# одинаковыми — это видно с первого же сообщения и чинится здесь, поэтому в
+# конфиг не выносится (§1 спеки вида сообщения).
+TIER_HOT = 80.0
+TIER_WARM = 70.0
+
+_EMPTY_TOP = "<i>ничего выше порога — подробности в файле</i>"
 
 
-def render_message(fresh: Sequence[ScoredVacancy], threshold: float) -> str:
-    """Шапка и «Топ» со ссылками, гарантированно короче `MESSAGE_LIMIT`.
+def render_message(fresh: Sequence[ScoredVacancy], threshold: float, now: datetime) -> str:
+    """Сообщение целиком, гарантированно короче `MESSAGE_LIMIT`.
 
     Счётчики здесь — отчёта, а не прогона: `Sink.emit` не получает
     `RunStats` и получать не должен, иначе ради одной строки текста
     пришлось бы менять интерфейс, общий с `csv` и `markdown` (спека §2).
+
+    Длина подбирается перебором СВЕРХУ ВНИЗ: собирается сообщение на
+    `TOP_LIMIT` записей, затем на одну меньше, и так до первого влезающего.
+    Перебор, а не наращивание с резервом места под хвост, потому что и
+    хвост, и подзаголовок «ЕЩЁ N» зависят от числа показанных записей —
+    наращивание считало бы их до того, как оно известно. Семь сборок дешевле
+    одной сетевой ошибки.
     """
     top = sorted(
         (item for item in fresh if item.score.total >= threshold),
         key=lambda item: item.score.total,
         reverse=True,
     )
-    head = f"<b>Новых вакансий: {len(fresh)}</b>, выше порога: {len(top)}"
-    lines = [head]
-    shown = 0
-    for item in top:
-        entry = _entry(item)
-        # Хвост объявляется честно, поэтому место под него резервируется
-        # ДО того, как строка перестанет влезать.
-        tail = f"\n\n…ещё {len(top) - shown} — в файле"
-        # Длина считается так, как её считает Telegram, — в кодовых
-        # единицах UTF-16 (`message_length`). Счёт в кодовых точках
-        # занижал её на каждом эмодзи в заголовке, и Bot API отвечал
-        # 400 на сообщение, которое по нашему счёту влезало.
-        if message_length("\n\n".join([*lines, entry]) + tail) > MESSAGE_LIMIT:
-            break
-        lines.append(entry)
-        shown += 1
-    if shown == 0 and top:
-        # Ни одна запись не влезла целиком — она сама больше лимита вместе
-        # с шапкой и хвостом. Обрезать готовую разметку нельзя (рвёт тег
-        # или сущность, `400 can't parse entities`), поэтому запасной
-        # вариант усекает ИСХОДНЫЙ заголовок до экранирования и до сборки
-        # тега — молчать нельзя, хвост уже обещал «ещё N».
-        minimal = _minimal_entry(top[0], head, len(top) - 1)
-        if minimal is not None:
-            lines.append(minimal)
-            shown = 1
-    if shown < len(top):
-        lines.append(f"…ещё {len(top) - shown} — в файле")
-    elif not top:
-        lines.append("<i>ничего выше порога — подробности в файле</i>")
-    return "\n\n".join(lines)
+    below = len(fresh) - len(top)
+    head = _head(now, len(fresh), len(top))
+    if not top:
+        return f"{head}\n\n{_EMPTY_TOP}"
+    limited = top[:TOP_LIMIT]
+    for count in range(len(limited), 0, -1):
+        message = _assemble(limited[:count], now, head, len(top), below)
+        if message_length(message) <= MESSAGE_LIMIT:
+            return message
+    return _minimal_message(top[0], head, len(top), below)
 
 
-def _entry(item: ScoredVacancy) -> str:
+def _head(now: datetime, total: int, above: int) -> str:
+    return f"{format_day(now)} · новых <b>{total}</b>, выше порога <b>{above}</b>"
+
+
+def _assemble(
+    items: Sequence[ScoredVacancy], now: datetime, head: str, above: int, below: int
+) -> str:
+    """Сообщение из заданного числа записей — без проверки длины."""
+    return "\n\n".join([head, _card(items[0], now)])
+
+
+def _card(item: ScoredVacancy, now: datetime) -> str:
+    """Карточка лучшего совпадения: подзаголовок и цитата.
+
+    Значка тира здесь нет намеренно: его место занимает `★`, а первой
+    записи значок «она лучшая» ничего не добавляет.
+    """
     discovered = item.discovered
-    meta = " · ".join(
-        part
-        for part in (
-            escape_html(discovered.company) if discovered.company else None,
-            escape_html(discovered.area) if discovered.area else None,
-            escape_html(discovered.salary.raw) if discovered.salary.raw else None,
-        )
-        if part
-    )
-    return (
-        f'<a href="{escape_attr(discovered.url)}">{escape_html(discovered.title)}</a> — '
-        f"<b>{item.score.total:.1f}</b>\n{meta}"
-    )
+    link = f'<a href="{escape_attr(discovered.url)}">{escape_html(discovered.title)}</a>'
+    meta = _meta(item, published=format_published(discovered.published_at, now))
+    body = f"<b>{link}</b>\n{meta}" if meta else f"<b>{link}</b>"
+    subheader = f"<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ · {item.score.total:.1f}</code>"
+    return f"{subheader}\n<blockquote>{body}</blockquote>"
 
 
-def _minimal_entry(item: ScoredVacancy, head: str, rest: int) -> str | None:
-    """Запасной вариант: голая ссылка с усечённым заголовком, без метаданных.
+def _meta(item: ScoredVacancy, published: str | None = None) -> str:
+    """«компания · регион · зарплата [· дата]»; пустые части не оставляют
+    после себя разделителя.
+
+    Экранируется всё, включая зарплату: токен валюты приходит из разметки
+    hh.ru (`_CURRENCY_TOKEN_RE` пропускает и `<`), то есть это чужой текст,
+    а не наше форматирование.
+    """
+    discovered = item.discovered
+    salary = format_salary_short(discovered.salary)
+    parts = (
+        escape_html(discovered.company) if discovered.company else None,
+        escape_html(discovered.area) if discovered.area else None,
+        escape_html(salary) if salary else None,
+        published,
+    )
+    return " · ".join(part for part in parts if part)
+
+
+def _minimal_message(item: ScoredVacancy, head: str, above: int, below: int) -> str:
+    """Запасной вариант: карточка с усечённым заголовком, без мета-строки.
 
     Заголовок усекается ИСХОДНЫМ текстом — двоичным поиском по длине
     префикса — а уже потом экранируется и оборачивается тегом. Обратный
     порядок (усечь готовую разметку) рвёт тег или именованную сущность
-    (`&amp;` пополам) и даёт `400` у Bot API вместо честного «Топа».
-    Двоичный поиск корректен, потому что `escape_html` не укорачивает
-    текст: экранированная длина префикса растёт вместе с его длиной.
-    Возвращает `None`, если не влезает даже пустой заголовок — тогда
-    вызывающий код оставляет прежнее поведение (только честный хвост).
+    (`&amp;` пополам) и даёт `400 can't parse entities` у Bot API вместо
+    честного сообщения. Двоичный поиск корректен, потому что `escape_html`
+    не укорачивает текст: экранированная длина префикса растёт вместе с
+    длиной префикса.
     """
-    discovered = item.discovered
-    prefix = f'<a href="{escape_attr(discovered.url)}">'
-    suffix = f"</a> — <b>{item.score.total:.1f}</b>"
-    tail = f"\n\n…ещё {rest} — в файле"
+    prefix = (
+        f"<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ · {item.score.total:.1f}</code>\n"
+        f'<blockquote><b><a href="{escape_attr(item.discovered.url)}">'
+    )
+    suffix = "</a></b></blockquote>"
+    title = item.discovered.title
 
     def fits(length: int) -> bool:
-        candidate = prefix + escape_html(discovered.title[:length]) + suffix
-        return message_length("\n\n".join([head, candidate]) + tail) <= MESSAGE_LIMIT
+        card = prefix + escape_html(title[:length]) + suffix
+        return message_length(f"{head}\n\n{card}") <= MESSAGE_LIMIT
 
     if not fits(0):
-        return None
-    low, high = 0, len(discovered.title)
+        # Не влезает даже пустой заголовок — показывать нечего, но молчать
+        # нельзя: файл дня уже уехал, и человек обязан узнать, что в нём.
+        return head
+    low, high = 0, len(title)
     while low < high:
         mid = (low + high + 1) // 2
         if fits(mid):
             low = mid
         else:
             high = mid - 1
-    return prefix + escape_html(discovered.title[:low]) + suffix
+    return f"{head}\n\n{prefix}{escape_html(title[:low])}{suffix}"

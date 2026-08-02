@@ -133,7 +133,7 @@ class TelegramSink:
         payload = document.encode("utf-8")
         draft = self._draft(path, payload)
         try:
-            self._client.send_message(render_message(fresh, self._threshold))
+            self._client.send_message(render_message(fresh, self._threshold, now))
         except BaseException:
             # Черновик не имеет права остаться: каталог отчётов зарос бы
             # обрывками, а файл дня обязан дождаться повторного прогона

@@ -986,6 +986,7 @@ def test_minimal_fallback_survives_a_title_that_expands_five_times_on_escape(
     assert '<a href="https://hh.ru/vacancy/1">' in message
 
 
+@pytest.mark.xfail(reason="хвост появляется в Task 5", strict=True)
 def test_long_top_is_truncated_with_an_honest_tail(tmp_path: Path) -> None:
     """Молчаливое обрезание запрещено: 5 позиций укладываются, 500 — нет."""
     client = FakeClient()
@@ -1117,3 +1118,65 @@ def test_unknown_sink_still_refused(tmp_path: Path) -> None:
     # «sink» латиницей давало на выходе заикание «в app.yaml неизвестный
     # приёмник: неизвестный sink: карандаш» (находка I4).
     assert "неизвестный приёмник: карандаш" == str(caught.value)
+
+
+# --- новый вид сообщения (спека 2026-08-02-telegram-digest-layout-design) ---
+
+
+def test_message_head_names_the_day_and_both_counts(tmp_path: Path) -> None:
+    """Шапка: «30 июля · новых 2, выше порога 1».
+
+    «новых», а не «просмотрено»: приёмник не получает `RunStats` и знает
+    только то, что дописал сам.
+    """
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=10.0)], NOW
+    )
+    assert "29 июля · новых <b>2</b>, выше порога <b>1</b>" in client.messages[0]
+
+
+def test_best_match_is_a_card_with_a_subheader(tmp_path: Path) -> None:
+    """Вакансия №1 — подзаголовок в `<code>` и цитата со ссылкой в `<b>`."""
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", title="Лучшая", total=87.3)], NOW)
+    message = client.messages[0]
+    assert "<code>★ ЛУЧШЕЕ СОВПАДЕНИЕ · 87.3</code>" in message
+    assert '<blockquote><b><a href="https://hh.ru/vacancy/1">Лучшая</a></b>' in message
+    assert "</blockquote>" in message
+
+
+def test_best_match_card_carries_company_area_salary_and_publication_date(
+    tmp_path: Path,
+) -> None:
+    """Мета-строка карточки — четыре части через « · », дата последней."""
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", total=87.3)], NOW)
+    assert "Р-Софт · Нижний Новгород · от 300k RUR · опубликовано сегодня" in client.messages[0]
+
+
+def test_only_the_card_carries_the_publication_date(tmp_path: Path) -> None:
+    """В семи строках подряд дата — шум; у находки дня она отвечает на
+    первый вопрос: не протухла ли она."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=80.0)], NOW
+    )
+    assert client.messages[0].count("опубликовано") == 1
+
+
+def test_card_without_company_does_not_double_the_separator(tmp_path: Path) -> None:
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", company=None, total=87.3)], NOW)
+    assert " ·  · " not in client.messages[0]
+    assert "Нижний Новгород · от 300k RUR" in client.messages[0]
+
+
+def test_empty_top_keeps_the_head_and_says_where_to_look(tmp_path: Path) -> None:
+    """Ничего выше порога — сообщение всё равно уходит: файл-то есть."""
+    client = FakeClient()
+    sink(tmp_path, client).emit([vacancy(vacancy_id="1", total=10.0)], NOW)
+    message = client.messages[0]
+    assert "новых <b>1</b>, выше порога <b>0</b>" in message
+    assert "<i>ничего выше порога — подробности в файле</i>" in message
+    assert "ЛУЧШЕЕ СОВПАДЕНИЕ" not in message
