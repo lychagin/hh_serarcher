@@ -17,7 +17,7 @@ from hh_search.domain.models import (
 from hh_search.sinks import build_sinks
 from hh_search.sinks.csv_sink import COLUMNS, CsvSink
 from hh_search.sinks.markdown_sink import MarkdownSink
-from hh_search.sinks.text import SNIPPET_LENGTH, format_work_formats
+from hh_search.sinks.text import SNIPPET_LENGTH, format_salary_short, format_work_formats
 
 # Данные тестов повторяют то, что приходит из хранилища: даты — aware UTC с
 # микросекундами (`storage/time_utils.py`), а зарплата и дата публикации
@@ -777,3 +777,51 @@ def test_markdown_dedup_survives_a_title_ending_with_a_backslash(tmp_path: Path)
     sink.emit([make_scored(vacancy_id="1", title="Инженер C++ \\")], NOW)
     text = (tmp_path / "2026-07-27-new.md").read_text(encoding="utf-8")
     assert text.count("https://hh.ru/vacancy/1") == 1
+
+
+def test_short_salary_prints_a_range_in_thousands() -> None:
+    """Диапазон — «450–600k ₽»: суффикс один раз в конце, тире короткое."""
+    salary = Salary(
+        raw="от 450 000 до 600 000 ₽", amount_from=450000, amount_to=600000, currency="₽"
+    )
+    assert format_salary_short(salary) == "450–600k ₽"
+
+
+def test_short_salary_drops_the_remainder_instead_of_rounding_it_up() -> None:
+    """487 500 даёт «от 487k», а не «от 488k».
+
+    Округление вниз всегда в сторону скромности: «от 488k» обещало бы
+    больше, чем написал работодатель, и обнаружилось бы это на собеседовании.
+    """
+    salary = Salary(raw="от 487 500 ₽", amount_from=487500, amount_to=None, currency="₽")
+    assert format_salary_short(salary) == "от 487k ₽"
+
+
+def test_short_salary_prints_only_the_upper_bound_when_there_is_no_lower() -> None:
+    salary = Salary(raw="до 600 000 ₽", amount_from=None, amount_to=600000, currency="₽")
+    assert format_salary_short(salary) == "до 600k ₽"
+
+
+def test_short_salary_keeps_small_amounts_whole() -> None:
+    """900 не превращается в «0k»: суффикс ставится, только если ОБЕ
+    печатаемые суммы не меньше тысячи."""
+    salary = Salary(raw="от 900 $", amount_from=900, amount_to=None, currency="$")
+    assert format_salary_short(salary) == "от 900 $"
+
+
+def test_short_salary_separates_thousands_with_a_space_when_it_prints_them_whole() -> None:
+    salary = Salary(raw="от 900 до 5 000 ₽", amount_from=900, amount_to=5000, currency="₽")
+    assert format_salary_short(salary) == "900–5 000 ₽"
+
+
+def test_short_salary_without_currency_prints_the_amounts_alone() -> None:
+    """Валюта не разобралась — суммы всё равно осмысленны."""
+    salary = Salary(raw="от 450 000", amount_from=450000, amount_to=None, currency=None)
+    assert format_salary_short(salary) == "от 450k"
+
+
+def test_short_salary_is_none_when_no_amount_was_parsed() -> None:
+    """`None`, а не «зарплата не указана»: вызывающий опускает часть
+    мета-строки целиком вместе с разделителем."""
+    assert format_salary_short(Salary()) is None
+    assert format_salary_short(Salary(raw="по договорённости")) is None

@@ -9,7 +9,7 @@
 
 import re
 
-from hh_search.domain.models import WorkFormat
+from hh_search.domain.models import Salary, WorkFormat
 
 # Описание с hh.ru — килобайты текста. Без обрезки «Топ» перестаёт быть
 # выжимкой и читается дольше самой страницы вакансии.
@@ -24,6 +24,10 @@ _WORK_FORMAT_LABELS: dict[WorkFormat, str] = {
     WorkFormat.ON_SITE: "офис",
     WorkFormat.FIELD_WORK: "разъездной",
 }
+
+# Порог, с которого сумма печатается тысячами. Ниже него «900 $»
+# превратилось бы в «0k $», то есть в неправду.
+_THOUSAND = 1000
 
 # Управляющие символы, которые не несут текста, но доезжают до файла:
 # нулевой байт и прочие C0/C1 ломают grep и часть редакторов, а
@@ -67,3 +71,40 @@ def format_work_formats(formats: frozenset[WorkFormat]) -> str:
     if not formats:
         return "формат не указан"
     return ", ".join(_WORK_FORMAT_LABELS[value] for value in sorted(formats))
+
+
+def format_salary_short(salary: Salary) -> str | None:
+    """Зарплата одной короткой строкой: «450–600k ₽», «от 487k ₽».
+
+    Собирается из разобранных сумм, а не из `Salary.raw`: полная строка
+    hh.ru («от 450 000 до 600 000 ₽ на руки») переносится на телефоне на
+    вторую строку и рвёт мета-строку сообщения. Пометка «на руки» вместе с
+    ней и теряется — она остаётся в файле дня и в CSV (решение владельца,
+    §3 спеки вида сообщения).
+
+    Тысячи ОТБРАСЫВАЮТСЯ, а не округляются: «от 487k» обещает меньше, чем
+    написал работодатель, а «от 488k» обещало бы больше.
+
+    `None` — ни одной суммы не разобрано. Тогда вызывающий код опускает
+    часть строки целиком, а не пишет «зарплата не указана»: в сообщении из
+    семи строк такая заглушка — семь строк шума.
+    """
+    low, high = salary.amount_from, salary.amount_to
+    if low is None and high is None:
+        return None
+    thousands = all(value >= _THOUSAND for value in (low, high) if value is not None)
+    suffix = "k" if thousands else ""
+    currency = f" {salary.currency}" if salary.currency else ""
+
+    def amount(value: int) -> str:
+        # Неразрывный пробел здесь не нужен: строку никто не переносит по
+        # словам, она уходит одним куском мета-строки.
+        return str(value // _THOUSAND) if thousands else f"{value:_}".replace("_", " ")
+
+    if low is not None and high is not None:
+        return f"{amount(low)}–{amount(high)}{suffix}{currency}"
+    if low is not None:
+        return f"от {amount(low)}{suffix}{currency}"
+    if high is not None:
+        return f"до {amount(high)}{suffix}{currency}"
+    return None
