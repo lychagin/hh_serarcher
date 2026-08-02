@@ -986,7 +986,6 @@ def test_minimal_fallback_survives_a_title_that_expands_five_times_on_escape(
     assert '<a href="https://hh.ru/vacancy/1">' in message
 
 
-@pytest.mark.xfail(reason="хвост появляется в Task 5", strict=True)
 def test_long_top_is_truncated_with_an_honest_tail(tmp_path: Path) -> None:
     """Молчаливое обрезание запрещено: 5 позиций укладываются, 500 — нет."""
     client = FakeClient()
@@ -1262,3 +1261,48 @@ def test_capped_top_keeps_the_highest_scores(tmp_path: Path) -> None:
     assert "Вакансия 19" in message
     assert "Вакансия 13" in message
     assert "Вакансия 12" not in message
+
+
+# --- Task 5: хвост, честно называющий остаток выше порога и ниже -----------
+
+
+def test_tail_counts_only_what_is_below_the_threshold(tmp_path: Path) -> None:
+    """Всё выше порога влезло — хвост про остальных."""
+    client = FakeClient()
+    batch = [vacancy(vacancy_id="1", total=87.3)]
+    batch += [vacancy(vacancy_id=str(index), total=10.0) for index in range(2, 12)]
+    sink(tmp_path, client).emit(batch, NOW)
+    assert "📄 Ещё <b>10</b> ниже порога — в файле" in client.messages[0]
+
+
+def test_tail_counts_only_what_did_not_fit_above_the_threshold(tmp_path: Path) -> None:
+    """Ниже порога никого, но выше — больше семи."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=90.0 - index)
+        for index in range(10)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    assert "📄 Ещё <b>3</b> выше порога — в файле" in client.messages[0]
+
+
+def test_tail_counts_both_remainders_separately(tmp_path: Path) -> None:
+    """Два разных остатка не складываются в одно число: «выше порога» —
+    это то, что человек хотел бы увидеть, а не увидел."""
+    client = FakeClient()
+    batch = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=90.0 - index)
+        for index in range(10)
+    ]
+    batch += [vacancy(vacancy_id=f"low{index}", total=10.0) for index in range(5)]
+    sink(tmp_path, client).emit(batch, NOW)
+    assert "📄 Ещё <b>3</b> выше порога и <b>5</b> ниже — в файле" in client.messages[0]
+
+
+def test_no_tail_when_everything_new_is_in_the_message(tmp_path: Path) -> None:
+    """Прятать нечего — строки нет вовсе, а не «Ещё 0»."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=80.0)], NOW
+    )
+    assert "в файле" not in client.messages[0]

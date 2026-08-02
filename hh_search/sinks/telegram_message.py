@@ -76,7 +76,29 @@ def _assemble(
         # неё макет и переделывался.
         blocks.append(f"<code>ЕЩЁ {len(rest)}</code>")
         blocks.append("\n".join(_entry(item) for item in rest))
+    tail = _tail(above - len(items), below)
+    if tail:
+        blocks.append(tail)
     return "\n\n".join(blocks)
+
+
+def _tail(hidden_above: int, below: int) -> str:
+    """Честный остаток: что не влезло и что осталось ниже порога.
+
+    Два числа не складываются в одно: «выше порога» — это то, что человек
+    хотел бы увидеть в сообщении и не увидел, а «ниже» он и так не ждал.
+
+    Ни одна форма не содержит существительного при числе: «145 вакансий»
+    потребовало бы согласования («1 вакансия», «2 вакансии»), то есть
+    таблицы форм ради одного слова.
+    """
+    if hidden_above and below:
+        return f"📄 Ещё <b>{hidden_above}</b> выше порога и <b>{below}</b> ниже — в файле"
+    if hidden_above:
+        return f"📄 Ещё <b>{hidden_above}</b> выше порога — в файле"
+    if below:
+        return f"📄 Ещё <b>{below}</b> ниже порога — в файле"
+    return ""
 
 
 def _entry(item: ScoredVacancy) -> str:
@@ -146,15 +168,18 @@ def _minimal_message(item: ScoredVacancy, head: str, above: int, below: int) -> 
     )
     suffix = "</a></b></blockquote>"
     title = item.discovered.title
+    tail = _tail(above - 1, below)
+    trailer = f"\n\n{tail}" if tail else ""
 
     def fits(length: int) -> bool:
         card = prefix + escape_html(title[:length]) + suffix
-        return message_length(f"{head}\n\n{card}") <= MESSAGE_LIMIT
+        return message_length(f"{head}\n\n{card}{trailer}") <= MESSAGE_LIMIT
 
     if not fits(0):
-        # Не влезает даже пустой заголовок — показывать нечего, но молчать
-        # нельзя: файл дня уже уехал, и человек обязан узнать, что в нём.
-        return head
+        # Не влезает даже пустой заголовок: показана НИ ОДНА запись, и
+        # хвост обязан назвать все, а не все минус одну.
+        nothing = _tail(above, below)
+        return f"{head}\n\n{nothing}" if nothing else head
     low, high = 0, len(title)
     while low < high:
         mid = (low + high + 1) // 2
@@ -162,4 +187,4 @@ def _minimal_message(item: ScoredVacancy, head: str, above: int, below: int) -> 
             low = mid
         else:
             high = mid - 1
-    return f"{head}\n\n{prefix}{escape_html(title[:low])}{suffix}"
+    return f"{head}\n\n{prefix}{escape_html(title[:low])}{suffix}{trailer}"
