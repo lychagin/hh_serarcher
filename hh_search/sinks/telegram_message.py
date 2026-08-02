@@ -68,7 +68,32 @@ def _assemble(
     items: Sequence[ScoredVacancy], now: datetime, head: str, above: int, below: int
 ) -> str:
     """Сообщение из заданного числа записей — без проверки длины."""
-    return "\n\n".join([head, _card(items[0], now)])
+    blocks = [head, _card(items[0], now)]
+    rest = items[1:]
+    if rest:
+        # Записи секции склеены ОДНИМ переводом строки, а блоки — двумя:
+        # пустая строка между вакансиями съедала половину экрана, из-за
+        # неё макет и переделывался.
+        blocks.append(f"<code>ЕЩЁ {len(rest)}</code>")
+        blocks.append("\n".join(_entry(item) for item in rest))
+    return "\n\n".join(blocks)
+
+
+def _entry(item: ScoredVacancy) -> str:
+    """Одна запись секции «ЕЩЁ»: балл со значком и мета-строка."""
+    discovered = item.discovered
+    link = f'<a href="{escape_attr(discovered.url)}">{escape_html(discovered.title)}</a>'
+    line = f"<b>{item.score.total:.1f}</b> {_tier(item.score.total)} {link}"
+    meta = _meta(item)
+    return f"{line}\n{meta}" if meta else line
+
+
+def _tier(score: float) -> str:
+    if score >= TIER_HOT:
+        return "🔥"
+    if score >= TIER_WARM:
+        return "⚡"
+    return "▫️"
 
 
 def _card(item: ScoredVacancy, now: datetime) -> str:

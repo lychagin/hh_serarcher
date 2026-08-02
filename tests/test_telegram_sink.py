@@ -1180,3 +1180,85 @@ def test_empty_top_keeps_the_head_and_says_where_to_look(tmp_path: Path) -> None
     assert "новых <b>1</b>, выше порога <b>0</b>" in message
     assert "<i>ничего выше порога — подробности в файле</i>" in message
     assert "ЛУЧШЕЕ СОВПАДЕНИЕ" not in message
+
+
+def test_rest_of_the_top_goes_under_a_counted_subheader(tmp_path: Path) -> None:
+    """«ЕЩЁ 2» цифрой: прописью потребовало бы склонения числительного."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [
+            vacancy(vacancy_id="1", total=87.3),
+            vacancy(vacancy_id="2", title="Вторая", total=80.0),
+            vacancy(vacancy_id="3", title="Третья", total=73.0),
+        ],
+        NOW,
+    )
+    message = client.messages[0]
+    assert "<code>ЕЩЁ 2</code>" in message
+    assert '<b>80.0</b> 🔥 <a href="https://hh.ru/vacancy/2">Вторая</a>' in message
+    assert '<b>73.0</b> ⚡ <a href="https://hh.ru/vacancy/3">Третья</a>' in message
+
+
+def test_entries_of_the_rest_are_not_separated_by_a_blank_line(tmp_path: Path) -> None:
+    """Пустая строка между вакансиями съедала половину экрана — из-за неё
+    макет и переделывался."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [
+            vacancy(vacancy_id="1", total=87.3),
+            vacancy(vacancy_id="2", title="Вторая", total=80.0),
+            vacancy(vacancy_id="3", title="Третья", total=73.0),
+        ],
+        NOW,
+    )
+    message = client.messages[0]
+    assert "\n\n<b>73.0</b>" not in message, "между записями секции появилась пустая строка"
+
+
+def test_a_single_vacancy_above_threshold_has_no_rest_section(tmp_path: Path) -> None:
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=87.3), vacancy(vacancy_id="2", total=10.0)], NOW
+    )
+    assert "ЕЩЁ" not in client.messages[0]
+
+
+@pytest.mark.parametrize(
+    ("total", "tier"),
+    [(87.3, "🔥"), (80.0, "🔥"), (79.9, "⚡"), (70.0, "⚡"), (69.9, "▫️")],
+)
+def test_tier_marker_follows_the_absolute_score(tmp_path: Path, total: float, tier: str) -> None:
+    """Границы 80 и 70 — из макета, включённые снизу."""
+    client = FakeClient()
+    sink(tmp_path, client).emit(
+        [vacancy(vacancy_id="1", total=95.0), vacancy(vacancy_id="2", title="Вторая", total=total)],
+        NOW,
+    )
+    assert f"{total:.1f}</b> {tier} " in client.messages[0]
+
+
+def test_top_is_capped_at_seven_entries(tmp_path: Path) -> None:
+    """Сорок вакансий выше порога дают ровно семь записей: карточку и «ЕЩЁ 6»."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=90.0 - index)
+        for index in range(40)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    assert "<code>ЕЩЁ 6</code>" in message
+    assert message.count('<a href="https://hh.ru/vacancy/') == 7
+
+
+def test_capped_top_keeps_the_highest_scores(tmp_path: Path) -> None:
+    """Режется хвост списка, а не его начало: в сообщении — лучшие семь."""
+    client = FakeClient()
+    many = [
+        vacancy(vacancy_id=str(index), title=f"Вакансия {index}", total=60.0 + index)
+        for index in range(20)
+    ]
+    sink(tmp_path, client).emit(many, NOW)
+    message = client.messages[0]
+    assert "Вакансия 19" in message
+    assert "Вакансия 13" in message
+    assert "Вакансия 12" not in message
