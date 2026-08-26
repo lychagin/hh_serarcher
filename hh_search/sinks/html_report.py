@@ -18,6 +18,7 @@ from itertools import groupby
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.base import REPORT_DATE_FORMAT
+from hh_search.sinks.ordering import by_relevance
 from hh_search.sinks.text import format_work_formats, snippet
 
 # Ссылки уже вписанных вакансий — вход дедупликации приёмника. Ограничение
@@ -130,7 +131,7 @@ def render_section(vacancies: Sequence[ScoredVacancy], now: datetime, threshold:
     кластерам, то же начало описания в «Топе» и та же одна строка в
     «Остальном». Порог включающий (`>=`), как в §6.3 основной спеки.
     """
-    ordered = sorted(vacancies, key=lambda item: item.score.total, reverse=True)
+    ordered = by_relevance(vacancies)
     top = [item for item in ordered if item.score.total >= threshold]
     rest = [item for item in ordered if item.score.total < threshold]
 

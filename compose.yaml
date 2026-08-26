@@ -23,8 +23,15 @@ services:
         required: false
     volumes:
       - ./data:/data
+    # Ollama живёт на ХОСТЕ, а не в этой сети: `auto` из конфига вычисляет
+    # шлюз по таблице маршрутов контейнера, а она указывает на сеть Docker,
+    # а не на машину владельца. `host-gateway` — единственный переносимый
+    # способ назвать хост изнутри контейнера.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       TZ: Europe/Moscow
+      HH_LLM_BASE_URL: "http://host.docker.internal:11434"
     # Больше, чем стоит остановка с обработчиком (0.26 с), но достаточно, чтобы
     # прогон успел закрыть транзакцию, если SIGTERM пришёл в середине.
     stop_grace_period: 30s

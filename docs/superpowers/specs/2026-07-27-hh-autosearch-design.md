@@ -374,7 +374,7 @@ URL с query-строкой, то есть всего RSS-поиска цели�
 ```text
 hh_search/
   __main__.py           CLI: команды демона (см. §8.3), маркер устойчивого 403, внятный отказ тома
-  errors.py             иерархия ошибок: AccessForbidden, DegenerateListing, FetchFailed, RobotsDisallowed, StorageUnavailable
+  errors.py             иерархия ошибок: AccessForbidden, DegenerateListing, FetchFailed, LlmUnavailable, RobotsDisallowed, StorageUnavailable
   logging_setup.py      stdout плюс /data/logs/hh.log с ротацией; httpx приглушён
   runlock.py            файловый замок: одновременно работает ровно один прогон
   scheduler.py          цикл режима serve: дедлайн, SIGTERM, устойчивый 403
@@ -386,6 +386,11 @@ hh_search/
   filtering/
     matching.py         нормализация и сопоставление слов
     prefilter.py        шаг 3: отсев по заголовку — единственный барьер перед сетью
+    relocation.py       переезд СОТРУДНИКА в тексте описания; технический смысл отсеян
+  llm/
+    client.py           локальная Ollama: /api/chat со схемой-объектом, /api/embed, адрес из шлюза
+    facts.py            стек, требуемый опыт и грейд из описания; ни одного суждения
+    semantic.py         текст профиля, косинус, упаковка вектора в BLOB; в сеть не ходит
   pipeline/
     __init__.py         run_once: ПОРЯДОК семи шагов и закрытие журнала на любом исходе
     cleanup.py          ручная уборка: план, исполнение, горизонт хранения
@@ -395,6 +400,7 @@ hh_search/
     failures.py         сводка однотипных отказов вместо строки на каждый URL
     forbidden.py        счётчик подряд идущих 403 на весь прогон
     listing_pages.py    одна страница листинга: разбор, повтор вырожденного ответа, запись
+    llm_enrich.py       векторы описаний пачками и семантика в отчёт; отказ модели не заразен
     report_files.py     отбор файлов отчётов под удаление, вынесен из cleanup.py бюджетом строк
     reporting.py        шаг 7: два прохода «пересчёт → unreported» и отправка в приёмники
     stats.py            счётчики прогона, ранг статусов ok/partial/failed, коды возврата
@@ -407,6 +413,7 @@ hh_search/
     csv_sink.py         CSV-отчёт с дедупликацией по файлу дня
     html_report.py      рендер HTML-отчёта: экранирование, «Топ» и «Остальное», кликабельные ссылки
     markdown_sink.py    Markdown-отчёт: «Топ» по порогу и «Остальное»
+    ordering.py         единственный порядок отчёта: оценка, семантика разрывает связки
     telegram_client.py  транспорт Bot API: sendMessage/sendDocument, токен не течёт в ошибки
     telegram_message.py сборка текста sendMessage: шапка, «Топ», безопасный запасной вариант
     telegram_sink.py    приёмник telegram: дедупликация по нескольким суткам, довозка документа
@@ -534,7 +541,28 @@ CREATE TABLE IF NOT EXISTS vacancy (
     -- невалидным UTF-8. Счётчика попыток рядом нет сознательно: он
     -- ограничивал сетевой цикл переобогащения, а порча оценки больше
     -- не приводит к обращениям в сеть (см. quarantine.py).
-    corrupt_payload BLOB
+    corrupt_payload BLOB,
+    -- Вектор описания: 1024 значения float32 с ЯВНЫМ порядком байт
+    -- (llm/semantic.py), 4 КБ на вакансию. NULL — вакансия ещё не
+    -- эмбеддилась, эмбеддинг выключен конфигом или описание снято
+    -- уборкой (вектор уходит вместе с ним: производная не имеет права
+    -- пережить исходник).
+    embedding       BLOB,
+    -- Имя модели, ОТДАВШЕЙ вектор выше. Лежит рядом не для истории:
+    -- вектор bge-m3 и вектор любой другой модели живут в разных
+    -- пространствах, и косинус между ними посчитается, выйдет
+    -- правдоподобным и не будет значить ничего. Выборки сравнивают это
+    -- поле с текущим `llm.embed_model`, поэтому правка конфига
+    -- обесценивает корпус САМА, без ручной чистки базы.
+    embedding_model TEXT,
+    -- Факты, выписанные из описания локальной моделью (VacancyFacts как
+    -- JSON): стек, требуемый опыт, грейд. НЕ суждение о пригодности —
+    -- замер 2026-08-26 развёл роли по способностям модели.
+    llm_facts       TEXT,
+    -- Имя модели, извлёкшей факты выше. Та же роль, что у
+    -- embedding_model: другая модель извлекает иначе, и отчёт, смешавший
+    -- два поколения, выглядел бы согласованным, не будучи им.
+    llm_facts_model TEXT
 );
 
 -- Три состояния строки со status = 'new' различаются только парой
@@ -1198,6 +1226,16 @@ limits:
   listing_pages_per_run: 60
   enrich_per_run: 200
   rows_per_batch: 500
+  llm_per_run: 200            # потолок вакансий, отдаваемых локальной модели
+# Локальная Ollama — спека 2026-08-26-local-llm-design.md. Общего флага
+# `enabled` нет: выключение выражается двумя `false`.
+llm:
+  base_url: auto
+  chat_model: llama3
+  embed_model: bge-m3
+  timeout_sec: 60
+  semantic: true
+  facts: true
 sinks: [csv, markdown]        # позже добавится telegram
 paths:
   state: /data/state/hh.db
@@ -1283,8 +1321,11 @@ services:
         required: false
     volumes:
       - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       TZ: Europe/Moscow
+      HH_LLM_BASE_URL: "http://host.docker.internal:11434"
     stop_grace_period: 30s
     mem_limit: 256m
     healthcheck:

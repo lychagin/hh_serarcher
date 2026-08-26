@@ -26,9 +26,16 @@ from datetime import UTC, datetime
 
 from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden
+from hh_search.llm.client import OllamaClient
 from hh_search.pipeline.discovery import discover, prefilter
 from hh_search.pipeline.enrichment import enrich
 from hh_search.pipeline.forbidden import ForbiddenStreak
+from hh_search.pipeline.llm_enrich import (
+    ReportEnrichment,
+    build_ranker,
+    embed_pending,
+    extract_pending,
+)
 from hh_search.pipeline.reporting import report
 from hh_search.pipeline.stats import EXIT_CODES, FAILED, OK, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
@@ -48,6 +55,7 @@ def run_once(
     scorer: Scorer,
     sinks: Sequence[Sink],
     now: datetime | None = None,
+    llm: OllamaClient | None = None,
 ) -> RunStats:
     """Один прогон целиком. Возвращает счётчики и статус, не бросает при частичном отказе.
 
@@ -72,7 +80,8 @@ def run_once(
         discover(config, client, repo, stats, forbidden)
         prefilter(config, repo, stats)
         enrich(config, client, repo, scorer, stats, forbidden)
-        report(repo, scorer, sinks, stats, moment, config.app.limits.rows_per_batch)
+        enrichment = _enrich_with_llm(config, repo, llm)
+        report(repo, scorer, sinks, stats, moment, config.app.limits.rows_per_batch, enrichment)
     except AccessForbidden as error:
         stats.degrade(FAILED, f"hh.ru закрыл доступ: {error}")
         # Без «прогон остановлен» и без «обходные пути» — то и другое
@@ -104,6 +113,37 @@ def run_once(
         f", причина: {stats.error}" if stats.error else "",
     )
     return stats
+
+
+def _enrich_with_llm(
+    config: Config, repo: Repository, llm: OllamaClient | None
+) -> ReportEnrichment | None:
+    """Досчитать векторы и факты, вернуть то, чем дополнится отчёт.
+
+    Стоит между `enrich` и `report`: описание уже скачано, а порядок ещё
+    не понадобился. Ни один путь отсюда не бросает — все вызовы внутри
+    гасят `LlmUnavailable` сами (§4 спеки
+    `docs/superpowers/specs/2026-08-26-local-llm-design.md`), и это не
+    вопрос вкуса: модель живёт на рабочей машине владельца, которая
+    выключается на ночь, а прогон идёт раз в четыре часа.
+
+    Два флага независимы: владелец, которому нужен только порядок выдачи,
+    не платит пяти минут прогона за факты (§0.5, §7).
+    """
+    if llm is None:
+        return None
+    limit = config.app.limits.llm_per_run
+    ranker = None
+    if config.app.llm.semantic:
+        embed_pending(llm, repo, config.app.llm.embed_model, limit)
+        ranker = build_ranker(llm, config.profile, config.app.llm.embed_model)
+    facts_model = None
+    if config.app.llm.facts:
+        extract_pending(llm, repo, config.app.llm.chat_model, limit)
+        facts_model = config.app.llm.chat_model
+    if ranker is None and facts_model is None:
+        return None
+    return ReportEnrichment(ranker=ranker, facts_model=facts_model)
 
 
 def _finish(repo: Repository, run_id: int, stats: RunStats) -> None:

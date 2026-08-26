@@ -5,11 +5,14 @@ from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 
+from pydantic import ValidationError
+
 from hh_search.domain.models import (
     DiscoveredVacancy,
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
+    VacancyFacts,
 )
 from hh_search.storage.base import (
     DEFAULT_BATCH_LIMIT,
@@ -20,7 +23,15 @@ from hh_search.storage.base import (
     STATUS_REJECTED,
     STATUS_REPORTED,
 )
-from hh_search.storage.mappers import to_discovered, to_id_and_title, to_scored, to_scoring_task
+from hh_search.storage.mappers import (
+    decode_text,
+    to_discovered,
+    to_embedding_task,
+    to_facts_task,
+    to_id_and_title,
+    to_scored,
+    to_scoring_task,
+)
 from hh_search.storage.migrations import apply_schema
 from hh_search.storage.quarantine import Quarantine, safe_rows
 from hh_search.storage.retention import Retention
@@ -626,6 +637,124 @@ class SqliteRepository:
             (score.total, score.model_dump_json(), vacancy_id),
         )
         self._connection.commit()
+
+    # --- 2.5: вектор описания ---------------------------------------------
+
+    def pending_embedding(self, model: str, limit: int) -> list[tuple[str, str]]:
+        """Описание есть, вектора текущей модели нет: отдать на эмбеддинг.
+
+        Сравнение с `model` в предикате, а не проверка на NULL: правка
+        `llm.embed_model` обязана ставить корпус в очередь заново сама.
+        Иначе база разъехалась бы на две несравнимые половины, каждая из
+        которых по отдельности выглядит здоровой.
+
+        Отказ вакансии не помечается ничем, и счётчика попыток здесь нет
+        сознательно. Отказ модели ничего не теряет: оценка по ключевым
+        словам на месте, вакансия отправится и без вектора (§4 спеки
+        2026-08-26), а следующий прогон попробует снова. Счётчик попыток
+        нужен там, где повтор стоит запроса к чужому источнику, — здесь
+        источник свой.
+        """
+        rows = self._connection.execute(
+            "SELECT CAST(id AS BLOB) AS id, CAST(title AS BLOB) AS title, "
+            "CAST(description AS BLOB) AS description FROM vacancy "
+            "WHERE description IS NOT NULL AND description <> '' "
+            "AND (embedding IS NULL OR embedding_model IS NOT ?) "
+            "ORDER BY COALESCE(published_at, first_seen_at) DESC LIMIT ?",
+            (model, limit),
+        ).fetchall()
+        return safe_rows(rows, to_embedding_task, self._quarantine)
+
+    def save_embedding(self, vacancy_id: str, model: str, vector: bytes) -> None:
+        """Записать вектор ВМЕСТЕ с именем модели — одним UPDATE.
+
+        Двумя запросами между ними существовало бы состояние «вектор новой
+        модели, имя старой», и падение процесса в этой щели оставило бы
+        вектор, который выборки считают пригодным, а он из другого
+        пространства.
+        """
+        self._connection.execute(
+            "UPDATE vacancy SET embedding = ?, embedding_model = ? WHERE id = ?",
+            (vector, model, vacancy_id),
+        )
+        self._connection.commit()
+
+    def embeddings(self, ids: Sequence[str], model: str) -> dict[str, bytes]:
+        """Векторы названных вакансий — только той модели, о которой спросили.
+
+        Отдаёт СЫРЫЕ байты, а не разобранный вектор, и это граница слоя, а
+        не лень. Формат упаковки принадлежит `llm/semantic.py`; знай о нём
+        хранилище, оно перестало бы просто хранить BLOB и завело бы
+        зависимость `storage → llm`, которой в этом проекте нет ни у
+        одного слоя. Порчу разбирает тот, кто знает формат.
+        """
+        placeholders = ", ".join("?" * len(ids))
+        rows = self._connection.execute(
+            f"SELECT CAST(id AS BLOB) AS id, embedding FROM vacancy "  # noqa: S608 - плейсхолдеры
+            f"WHERE id IN ({placeholders}) AND embedding IS NOT NULL AND embedding_model IS ?",
+            (*ids, model),
+        ).fetchall()
+        vectors: dict[str, bytes] = {}
+        for row in rows:
+            try:
+                vectors[decode_text(row["id"])] = bytes(row["embedding"])
+            except UnicodeDecodeError:
+                continue
+        return vectors
+
+    # --- 2.6: факты описания ----------------------------------------------
+
+    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str]]:
+        """Описание есть, фактов ЭТОЙ модели нет: (id, заголовок, описание).
+
+        Заголовок и описание отдаются порознь, а не склеенными, как в
+        `pending_embedding`: эмбеддингу нужен один текст, а промпту —
+        разные роли у этих двух полей.
+        """
+        rows = self._connection.execute(
+            "SELECT CAST(id AS BLOB) AS id, CAST(title AS BLOB) AS title, "
+            "CAST(description AS BLOB) AS description FROM vacancy "
+            "WHERE description IS NOT NULL AND description <> '' "
+            "AND (llm_facts IS NULL OR llm_facts_model IS NOT ?) "
+            "ORDER BY COALESCE(published_at, first_seen_at) DESC LIMIT ?",
+            (model, limit),
+        ).fetchall()
+        return safe_rows(rows, to_facts_task, self._quarantine)
+
+    def save_facts(self, vacancy_id: str, model: str, facts: VacancyFacts) -> None:
+        """Факты и имя извлёкшей их модели — одним UPDATE, не двумя."""
+        self._connection.execute(
+            "UPDATE vacancy SET llm_facts = ?, llm_facts_model = ? WHERE id = ?",
+            (facts.model_dump_json(), model, vacancy_id),
+        )
+        self._connection.commit()
+
+    def facts(self, ids: Sequence[str], model: str) -> dict[str, VacancyFacts]:
+        """Факты названных вакансий — только той модели, о которой спросили.
+
+        Нечитаемая запись пропускается вместе со своей вакансией и БЕЗ
+        карантина, в отличие от `score_detail`. Разница по смыслу: без
+        оценки вакансия не отправляется вовсе, поэтому её порча — авария,
+        требующая лечения. Без фактов вакансия отправляется, просто без
+        них, и заводить ради этого вторую очередь лечения значило бы
+        платить сложностью за потерю, которой нет.
+        """
+        placeholders = ", ".join("?" * len(ids))
+        rows = self._connection.execute(
+            f"SELECT CAST(id AS BLOB) AS id, CAST(llm_facts AS BLOB) AS llm_facts "  # noqa: S608
+            f"FROM vacancy WHERE id IN ({placeholders}) "
+            "AND llm_facts IS NOT NULL AND llm_facts_model IS ?",
+            (*ids, model),
+        ).fetchall()
+        extracted: dict[str, VacancyFacts] = {}
+        for row in rows:
+            try:
+                extracted[decode_text(row["id"])] = VacancyFacts.model_validate_json(
+                    decode_text(row["llm_facts"])
+                )
+            except (ValidationError, UnicodeDecodeError):
+                continue
+        return extracted
 
     # --- 3: отчёт --------------------------------------------------------
 

@@ -118,6 +118,13 @@ def test_csv_row_carries_every_column(tmp_path: Path) -> None:
             "published_at": "2026-07-27 06:21",
             "listing": "programmist",
             "url": "https://hh.ru/vacancy/1",
+            # Пусто: `make_scored()` не задаёт ни семантики, ни фактов, то
+            # есть это вакансия из прогона без локальной модели — штатный
+            # случай, и колонки обязаны быть пустыми, а не нулевыми.
+            "semantic": "",
+            "stack": "",
+            "seniority": "",
+            "relocation": "",
         }
     ]
 
@@ -260,7 +267,12 @@ def test_csv_does_not_glue_a_row_onto_an_unfinished_line(tmp_path: Path) -> None
     path = tmp_path / "2026-07-27-new.csv"
     sink = CsvSink(tmp_path)
     sink.emit([make_scored(vacancy_id=str(i)) for i in (1, 2, 3)], NOW)
-    os.truncate(path, path.stat().st_size - 20)
+    # Обрыв по последнему разделителю, а не «минус двадцать байт»: число
+    # было привязано к тогдашней ширине строки и с добавлением колонок
+    # стало резать посреди кириллической буквы — то есть тест падал бы на
+    # чтении, не дойдя до того, что проверяет. Разделитель — ascii и всегда
+    # в середине строки, что и требуется.
+    os.truncate(path, path.read_bytes().rfind(b";"))
     sink.emit([make_scored(vacancy_id="3"), make_scored(vacancy_id="4")], NOW)
     rows = read_rows(path)
     assert [row["url"] for row in rows if row["id"] == "4"] == ["https://hh.ru/vacancy/4"]

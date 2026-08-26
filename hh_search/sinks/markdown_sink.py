@@ -4,8 +4,9 @@ from datetime import datetime
 from itertools import groupby
 from pathlib import Path
 
-from hh_search.domain.models import ScoredVacancy
+from hh_search.domain.models import ScoredVacancy, VacancyFacts
 from hh_search.sinks.base import REPORT_DATE_FORMAT
+from hh_search.sinks.ordering import by_relevance
 from hh_search.sinks.text import collapse, format_work_formats, snippet
 
 # Заголовок и описание пишет работодатель. `[Удалённо] Инженер` в начале
@@ -63,7 +64,7 @@ class MarkdownSink:
         existing = self._read_day_file(path)
         written = set(_WRITTEN_LINK_RE.findall(existing))
         ordered: list[ScoredVacancy] = []
-        for item in sorted(vacancies, key=lambda item: item.score.total, reverse=True):
+        for item in by_relevance(vacancies):
             if item.discovered.url in written:
                 continue
             written.add(item.discovered.url)
@@ -134,8 +135,16 @@ class MarkdownSink:
         # ей не грозит (markdown-спецсимволов в словаре подписей нет), но
         # штраф в скоринге без него выглядел бы произволом (спека §3).
         work_format = format_work_formats(item.details.work_formats)
+        # Семантика приписывается к оценке, а НЕ заменяет её: она не
+        # участвует в `total` (§6 спеки 2026-08-26) и служит владельцу
+        # материалом для решения, стоит ли давать ей больший вес. Пусто —
+        # значит не считалось, и тогда строка выглядит в точности как до
+        # появления модели (наблюдаемая форма §4).
+        semantic = "" if item.semantic is None else f" · близость {item.semantic:.3f}"
         return (
-            f"**[{_plain(discovered.title)}]({discovered.url})** — {item.score.total:.1f}\n\n"
+            f"**[{_plain(discovered.title)}]({discovered.url})** — "
+            f"{item.score.total:.1f}{semantic}\n\n"
+            f"{_facts_line(item.facts)}"
             f"{_plain(discovered.company)} · {_plain(discovered.area)} · "
             f"{_plain(discovered.salary.raw, fallback='зарплата не указана')} · "
             f"{published} · {work_format}\n\n"
@@ -154,3 +163,34 @@ class MarkdownSink:
             f"- [{_plain(discovered.title)}]({discovered.url}) — "
             f"{item.score.total:.1f} · {_plain(discovered.company)} · {work_format}"
         )
+
+
+def _facts_line(facts: VacancyFacts | None) -> str:
+    """Строка с выписанным моделью — или пусто, если выписывать нечего.
+
+    Пустой строки «стек: » в отчёте не появляется никогда: его читают
+    глазами, и пустая подпись хуже отсутствующей. Отсюда же и то, что
+    стек экранируется `_escape`: модель переписывает названия ИЗ ОПИСАНИЯ,
+    то есть отдаёт текст работодателя, а не свой словарь.
+    """
+    # Проверка обязательна — без неё `facts.stack` ниже упал бы на `None`.
+    # Наблюдаемого поведения она при этом не добавляет: замена этой строки
+    # на `facts = VacancyFacts()` даёт РОВНО тот же вывод, потому что
+    # пустые факты и так не дают ни одной части. Записано честно, чтобы
+    # следующий читатель не искал сторожа, которого здесь быть не может.
+    if facts is None:
+        return ""
+    parts: list[str] = []
+    if facts.stack:
+        parts.append(f"стек: {_escape(', '.join(facts.stack))}")
+    if facts.required_years is not None:
+        parts.append(f"опыт от {facts.required_years} лет")
+    if facts.seniority is not None:
+        parts.append(facts.seniority)
+    if facts.relocation is not None:
+        # Первым в строке, а не последним: это единственная её часть,
+        # способная закрыть вакансию для владельца целиком.
+        where = f" в {_escape(facts.relocation.city)}" if facts.relocation.city else ""
+        kind = "требуется" if facts.relocation.kind == "required" else "по желанию"
+        parts.insert(0, f"**переезд{where} — {kind}**")
+    return f"_{' · '.join(parts)}_\n\n" if parts else ""
