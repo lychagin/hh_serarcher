@@ -397,7 +397,7 @@ docker compose run --rm hh-search cleanup --reports --apply   # плюс фай�
 **CSV** — UTF-8 с BOM и разделителем `;` ради Excel, колонки:
 
 ```
-id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;listing;url;work_formats;semantic
+id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;listing;url;work_formats;semantic;stack;seniority
 ```
 
 Балл записан числом, поэтому сортировка по нему и фильтр по зарплате работают
@@ -408,6 +408,11 @@ id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;
 ОДИНАКОВЫМ баллом, а таких больше половины. Пустая ячейка значит «не
 считалось» — модель выключена в `app.yaml`, недоступна, или описание уже снято
 уборкой.
+
+`stack` и `seniority` — выписанное той же моделью из текста вакансии. Это не
+дубликат скоринга: балл считается по сигналам из `profile.yaml`, а сюда
+попадает то, что в описании НАЗВАНО, включая технологии, которых вы не искали.
+Пустые ячейки читаются так же, как у `semantic`.
 
 Отчёт можно пересобрать из базы, ничего не запрашивая у hh.ru:
 

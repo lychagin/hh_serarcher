@@ -37,6 +37,12 @@ COLUMNS = [
     # файла дня написан прошлой версией, и колонка в середине сдвинула бы
     # для `DictReader` все поля после себя — молча.
     "semantic",
+    # Выписанное локальной моделью — тоже в хвост и тоже по правилу выше.
+    # `required_years` в колонку не выведен: замер 2026-08-26 показал, что
+    # модель берёт его из текста реже и хуже, чем стек, а колонка,
+    # заполненная на четверть, в таблице хуже отсутствующей.
+    "stack",
+    "seniority",
 ]
 
 # Excel и LibreOffice исполняют содержимое ячейки, начинающееся с этих
@@ -142,6 +148,7 @@ class CsvSink:
 
     def _row(self, item: ScoredVacancy) -> dict[str, str]:
         discovered = item.discovered
+        facts = item.facts
         salary = discovered.salary
         published_at = discovered.published_at
         return {
@@ -167,6 +174,11 @@ class CsvSink:
             # вышло мало» — разные вещи, и ноль на месте первого утверждал
             # бы то, чего никто не измерял.
             "semantic": "" if item.semantic is None else f"{item.semantic:.3f}",
+            # Через `_cell`, как и весь остальной текст: стек модель
+            # переписывает ИЗ ОПИСАНИЯ, то есть это по-прежнему текст
+            # работодателя, и формула в нём так же исполнится в Excel.
+            "stack": _cell(", ".join(facts.stack) if facts and facts.stack else None),
+            "seniority": _cell(facts.seniority if facts else None),
         }
 
 

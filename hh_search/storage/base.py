@@ -34,6 +34,7 @@ from hh_search.domain.models import (
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
+    VacancyFacts,
 )
 
 STATUS_NEW = "new"
@@ -189,6 +190,20 @@ class Repository(Protocol):
         Именно сырые: формат упаковки принадлежит `llm/semantic.py`, и
         зависимости `storage → llm` в этом проекте нет.
         """
+        ...
+
+    # --- 2.6: факты описания ---------------------------------------------
+
+    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str]]:
+        """Описание есть, фактов ЭТОЙ модели нет: (id, заголовок, описание)."""
+        ...
+
+    def save_facts(self, vacancy_id: str, model: str, facts: VacancyFacts) -> None:
+        """Факты и имя извлёкшей их модели — одним UPDATE, не двумя."""
+        ...
+
+    def facts(self, ids: Sequence[str], model: str) -> dict[str, VacancyFacts]:
+        """Факты названных вакансий, только этой модели. Нечитаемые пропускаются."""
         ...
 
     # --- 3: отчёт --------------------------------------------------------

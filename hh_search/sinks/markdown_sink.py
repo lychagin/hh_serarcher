@@ -4,7 +4,7 @@ from datetime import datetime
 from itertools import groupby
 from pathlib import Path
 
-from hh_search.domain.models import ScoredVacancy
+from hh_search.domain.models import ScoredVacancy, VacancyFacts
 from hh_search.sinks.base import REPORT_DATE_FORMAT
 from hh_search.sinks.ordering import by_relevance
 from hh_search.sinks.text import collapse, format_work_formats, snippet
@@ -144,6 +144,7 @@ class MarkdownSink:
         return (
             f"**[{_plain(discovered.title)}]({discovered.url})** — "
             f"{item.score.total:.1f}{semantic}\n\n"
+            f"{_facts_line(item.facts)}"
             f"{_plain(discovered.company)} · {_plain(discovered.area)} · "
             f"{_plain(discovered.salary.raw, fallback='зарплата не указана')} · "
             f"{published} · {work_format}\n\n"
@@ -162,3 +163,28 @@ class MarkdownSink:
             f"- [{_plain(discovered.title)}]({discovered.url}) — "
             f"{item.score.total:.1f} · {_plain(discovered.company)} · {work_format}"
         )
+
+
+def _facts_line(facts: VacancyFacts | None) -> str:
+    """Строка с выписанным моделью — или пусто, если выписывать нечего.
+
+    Пустой строки «стек: » в отчёте не появляется никогда: его читают
+    глазами, и пустая подпись хуже отсутствующей. Отсюда же и то, что
+    стек экранируется `_escape`: модель переписывает названия ИЗ ОПИСАНИЯ,
+    то есть отдаёт текст работодателя, а не свой словарь.
+    """
+    # Проверка обязательна — без неё `facts.stack` ниже упал бы на `None`.
+    # Наблюдаемого поведения она при этом не добавляет: замена этой строки
+    # на `facts = VacancyFacts()` даёт РОВНО тот же вывод, потому что
+    # пустые факты и так не дают ни одной части. Записано честно, чтобы
+    # следующий читатель не искал сторожа, которого здесь быть не может.
+    if facts is None:
+        return ""
+    parts: list[str] = []
+    if facts.stack:
+        parts.append(f"стек: {_escape(', '.join(facts.stack))}")
+    if facts.required_years is not None:
+        parts.append(f"опыт от {facts.required_years} лет")
+    if facts.seniority is not None:
+        parts.append(facts.seniority)
+    return f"_{' · '.join(parts)}_\n\n" if parts else ""

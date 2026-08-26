@@ -155,6 +155,11 @@ def to_embedding_task(row: sqlite3.Row) -> tuple[str, str]:
     return decode_text(row["id"]), f"{decode_text(row['title'])}\n{decode_text(row['description'])}"
 
 
+def to_facts_task(row: sqlite3.Row) -> tuple[str, str, str]:
+    """id, заголовок и описание порознь: у них разные роли в промпте."""
+    return decode_text(row["id"]), decode_text(row["title"]), decode_text(row["description"])
+
+
 def to_scoring_task(row: sqlite3.Row) -> tuple[DiscoveredVacancy, VacancyDetails]:
     """Описание уже скачано, оценки нет — всё для локального пересчёта."""
     return to_discovered(row), to_details(row)

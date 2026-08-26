@@ -14,7 +14,13 @@ import respx
 
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
-from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, ScoredVacancy, VacancyDetails
+from hh_search.domain.models import (
+    DiscoveredVacancy,
+    ScoreBreakdown,
+    ScoredVacancy,
+    VacancyDetails,
+    VacancyFacts,
+)
 from hh_search.errors import AccessForbidden
 from hh_search.pipeline import RunStats, run_once
 from hh_search.pipeline.discovery import prefilter
@@ -1637,6 +1643,8 @@ class _MemoryRow:
     reported_at: datetime | None = None
     embedding: bytes | None = None
     embedding_model: str | None = None
+    facts: VacancyFacts | None = None
+    facts_model: str | None = None
 
 
 class MemoryRepository:
@@ -1781,6 +1789,28 @@ class MemoryRepository:
             vacancy_id: row.embedding
             for vacancy_id, row in self.rows.items()
             if vacancy_id in set(ids) and row.embedding is not None and row.embedding_model == model
+        }
+
+    # --- факты описания --------------------------------------------------
+
+    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str]]:
+        pending = [
+            (vacancy_id, row.discovered.title, row.details.description)
+            for vacancy_id, row in self.rows.items()
+            if row.details is not None and row.facts_model != model
+        ]
+        return pending[:limit]
+
+    def save_facts(self, vacancy_id: str, model: str, facts: VacancyFacts) -> None:
+        row = self.rows[vacancy_id]
+        row.facts, row.facts_model = facts, model
+
+    def facts(self, ids: Sequence[str], model: str) -> dict[str, VacancyFacts]:
+        wanted = set(ids)
+        return {
+            vacancy_id: row.facts
+            for vacancy_id, row in self.rows.items()
+            if vacancy_id in wanted and row.facts is not None and row.facts_model == model
         }
 
     # --- отчёт ---------------------------------------------------------

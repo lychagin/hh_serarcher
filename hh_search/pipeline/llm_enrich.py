@@ -16,6 +16,7 @@ from hh_search.config.models import ProfileConfig
 from hh_search.domain.models import ScoredVacancy
 from hh_search.errors import LlmUnavailable
 from hh_search.llm.client import OllamaClient
+from hh_search.llm.facts import extract_facts
 from hh_search.llm.semantic import cosine, pack_vector, profile_text, unpack_vector
 from hh_search.storage.base import Repository
 
@@ -125,3 +126,58 @@ class SemanticRanker:
                 error,
             )
             return None
+
+
+def extract_pending(client: OllamaClient, repo: Repository, model: str, limit: int) -> int:
+    """Выписать факты из описаний очереди. Возвращает, сколько записано.
+
+    По одной вакансии за запрос — в отличие от векторов, которые уезжают
+    пачками: `/api/chat` принимает один диалог, и склеить двадцать
+    вакансий в один промпт значило бы просить 8B-модель удержать двадцать
+    ответов в одном JSON. Замер §0.3 снят на одной вакансии за раз, и
+    расширять его на непроверенную форму нельзя.
+
+    Отказ не считается: `extract_facts` уже вернул `None` и уже сказал об
+    этом. Здесь важно другое — не оборвать цикл на первой неудаче, потому
+    что промах на ОДНОЙ вакансии (ответ мимо схемы) не значит, что модель
+    недоступна для следующей.
+    """
+    written = 0
+    for vacancy_id, title, description in repo.pending_facts(model, limit):
+        facts = extract_facts(client, title, description)
+        if facts is None:
+            continue
+        repo.save_facts(vacancy_id, model, facts)
+        written += 1
+    if written:
+        logger.info("выписано фактов из описаний: %d", written)
+    return written
+
+
+@dataclass(frozen=True)
+class ReportEnrichment:
+    """Всё, чем локальная модель дополняет отчёт. Любая часть может отсутствовать.
+
+    Один объект вместо двух параметров `report()`: у них общий жизненный
+    цикл (строятся вместе, гаснут вместе) и общая судьба при отказе
+    модели. Пустое обогащение — законное состояние, а не край: так
+    выглядит прогон без модели, и вести себя он обязан ровно как прогон
+    до её появления (§4 спеки).
+    """
+
+    ranker: SemanticRanker | None = None
+    facts_model: str | None = None
+
+    def attach(self, repo: Repository, vacancies: Sequence[ScoredVacancy]) -> list[ScoredVacancy]:
+        attached = list(vacancies)
+        if self.ranker is not None:
+            attached = self.ranker.attach(repo, attached)
+        if self.facts_model is not None:
+            extracted = repo.facts([item.discovered.id for item in attached], self.facts_model)
+            attached = [
+                item
+                if item.discovered.id not in extracted
+                else item.model_copy(update={"facts": extracted[item.discovered.id]})
+                for item in attached
+            ]
+        return attached

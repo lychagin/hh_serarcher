@@ -57,6 +57,8 @@ ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("vacancy", "work_formats", "TEXT"),
     ("vacancy", "embedding", "BLOB"),
     ("vacancy", "embedding_model", "TEXT"),
+    ("vacancy", "llm_facts", "TEXT"),
+    ("vacancy", "llm_facts_model", "TEXT"),
 )
 
 # У отказов, накопленных базой прошлого поколения, машинного кода нет:

@@ -9,7 +9,13 @@ import csv
 from datetime import UTC, datetime
 from pathlib import Path
 
-from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, ScoredVacancy, VacancyDetails
+from hh_search.domain.models import (
+    DiscoveredVacancy,
+    ScoreBreakdown,
+    ScoredVacancy,
+    VacancyDetails,
+    VacancyFacts,
+)
 from hh_search.sinks.csv_sink import COLUMNS, CsvSink
 from hh_search.sinks.markdown_sink import MarkdownSink
 
@@ -34,13 +40,35 @@ def make(vacancy_id: str, total: float, semantic: float | None) -> ScoredVacancy
     )
 
 
-def test_semantic_is_the_last_csv_column() -> None:
-    """В хвост, а не в середину — инвариант этого приёмника.
+def test_new_columns_are_appended_and_never_inserted() -> None:
+    """Прежние колонки стоят на прежних местах — вот настоящий инвариант.
 
-    Колонка в середине сдвинула бы все поля после себя для `DictReader`,
-    читающего файл дня по заголовку, написанному прошлой версией. Молча.
+    Колонка, вставленная в СЕРЕДИНУ, сдвинула бы все поля после себя для
+    `DictReader`, читающего файл дня по заголовку, написанному прошлой
+    версией: `salary_from` получил бы значение формата, `url` потерял бы
+    последнее поле — молча, без исключения.
+
+    Сторожится префикс, а не «последняя колонка называется так-то»:
+    прежняя редакция этого теста утверждала второе и покраснела от
+    добавления следующей же колонки, ничего при этом не защитив.
     """
-    assert COLUMNS[-1] == "semantic"
+    established = [
+        "id",
+        "score",
+        "cluster",
+        "title",
+        "company",
+        "area",
+        "salary_from",
+        "salary_to",
+        "currency",
+        "published_at",
+        "listing",
+        "url",
+        "work_formats",
+    ]
+
+    assert COLUMNS[: len(established)] == established
 
 
 def test_csv_carries_the_value_and_leaves_it_empty_when_unknown(tmp_path: Path) -> None:
@@ -77,3 +105,54 @@ def test_markdown_without_semantics_looks_exactly_as_before(tmp_path: Path) -> N
 
     text = (tmp_path / f"{NOW:%Y-%m-%d}-new.md").read_text(encoding="utf-8")
     assert "**[Ведущий разработчик 1](https://hh.ru/vacancy/1)** — 87.3\n" in text
+
+
+# --- Факты ----------------------------------------------------------------
+
+
+def with_facts(vacancy_id: str, facts: VacancyFacts | None) -> ScoredVacancy:
+    return make(vacancy_id, 87.3, 0.669).model_copy(update={"facts": facts})
+
+
+def test_stack_column_lists_what_the_model_found(tmp_path: Path) -> None:
+    """Стек в CSV — не дубликат скоринга.
+
+    `KeywordScorer` находит только сигналы из `profile.yaml`; модель
+    выписывает то, что в тексте НАЗВАНО, включая технологии, которых
+    владелец не искал. Это и есть новое знание, ради которого шаг стоит
+    пяти минут прогона.
+    """
+    CsvSink(tmp_path).emit(
+        [with_facts("1", VacancyFacts(stack=["Python", "Kafka"], seniority="senior"))], NOW
+    )
+
+    with (tmp_path / f"{NOW:%Y-%m-%d}-new.csv").open(encoding="utf-8-sig") as handle:
+        row = next(iter(csv.DictReader(handle, delimiter=";")))
+    assert row["stack"] == "Python, Kafka"
+    assert row["seniority"] == "senior"
+
+
+def test_csv_leaves_fact_columns_empty_when_nothing_was_extracted(tmp_path: Path) -> None:
+    CsvSink(tmp_path).emit([with_facts("1", None)], NOW)
+
+    with (tmp_path / f"{NOW:%Y-%m-%d}-new.csv").open(encoding="utf-8-sig") as handle:
+        row = next(iter(csv.DictReader(handle, delimiter=";")))
+    assert (row["stack"], row["seniority"]) == ("", "")
+
+
+def test_markdown_shows_the_extracted_stack(tmp_path: Path) -> None:
+    MarkdownSink(tmp_path, threshold=60.0).emit(
+        [with_facts("1", VacancyFacts(stack=["Python", "Kafka"], required_years=3))], NOW
+    )
+
+    text = (tmp_path / f"{NOW:%Y-%m-%d}-new.md").read_text(encoding="utf-8")
+    assert "Python, Kafka" in text
+    assert "3" in text
+
+
+def test_markdown_without_facts_adds_no_empty_line(tmp_path: Path) -> None:
+    """Пустых «стек: » в отчёте быть не должно — их читают глазами."""
+    MarkdownSink(tmp_path, threshold=60.0).emit([with_facts("1", None)], NOW)
+
+    text = (tmp_path / f"{NOW:%Y-%m-%d}-new.md").read_text(encoding="utf-8")
+    assert "стек" not in text.lower()

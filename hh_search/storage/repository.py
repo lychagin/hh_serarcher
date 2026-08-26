@@ -5,11 +5,14 @@ from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 
+from pydantic import ValidationError
+
 from hh_search.domain.models import (
     DiscoveredVacancy,
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
+    VacancyFacts,
 )
 from hh_search.storage.base import (
     DEFAULT_BATCH_LIMIT,
@@ -24,6 +27,7 @@ from hh_search.storage.mappers import (
     decode_text,
     to_discovered,
     to_embedding_task,
+    to_facts_task,
     to_id_and_title,
     to_scored,
     to_scoring_task,
@@ -697,6 +701,60 @@ class SqliteRepository:
             except UnicodeDecodeError:
                 continue
         return vectors
+
+    # --- 2.6: факты описания ----------------------------------------------
+
+    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str]]:
+        """Описание есть, фактов ЭТОЙ модели нет: (id, заголовок, описание).
+
+        Заголовок и описание отдаются порознь, а не склеенными, как в
+        `pending_embedding`: эмбеддингу нужен один текст, а промпту —
+        разные роли у этих двух полей.
+        """
+        rows = self._connection.execute(
+            "SELECT CAST(id AS BLOB) AS id, CAST(title AS BLOB) AS title, "
+            "CAST(description AS BLOB) AS description FROM vacancy "
+            "WHERE description IS NOT NULL AND description <> '' "
+            "AND (llm_facts IS NULL OR llm_facts_model IS NOT ?) "
+            "ORDER BY COALESCE(published_at, first_seen_at) DESC LIMIT ?",
+            (model, limit),
+        ).fetchall()
+        return safe_rows(rows, to_facts_task, self._quarantine)
+
+    def save_facts(self, vacancy_id: str, model: str, facts: VacancyFacts) -> None:
+        """Факты и имя извлёкшей их модели — одним UPDATE, не двумя."""
+        self._connection.execute(
+            "UPDATE vacancy SET llm_facts = ?, llm_facts_model = ? WHERE id = ?",
+            (facts.model_dump_json(), model, vacancy_id),
+        )
+        self._connection.commit()
+
+    def facts(self, ids: Sequence[str], model: str) -> dict[str, VacancyFacts]:
+        """Факты названных вакансий — только той модели, о которой спросили.
+
+        Нечитаемая запись пропускается вместе со своей вакансией и БЕЗ
+        карантина, в отличие от `score_detail`. Разница по смыслу: без
+        оценки вакансия не отправляется вовсе, поэтому её порча — авария,
+        требующая лечения. Без фактов вакансия отправляется, просто без
+        них, и заводить ради этого вторую очередь лечения значило бы
+        платить сложностью за потерю, которой нет.
+        """
+        placeholders = ", ".join("?" * len(ids))
+        rows = self._connection.execute(
+            f"SELECT CAST(id AS BLOB) AS id, CAST(llm_facts AS BLOB) AS llm_facts "  # noqa: S608
+            f"FROM vacancy WHERE id IN ({placeholders}) "
+            "AND llm_facts IS NOT NULL AND llm_facts_model IS ?",
+            (*ids, model),
+        ).fetchall()
+        extracted: dict[str, VacancyFacts] = {}
+        for row in rows:
+            try:
+                extracted[decode_text(row["id"])] = VacancyFacts.model_validate_json(
+                    decode_text(row["llm_facts"])
+                )
+            except (ValidationError, UnicodeDecodeError):
+                continue
+        return extracted
 
     # --- 3: отчёт --------------------------------------------------------
 

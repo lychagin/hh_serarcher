@@ -50,8 +50,9 @@ LLM_ON = """
 llm:
   base_url: "http://ollama.test:11434"
   embed_model: bge-m3
+  chat_model: llama3
   semantic: true
-  facts: false
+  facts: true
 """
 
 
@@ -83,13 +84,17 @@ def outcome(sink: RecordingSink) -> list[tuple[str, float]]:
 @respx.mock
 def run_with_llm(config: Config, failure: Failure) -> tuple[RecordingSink, RunStats]:
     mock_source(TWO_ENRICHABLE)
-    route = respx.post(f"{OLLAMA}/api/embed")
-    # Отказ транспорта respx изображает исключением, отказ сервера —
-    # готовым ответом, и подать одно вместо другого он не даёт.
-    if isinstance(failure, httpx.Response):
-        route.mock(return_value=failure)
-    else:
-        route.mock(side_effect=failure)
+    # ОБА конца ломаются одинаково: отказала модель, а не одна её ручка.
+    # Мокать только `/api/embed` значило бы проверять деградацию половины
+    # шага, а вторая половина — `/api/chat` — роняла бы прогон невидимо.
+    for path in ("/api/embed", "/api/chat"):
+        route = respx.post(f"{OLLAMA}{path}")
+        # Отказ транспорта respx изображает исключением, отказ сервера —
+        # готовым ответом, и подать одно вместо другого он не даёт.
+        if isinstance(failure, httpx.Response):
+            route.mock(return_value=failure)
+        else:
+            route.mock(side_effect=failure)
     sink = RecordingSink()
     repo = fresh_repo()
     with make_client(config) as client:
@@ -160,6 +165,9 @@ def test_working_ollama_actually_reaches_the_report(tmp_path: Path) -> None:
             200, json={"embeddings": [[1.0, 0.0]] * len(json.loads(request.content)["input"])}
         )
     )
+    respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(200, json={"message": {"content": json.dumps({"stack": []})}})
+    )
     sink = RecordingSink()
     repo = fresh_repo()
 
@@ -169,3 +177,40 @@ def test_working_ollama_actually_reaches_the_report(tmp_path: Path) -> None:
     assert sink.items, "прогон ничего не отправил — проверять нечего"
     assert all(item.semantic is not None for item in sink.items)
     assert set(repo.embeddings([item.discovered.id for item in sink.items], "bge-m3"))
+
+
+@respx.mock
+def test_working_ollama_puts_extracted_facts_into_the_report(tmp_path: Path) -> None:
+    """Положительный сторож для фактов — брат-близнец сторожа выше.
+
+    По той же причине: тесты деградации не отличают сломанную модель от
+    неподключённого шага, и без этого теста удаление `extract_pending` из
+    `run_once` целиком не красило бы ничего.
+    """
+    config = fresh_config(tmp_path, "факты")
+    mock_source(TWO_ENRICHABLE)
+    respx.post(f"{OLLAMA}/api/embed").mock(
+        side_effect=lambda request: httpx.Response(
+            200, json={"embeddings": [[1.0, 0.0]] * len(json.loads(request.content)["input"])}
+        )
+    )
+    respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": json.dumps({"stack": ["Yocto", "ARM"], "seniority": "senior"})
+                }
+            },
+        )
+    )
+    sink = RecordingSink()
+    repo = fresh_repo()
+
+    with make_client(config) as client:
+        run_once(config, client, repo, KeywordScorer(config.profile), [sink], NOW, llm=llm_client())
+
+    assert sink.items, "прогон ничего не отправил — проверять нечего"
+    assert all(item.facts is not None for item in sink.items)
+    assert sink.items[0].facts is not None
+    assert sink.items[0].facts.stack == ["Yocto", "ARM"]

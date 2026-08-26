@@ -21,7 +21,7 @@ from datetime import datetime
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.pipeline.enrichment import rescore
-from hh_search.pipeline.llm_enrich import SemanticRanker
+from hh_search.pipeline.llm_enrich import ReportEnrichment
 from hh_search.pipeline.stats import FAILED, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
 from hh_search.sinks.base import Sink
@@ -39,7 +39,7 @@ def report(
     stats: RunStats,
     moment: datetime,
     limit: int,
-    ranker: SemanticRanker | None = None,
+    enrichment: ReportEnrichment | None = None,
 ) -> None:
     # ДО раннего возврата при пустой очереди и до `emit`: обслуживание не
     # зависит от наличия работы (T-2), а довезённый вчерашний документ
@@ -48,14 +48,15 @@ def report(
     ready = _collect(repo, scorer, stats, limit)
     if not ready:
         return
-    # Семантика проставляется ЗДЕСЬ, а не в `_collect`: она не влияет на
-    # то, что попадёт в отчёт, только на порядок внутри него. Отсутствие
-    # ранжировщика (модель недоступна, `llm.semantic: false`, команда
-    # `report` без LLM) оставляет `semantic` пустым у всех, и устойчивая
-    # сортировка приёмников даёт ровно прежний порядок — §4 спеки
+    # Обогащение проставляется ЗДЕСЬ, а не в `_collect`: оно не влияет
+    # на то, ЧТО попадёт в отчёт, только на порядок внутри него и на то,
+    # что рядом с вакансией написано. Его отсутствие (модель недоступна,
+    # оба флага `false`, команда `report` без LLM) оставляет `semantic` и
+    # `facts` пустыми у всех, и устойчивая сортировка приёмников даёт
+    # ровно прежний порядок — §4 спеки
     # `docs/superpowers/specs/2026-08-26-local-llm-design.md`.
-    if ranker is not None:
-        ready = ranker.attach(repo, ready)
+    if enrichment is not None:
+        ready = enrichment.attach(repo, ready)
     if not sinks:
         # Недостижимо через конфиг (`sinks` требует min_length=1), но
         # пометить вакансии отправленными, не отправив их никуда, — тихая
