@@ -9,6 +9,7 @@ robots.txt, паузу в секунду между запросами и `Retry
 """
 
 import json
+import logging
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -23,6 +24,8 @@ from hh_search.errors import LlmUnavailable
 # явный `base_url` из конфига проходит мимо и порт называет сам.
 DEFAULT_PORT = 11434
 
+logger = logging.getLogger(__name__)
+
 _ROUTE_FILE = Path("/proc/net/route")
 
 # Переопределение адреса средой. Старше конфига сознательно: адрес зависит
@@ -32,13 +35,21 @@ _ROUTE_FILE = Path("/proc/net/route")
 # маршрутов.
 BASE_URL_ENV = "HH_LLM_BASE_URL"
 
+# Ожидание СОЕДИНЕНИЯ, отдельно от ожидания ответа. Замер 2026-08-26:
+# пока доступ не открыт, брандмауэр Windows отбрасывает пакеты, а не
+# отвергает их, — и клиент с одним общим таймаутом висел все
+# `timeout_sec` на каждом вызове. Шестьдесят секунд осмысленны для
+# генерации (холодная загрузка модели — 6.9 с), но не для соединения с
+# машиной по соседству: не соединились за пять секунд — не соединимся.
+CONNECT_TIMEOUT_SEC = 5.0
+
 # Строка таблицы маршрутов с этим назначением — маршрут по умолчанию.
 _DEFAULT_DESTINATION = "00000000"
 
 
 def resolve_base_url(
     configured: str,
-    route_file: Path = _ROUTE_FILE,
+    route_file: Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> str:
     """`auto` — вычислить адрес хоста, всё остальное — вернуть как есть.
@@ -57,7 +68,11 @@ def resolve_base_url(
         return override
     if configured != "auto":
         return configured
-    return f"http://{_default_gateway(route_file)}:{DEFAULT_PORT}"
+    # Путь берётся ЗДЕСЬ, а не значением аргумента по умолчанию: то
+    # связалось бы в момент импорта модуля, и подмена `_ROUTE_FILE` не
+    # доходила бы до вызова вовсе — ловушка, стоившая одного зелёного
+    # теста, который ничего не проверял.
+    return f"http://{_default_gateway(route_file or _ROUTE_FILE)}:{DEFAULT_PORT}"
 
 
 def _default_gateway(route_file: Path) -> str:
@@ -104,11 +119,11 @@ class OllamaClient:
     ) -> None:
         self._config = config
         # Адрес разрешён ВЫШЕ и передан готовым: `auto` умеет падать
-        # (§2 спеки), а падать конструктор клиента обязан не в середине
-        # прогона, а на старте процесса, вместе с остальным конфигом.
+        # (§2 спеки), и гасит этот отказ `build_llm` — прогон идёт без
+        # модели. Конструктор поэтому не знает про `auto` ничего.
         self._client = httpx.Client(
             base_url=base_url,
-            timeout=config.timeout_sec,
+            timeout=httpx.Timeout(config.timeout_sec, connect=CONNECT_TIMEOUT_SEC),
             transport=transport,
         )
 
@@ -121,6 +136,9 @@ class OllamaClient:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        self.close()
+
+    def close(self) -> None:
         self._client.close()
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
@@ -204,3 +222,29 @@ def _server_words(response: httpx.Response) -> str:
     что запасной путь давал тот же ответ.
     """
     return response.text[:200]
+
+
+def build_llm(config: LlmConfig) -> OllamaClient | None:
+    """Клиент или `None`, если модель не нужна либо недостижима.
+
+    Оба `false` — клиент не строится вовсе: это и есть выключатель, и
+    общего флага `enabled` в конфиге поэтому нет (§7 спеки).
+
+    Неразрешимый `auto` гасится ЗДЕСЬ и превращается в отсутствие
+    клиента, а не в исключение. Отсутствие маршрута по умолчанию —
+    свойство машины, а не опечатка владельца, и §4 спеки не отличает его
+    от выключенного Ollama: терять вакансии из-за того, чего у них нет,
+    нельзя. Молчать при этом тоже нельзя — отсюда строка ERROR.
+    """
+    if not (config.semantic or config.facts):
+        return None
+    try:
+        base_url = resolve_base_url(config.base_url)
+    except (ValueError, OSError) as error:
+        logger.error(
+            "адрес локальной модели не получен (%s): прогон пойдёт без неё, "
+            "по одной ключевой оценке",
+            error,
+        )
+        return None
+    return OllamaClient(config, base_url)

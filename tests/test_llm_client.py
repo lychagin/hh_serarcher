@@ -15,7 +15,14 @@ import respx
 
 from hh_search.config.models import LlmConfig
 from hh_search.errors import LlmUnavailable
-from hh_search.llm.client import BASE_URL_ENV, OllamaClient, resolve_base_url
+from hh_search.llm import client as client_module
+from hh_search.llm.client import (
+    BASE_URL_ENV,
+    CONNECT_TIMEOUT_SEC,
+    OllamaClient,
+    build_llm,
+    resolve_base_url,
+)
 
 # Живой /proc/net/route этой машины (WSL2, NAT). Шлюз `012011AC` —
 # little-endian запись 172.17.32.1, и порядок байт здесь не украшение:
@@ -289,3 +296,82 @@ def test_response_without_message_content_raises_llm_unavailable() -> None:
 
     with pytest.raises(LlmUnavailable, match="message.content"):
         make_client().chat("извлеки", "вакансия", GRADE_SCHEMA)
+
+
+# --- Сборка клиента -------------------------------------------------------
+
+
+def test_client_is_not_built_when_both_uses_are_off() -> None:
+    """Оба `false` — клиент не строится вовсе. Это и есть выключатель.
+
+    Общего флага `enabled` в конфиге нет сознательно (§7 спеки): он завёл
+    бы состояние `enabled: false` при `semantic: true`, осмысленное на вид
+    и не значащее ничего.
+    """
+    config = LlmConfig(base_url=BASE, semantic=False, facts=False)
+
+    assert build_llm(config) is None
+
+
+def test_client_is_built_when_at_least_one_use_is_on() -> None:
+    config = LlmConfig(base_url=BASE, semantic=True, facts=False)
+
+    client = build_llm(config)
+
+    assert client is not None
+    client.close()
+
+
+def test_unresolvable_auto_address_gives_no_client_instead_of_an_exception(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Не вычислился адрес — прогон идёт БЕЗ модели, а не падает.
+
+    Это тот же случай, что выключенный Ollama, и §4 спеки не делает между
+    ними разницы: отсутствие маршрута по умолчанию — свойство машины, а не
+    опечатка владельца, и ронять из-за него ночной прогон значит терять
+    вакансии по причине, к вакансиям отношения не имеющей. Молчать при
+    этом нельзя — отсюда ровно одна строка ERROR.
+    """
+    monkeypatch.setattr(client_module, "_ROUTE_FILE", Path("/nonexistent/route"))
+
+    with caplog.at_level("ERROR"):
+        assert build_llm(LlmConfig(base_url="auto", semantic=True)) is None
+
+    assert len([record for record in caplog.records if record.levelname == "ERROR"]) == 1
+
+
+def test_omitting_the_llm_section_leaves_the_feature_off() -> None:
+    """Обновление не включает возможность само.
+
+    У работающей установки секции `llm` в `app.yaml` нет вовсе. Умолчание
+    `true` означало бы, что сервис после обновления начинает ходить за
+    моделью, которой на той машине может не быть, и пишет ERROR каждые
+    четыре часа. Образец конфига при этом включает обе — новому
+    пользователю возможность видна.
+    """
+    default = LlmConfig()
+
+    assert (default.semantic, default.facts) == (False, False)
+    assert build_llm(default) is None
+
+
+def test_connect_timeout_is_short_while_read_timeout_is_not() -> None:
+    """Ожидание соединения и ожидание ответа — разные величины.
+
+    Замер 2026-08-26: пока доступ не открыт, брандмауэр Windows
+    ОТБРАСЫВАЕТ пакеты, а не отвергает их, — и клиент с одним общим
+    таймаутом висел все 60 секунд на каждом вызове. Шестьдесят секунд
+    осмысленны для генерации (холодная загрузка модели стоит 6.9 с), но
+    не для установления соединения с машиной по соседству: не соединились
+    за пять секунд — не соединимся.
+    """
+    # `timeout_sec` намеренно НЕ равен `CONNECT_TIMEOUT_SEC`: на равных
+    # числах тест зелен и при слитых таймаутах — проверено мутацией.
+    client = make_client(timeout_sec=60.0)
+    timeout = client._client.timeout  # noqa: SLF001 — иначе разделение ненаблюдаемо
+
+    assert timeout.connect == CONNECT_TIMEOUT_SEC
+    assert timeout.read == 60.0
+    assert CONNECT_TIMEOUT_SEC < 60.0
+    client.close()

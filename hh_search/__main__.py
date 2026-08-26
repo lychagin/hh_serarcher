@@ -22,6 +22,7 @@ import typer
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden, StorageUnavailable
+from hh_search.llm.client import build_llm
 from hh_search.logging_setup import setup_logging
 from hh_search.pipeline import EXIT_CODES, OK, PARTIAL, RunStats, run_once
 from hh_search.pipeline.cleanup import CleanupDays, execute, horizon, plan
@@ -312,8 +313,20 @@ def _execute(config: Config, sinks: Sequence[Sink]) -> RunStats | None:
             # Ровно здесь и нигде раньше: замок уже наш, значит любая строка
             # `running` осталась от умершего процесса, а не от живого соседа.
             repo.close_abandoned_runs()
-            with PoliteClient(config.app.http, config.app.user_agent) as client:
-                return run_once(config, client, repo, KeywordScorer(config.profile), sinks)
+            # Клиент модели строится ВНУТРИ замка и после него: его
+            # сборка не ходит в сеть, но и держать открытым соединение
+            # прогона, который сейчас же откажется стартовать («слишком
+            # рано»), незачем. `None` здесь — штатный исход, а не отказ:
+            # см. `build_llm` и §4 спеки 2026-08-26.
+            llm = build_llm(config.app.llm)
+            try:
+                with PoliteClient(config.app.http, config.app.user_agent) as client:
+                    return run_once(
+                        config, client, repo, KeywordScorer(config.profile), sinks, llm=llm
+                    )
+            finally:
+                if llm is not None:
+                    llm.close()
 
 
 @app.command("init-db")

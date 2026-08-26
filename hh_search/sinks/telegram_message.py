@@ -11,6 +11,7 @@ from datetime import datetime
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.html_report import escape_attr, escape_html
+from hh_search.sinks.ordering import by_relevance
 from hh_search.sinks.telegram_client import MESSAGE_LIMIT, message_length
 from hh_search.sinks.text import format_day, format_published, format_salary_short
 
@@ -43,11 +44,7 @@ def render_message(fresh: Sequence[ScoredVacancy], threshold: float, now: dateti
     наращивание считало бы их до того, как оно известно. Семь сборок дешевле
     одной сетевой ошибки.
     """
-    top = sorted(
-        (item for item in fresh if item.score.total >= threshold),
-        key=lambda item: item.score.total,
-        reverse=True,
-    )
+    top = by_relevance([item for item in fresh if item.score.total >= threshold])
     below = len(fresh) - len(top)
     head = _head(now, len(fresh), len(top))
     if not top:

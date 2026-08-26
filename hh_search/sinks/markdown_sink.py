@@ -6,6 +6,7 @@ from pathlib import Path
 
 from hh_search.domain.models import ScoredVacancy
 from hh_search.sinks.base import REPORT_DATE_FORMAT
+from hh_search.sinks.ordering import by_relevance
 from hh_search.sinks.text import collapse, format_work_formats, snippet
 
 # Заголовок и описание пишет работодатель. `[Удалённо] Инженер` в начале
@@ -63,7 +64,7 @@ class MarkdownSink:
         existing = self._read_day_file(path)
         written = set(_WRITTEN_LINK_RE.findall(existing))
         ordered: list[ScoredVacancy] = []
-        for item in sorted(vacancies, key=lambda item: item.score.total, reverse=True):
+        for item in by_relevance(vacancies):
             if item.discovered.url in written:
                 continue
             written.add(item.discovered.url)

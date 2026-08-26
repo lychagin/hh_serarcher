@@ -26,9 +26,11 @@ from datetime import UTC, datetime
 
 from hh_search.config.models import Config
 from hh_search.errors import AccessForbidden
+from hh_search.llm.client import OllamaClient
 from hh_search.pipeline.discovery import discover, prefilter
 from hh_search.pipeline.enrichment import enrich
 from hh_search.pipeline.forbidden import ForbiddenStreak
+from hh_search.pipeline.llm_enrich import SemanticRanker, build_ranker, embed_pending
 from hh_search.pipeline.reporting import report
 from hh_search.pipeline.stats import EXIT_CODES, FAILED, OK, PARTIAL, RunStats
 from hh_search.scoring.base import Scorer
@@ -48,6 +50,7 @@ def run_once(
     scorer: Scorer,
     sinks: Sequence[Sink],
     now: datetime | None = None,
+    llm: OllamaClient | None = None,
 ) -> RunStats:
     """Один прогон целиком. Возвращает счётчики и статус, не бросает при частичном отказе.
 
@@ -72,7 +75,8 @@ def run_once(
         discover(config, client, repo, stats, forbidden)
         prefilter(config, repo, stats)
         enrich(config, client, repo, scorer, stats, forbidden)
-        report(repo, scorer, sinks, stats, moment, config.app.limits.rows_per_batch)
+        ranker = _rank_semantically(config, repo, llm)
+        report(repo, scorer, sinks, stats, moment, config.app.limits.rows_per_batch, ranker)
     except AccessForbidden as error:
         stats.degrade(FAILED, f"hh.ru закрыл доступ: {error}")
         # Без «прогон остановлен» и без «обходные пути» — то и другое
@@ -104,6 +108,25 @@ def run_once(
         f", причина: {stats.error}" if stats.error else "",
     )
     return stats
+
+
+def _rank_semantically(
+    config: Config, repo: Repository, llm: OllamaClient | None
+) -> SemanticRanker | None:
+    """Досчитать векторы и вернуть ранжировщик. `None` — отчёт без семантики.
+
+    Стоит между `enrich` и `report`: описание уже скачано, а порядок ещё
+    не понадобился. Ни один путь отсюда не бросает — оба вызова внутри
+    гасят `LlmUnavailable` сами (§4 спеки
+    `docs/superpowers/specs/2026-08-26-local-llm-design.md`), и это не
+    вопрос вкуса: модель живёт на рабочей машине владельца, которая
+    выключается на ночь, а прогон идёт раз в четыре часа.
+    """
+    if llm is None or not config.app.llm.semantic:
+        return None
+    model = config.app.llm.embed_model
+    embed_pending(llm, repo, model, config.app.limits.llm_per_run)
+    return build_ranker(llm, config.profile, model)
 
 
 def _finish(repo: Repository, run_id: int, stats: RunStats) -> None:
