@@ -15,7 +15,12 @@ from hh_search.config.models import LlmConfig
 from hh_search.domain.models import DiscoveredVacancy, ScoreBreakdown, ScoredVacancy, VacancyDetails
 from hh_search.llm.client import OllamaClient
 from hh_search.llm.semantic import pack_vector
-from hh_search.pipeline.llm_enrich import SemanticRanker, build_ranker, embed_pending
+from hh_search.pipeline.llm_enrich import (
+    SemanticRanker,
+    build_ranker,
+    embed_pending,
+    extract_pending,
+)
 from hh_search.storage.repository import SqliteRepository
 from tests.test_llm_semantic import PROFILE
 
@@ -216,3 +221,55 @@ def test_absent_vectors_are_silent_while_broken_ones_are_not(
     warnings = [record for record in caplog.records if record.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "битая" in warnings[0].getMessage()
+
+
+def enriched_with(repo: SqliteRepository, vacancy_id: str, description: str) -> None:
+    repo.add_discovered(
+        DiscoveredVacancy(
+            id=vacancy_id,
+            url=f"https://hh.ru/vacancy/{vacancy_id}",
+            title="Ведущий разработчик",
+            found_by_query="programmist",
+        ),
+        cluster="backend",
+        weight=8,
+    )
+    repo.save_enriched(
+        vacancy_id,
+        VacancyDetails(description=description),
+        ScoreBreakdown(title=1, stack=1, responsibilities=1, domain=1, penalty=0, total=87.3),
+    )
+
+
+@respx.mock
+def test_relocation_is_asked_only_where_the_text_mentions_it(repo: SqliteRepository) -> None:
+    """Второй запрос — только у тех, где переезд уже найден словами.
+
+    Замер 2026-08-26: таких девять из ста пятидесяти. Спрашивать всех
+    значило бы удвоить цену шага ради ответа, который и так известен без
+    сети, — пять минут прогона вместо пятнадцати секунд.
+    """
+    enriched_with(repo, "с-переездом", "Работа в Елабуге, компания помогает с переездом")
+    enriched_with(repo, "без-переезда", "Удалённая работа, Yocto и ARM")
+
+    def by_question(request: httpx.Request) -> httpx.Response:
+        # Отвечать по СОДЕРЖАНИЮ запроса, а не по порядку: очередь
+        # `pending_facts` отсортирована по дате, и список ответов,
+        # привязанный к порядку вакансий, проверял бы сортировку вместо
+        # предмета теста.
+        system = json.loads(request.content)["messages"][0]["content"]
+        answer = (
+            {"kind": "required", "city": "Елабуга"} if "переезд" in system else {"stack": ["Yocto"]}
+        )
+        return httpx.Response(200, json={"message": {"content": json.dumps(answer)}})
+
+    route = respx.post(f"{BASE}/api/chat").mock(side_effect=by_question)
+
+    extract_pending(make_client(), repo, "llama3", limit=10)
+
+    # Три запроса на две вакансии: факты обеим, уточнение — одной.
+    assert route.call_count == 3
+    stored = repo.facts(["с-переездом", "без-переезда"], "llama3")
+    assert stored["с-переездом"].relocation is not None
+    assert stored["с-переездом"].relocation.city == "Елабуга"
+    assert stored["без-переезда"].relocation is None

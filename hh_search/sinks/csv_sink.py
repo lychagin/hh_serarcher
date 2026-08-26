@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from hh_search.domain.models import ScoredVacancy
+from hh_search.domain.models import ScoredVacancy, VacancyFacts
 from hh_search.sinks.base import REPORT_DATE_FORMAT
 from hh_search.sinks.text import format_work_formats
 
@@ -43,6 +43,7 @@ COLUMNS = [
     # заполненная на четверть, в таблице хуже отсутствующей.
     "stack",
     "seniority",
+    "relocation",
 ]
 
 # Excel и LibreOffice исполняют содержимое ячейки, начинающееся с этих
@@ -179,7 +180,21 @@ class CsvSink:
             # работодателя, и формула в нём так же исполнится в Excel.
             "stack": _cell(", ".join(facts.stack) if facts and facts.stack else None),
             "seniority": _cell(facts.seniority if facts else None),
+            "relocation": _cell(_relocation(facts)),
         }
+
+
+def _relocation(facts: VacancyFacts | None) -> str | None:
+    """«требуется: Елабуга» — вид и город одной ячейкой.
+
+    Одна колонка, а не две: фильтровать в таблице владелец будет по
+    наличию переезда, а не по городу отдельно, а две ячейки, из которых
+    вторая пуста у половины строк, читаются хуже одной.
+    """
+    if facts is None or facts.relocation is None:
+        return None
+    kind = "требуется" if facts.relocation.kind == "required" else "по желанию"
+    return f"{kind}: {facts.relocation.city}" if facts.relocation.city else kind
 
 
 def _read_day_file(path: Path) -> str:

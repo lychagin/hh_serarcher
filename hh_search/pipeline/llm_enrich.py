@@ -15,8 +15,9 @@ from dataclasses import dataclass
 from hh_search.config.models import ProfileConfig
 from hh_search.domain.models import ScoredVacancy
 from hh_search.errors import LlmUnavailable
+from hh_search.filtering.relocation import mentions_relocation
 from hh_search.llm.client import OllamaClient
-from hh_search.llm.facts import extract_facts
+from hh_search.llm.facts import extract_facts, extract_relocation
 from hh_search.llm.semantic import cosine, pack_vector, profile_text, unpack_vector
 from hh_search.storage.base import Repository
 
@@ -147,6 +148,15 @@ def extract_pending(client: OllamaClient, repo: Repository, model: str, limit: i
         facts = extract_facts(client, title, description)
         if facts is None:
             continue
+        # Второй запрос — только там, где переезд УЖЕ найден текстом:
+        # примерно у шести процентов вакансий (замер 2026-08-26 — девять
+        # из ста пятидесяти). Спрашивать про переезд всех значило бы
+        # платить вторым запросом за каждую вакансию ради ответа `None`,
+        # который и так известен без сети.
+        if mentions_relocation(f"{title}\n{description}"):
+            relocation = extract_relocation(client, title, description)
+            if relocation is not None:
+                facts = facts.model_copy(update={"relocation": relocation})
         repo.save_facts(vacancy_id, model, facts)
         written += 1
     if written:

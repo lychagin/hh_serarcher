@@ -187,4 +187,10 @@ def _facts_line(facts: VacancyFacts | None) -> str:
         parts.append(f"опыт от {facts.required_years} лет")
     if facts.seniority is not None:
         parts.append(facts.seniority)
+    if facts.relocation is not None:
+        # Первым в строке, а не последним: это единственная её часть,
+        # способная закрыть вакансию для владельца целиком.
+        where = f" в {_escape(facts.relocation.city)}" if facts.relocation.city else ""
+        kind = "требуется" if facts.relocation.kind == "required" else "по желанию"
+        parts.insert(0, f"**переезд{where} — {kind}**")
     return f"_{' · '.join(parts)}_\n\n" if parts else ""

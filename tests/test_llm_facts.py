@@ -13,9 +13,14 @@ import pytest
 import respx
 
 from hh_search.config.models import LlmConfig
-from hh_search.domain.models import VacancyFacts
+from hh_search.domain.models import Relocation, VacancyFacts
 from hh_search.llm.client import OllamaClient
-from hh_search.llm.facts import FACTS_SCHEMA, extract_facts
+from hh_search.llm.facts import (
+    FACTS_SCHEMA,
+    RELOCATION_SCHEMA,
+    extract_facts,
+    extract_relocation,
+)
 
 BASE = "http://ollama.test:11434"
 
@@ -135,3 +140,69 @@ def test_an_extra_field_in_the_answer_is_refused_and_not_ignored() -> None:
     )
 
     assert extract_facts(make_client(), "Заголовок", "описание") is None
+
+
+# --- Переезд ---------------------------------------------------------------
+
+
+@respx.mock
+def test_relocation_is_asked_separately_and_only_about_the_city_and_kind() -> None:
+    """Отдельный вопрос, а не поле в общей схеме, — решение замера.
+
+    llama3, спрошенная «есть ли переезд», нашла пять упоминаний из
+    одиннадцати. Слова находят все одиннадцать, поэтому НАХОДИТ регулярка
+    (`filtering/relocation.py`), а модель отвечает только на то, в чём
+    измеренно сильна: как называется город и требование это или льгота.
+    Вопрос «есть ли переезд» ей больше не задаётся вовсе.
+    """
+    route = respx.post(f"{BASE}/api/chat").mock(
+        return_value=answer({"kind": "required", "city": "Елабуга"})
+    )
+
+    relocation = extract_relocation(
+        make_client(), "Инженер", "работа в Елабуге, поможем с переездом"
+    )
+
+    assert relocation == Relocation(kind="required", city="Елабуга")
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["format"]["properties"]["kind"]["enum"] == ["required", "offered"]
+
+
+@respx.mock
+def test_relocation_schema_has_no_not_people_option() -> None:
+    """Класса «речь не о людях» в схеме НЕТ, и это тоже замер.
+
+    Спрошенная про него llama3 не выбрала его ни разу из одиннадцати —
+    включая обе вакансии, где переезжали приложения. Оставить в схеме
+    вариант, который модель не выбирает никогда, значит создать видимость
+    проверки: она отвечала бы `required` на «переезд приложений в
+    Kubernetes» ровно так же, как отвечает сейчас. Технический смысл
+    отсеян ДО вызова, детерминированно.
+    """
+    respx.post(f"{BASE}/api/chat").mock(return_value=answer({"kind": "offered"}))
+
+    extract_relocation(make_client(), "Инженер", "возможна релокация на Кипр")
+
+    assert "not_people" not in json.dumps(FACTS_SCHEMA) + json.dumps(RELOCATION_SCHEMA)
+
+
+@respx.mock
+def test_unknown_city_is_none_and_not_invented() -> None:
+    respx.post(f"{BASE}/api/chat").mock(return_value=answer({"kind": "offered", "city": None}))
+
+    relocation = extract_relocation(make_client(), "Инженер", "возможна релокация")
+
+    assert relocation is not None
+    assert relocation.city is None
+
+
+@respx.mock
+def test_unreachable_model_costs_the_relocation_detail_and_not_the_flag() -> None:
+    """Модель молчит — пометка о переезде всё равно остаётся.
+
+    Её ставит регулярка, без сети. Модель добавляет к пометке город и
+    вид, и её отказ обязан стоить ровно этой прибавки (§4 спеки).
+    """
+    respx.post(f"{BASE}/api/chat").mock(side_effect=httpx.ConnectError("refused"))
+
+    assert extract_relocation(make_client(), "Инженер", "поможем с переездом") is None

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from hh_search.domain.models import (
     DiscoveredVacancy,
+    Relocation,
     ScoreBreakdown,
     ScoredVacancy,
     VacancyDetails,
@@ -156,3 +157,78 @@ def test_markdown_without_facts_adds_no_empty_line(tmp_path: Path) -> None:
 
     text = (tmp_path / f"{NOW:%Y-%m-%d}-new.md").read_text(encoding="utf-8")
     assert "стек" not in text.lower()
+
+
+# --- Переезд --------------------------------------------------------------
+
+
+def test_relocation_is_the_first_thing_said_about_a_vacancy(tmp_path: Path) -> None:
+    """Переезд идёт первым в строке фактов, раньше стека и грейда.
+
+    Это единственная её часть, способная закрыть вакансию для владельца
+    целиком: стек можно доучить, грейд обсудить, а переезд в Елабугу — это
+    решение о жизни, а не о работе.
+    """
+    facts = VacancyFacts(
+        stack=["Python"],
+        seniority="lead",
+        relocation=Relocation(kind="required", city="Елабуга"),
+    )
+    MarkdownSink(tmp_path, threshold=60.0).emit([with_facts("1", facts)], NOW)
+
+    line = next(
+        row
+        for row in (tmp_path / f"{NOW:%Y-%m-%d}-new.md").read_text(encoding="utf-8").splitlines()
+        if "переезд" in row
+    )
+    assert line.index("переезд") < line.index("стек")
+    assert "Елабуга" in line and "требуется" in line
+
+
+def test_optional_relocation_is_not_called_required(tmp_path: Path) -> None:
+    """«Возможна релокация на Кипр по желанию» — не то же, что «работа в Елабуге».
+
+    Разницу называет модель, и напечатать одно вместо другого значило бы
+    отпугнуть владельца от удалённой вакансии с приятной льготой.
+    """
+    facts = VacancyFacts(relocation=Relocation(kind="offered", city="Кипр"))
+    MarkdownSink(tmp_path, threshold=60.0).emit([with_facts("1", facts)], NOW)
+
+    text = (tmp_path / f"{NOW:%Y-%m-%d}-new.md").read_text(encoding="utf-8")
+    assert "по желанию" in text
+    assert "требуется" not in text
+
+
+def test_csv_carries_relocation_as_one_cell(tmp_path: Path) -> None:
+    CsvSink(tmp_path).emit(
+        [with_facts("1", VacancyFacts(relocation=Relocation(kind="required", city="Елабуга")))],
+        NOW,
+    )
+
+    with (tmp_path / f"{NOW:%Y-%m-%d}-new.csv").open(encoding="utf-8-sig") as handle:
+        row = next(iter(csv.DictReader(handle, delimiter=";")))
+    assert row["relocation"] == "требуется: Елабуга"
+
+
+def test_csv_relocation_is_empty_without_one(tmp_path: Path) -> None:
+    CsvSink(tmp_path).emit([with_facts("1", VacancyFacts(stack=["Python"]))], NOW)
+
+    with (tmp_path / f"{NOW:%Y-%m-%d}-new.csv").open(encoding="utf-8-sig") as handle:
+        row = next(iter(csv.DictReader(handle, delimiter=";")))
+    assert row["relocation"] == ""
+
+
+def test_csv_calls_an_optional_relocation_optional(tmp_path: Path) -> None:
+    """Проверено мутацией: без этого случая CSV мог называть льготу требованием.
+
+    Соседний тест подаёт только `required`, и подмена вида на константу
+    его не красила — то есть ошибка, отпугивающая владельца от удалённой
+    вакансии с приятной льготой, прошла бы незамеченной.
+    """
+    CsvSink(tmp_path).emit(
+        [with_facts("1", VacancyFacts(relocation=Relocation(kind="offered", city="Кипр")))], NOW
+    )
+
+    with (tmp_path / f"{NOW:%Y-%m-%d}-new.csv").open(encoding="utf-8-sig") as handle:
+        row = next(iter(csv.DictReader(handle, delimiter=";")))
+    assert row["relocation"] == "по желанию: Кипр"

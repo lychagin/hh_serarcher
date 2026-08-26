@@ -11,7 +11,7 @@ import logging
 
 from pydantic import ValidationError
 
-from hh_search.domain.models import VacancyFacts
+from hh_search.domain.models import Relocation, VacancyFacts
 from hh_search.errors import LlmUnavailable
 from hh_search.llm.client import OllamaClient
 
@@ -70,4 +70,49 @@ def extract_facts(client: OllamaClient, title: str, description: str) -> Vacancy
             error.errors()[0]["type"],
             answer,
         )
+        return None
+
+
+# Схема уточнения переезда. Класса «речь не о людях» в ней НЕТ: замер
+# §0.7 показал, что модель не выбирает его никогда — включая обе живые
+# вакансии, где переезжали приложения. Технический смысл отсеивает
+# `filtering/relocation.py`, до вызова и без сети.
+RELOCATION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": ["required", "offered"]},
+        "city": {"type": ["string", "null"]},
+    },
+    "required": ["kind"],
+}
+
+_RELOCATION_SYSTEM = (
+    "В тексте вакансии есть речь о переезде сотрудника. Ответь на два вопроса. "
+    "kind: 'required' — переехать надо, чтобы работать; 'offered' — переезд возможен "
+    "по желанию или предлагается как льгота. "
+    "city — город или страна переезда, если названы в тексте, иначе null. Не додумывай."
+)
+
+
+def extract_relocation(client: OllamaClient, title: str, description: str) -> Relocation | None:
+    """Город и вид переезда — или `None`.
+
+    Зовётся ТОЛЬКО у вакансий, где переезд уже найден текстом
+    (`filtering.relocation.mentions_relocation`), то есть примерно у
+    шести процентов: замер 2026-08-26 — девять вакансий из ста
+    пятидесяти, пятнадцать секунд на прогон вместо пяти минут.
+
+    Вопроса «есть ли переезд» модели не задаётся вовсе: на нём она нашла
+    пять упоминаний из одиннадцати. Её отказ стоит городу и виду, но не
+    самой пометке — ту поставили без сети.
+    """
+    try:
+        answer = client.chat(_RELOCATION_SYSTEM, f"{title}\n{description}", RELOCATION_SCHEMA)
+    except LlmUnavailable as error:
+        logger.debug("переезд не уточнён (%s)", error)
+        return None
+    try:
+        return Relocation.model_validate(answer)
+    except ValidationError:
+        logger.warning("модель ответила мимо схемы переезда: %.200s", answer)
         return None
