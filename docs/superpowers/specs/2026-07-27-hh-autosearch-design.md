@@ -374,7 +374,7 @@ URL с query-строкой, то есть всего RSS-поиска цели�
 ```text
 hh_search/
   __main__.py           CLI: команды демона (см. §8.3), маркер устойчивого 403, внятный отказ тома
-  errors.py             иерархия ошибок: AccessForbidden, DegenerateListing, FetchFailed, RobotsDisallowed, StorageUnavailable
+  errors.py             иерархия ошибок: AccessForbidden, DegenerateListing, FetchFailed, LlmUnavailable, RobotsDisallowed, StorageUnavailable
   logging_setup.py      stdout плюс /data/logs/hh.log с ротацией; httpx приглушён
   runlock.py            файловый замок: одновременно работает ровно один прогон
   scheduler.py          цикл режима serve: дедлайн, SIGTERM, устойчивый 403
@@ -386,6 +386,8 @@ hh_search/
   filtering/
     matching.py         нормализация и сопоставление слов
     prefilter.py        шаг 3: отсев по заголовку — единственный барьер перед сетью
+  llm/
+    client.py           локальная Ollama: /api/chat со схемой-объектом, /api/embed, адрес из шлюза
   pipeline/
     __init__.py         run_once: ПОРЯДОК семи шагов и закрытие журнала на любом исходе
     cleanup.py          ручная уборка: план, исполнение, горизонт хранения
@@ -1198,6 +1200,16 @@ limits:
   listing_pages_per_run: 60
   enrich_per_run: 200
   rows_per_batch: 500
+  llm_per_run: 200            # потолок вакансий, отдаваемых локальной модели
+# Локальная Ollama — спека 2026-08-26-local-llm-design.md. Общего флага
+# `enabled` нет: выключение выражается двумя `false`.
+llm:
+  base_url: auto
+  chat_model: llama3
+  embed_model: bge-m3
+  timeout_sec: 60
+  semantic: true
+  facts: true
 sinks: [csv, markdown]        # позже добавится telegram
 paths:
   state: /data/state/hh.db
@@ -1283,8 +1295,11 @@ services:
         required: false
     volumes:
       - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       TZ: Europe/Moscow
+      HH_LLM_BASE_URL: "http://host.docker.internal:11434"
     stop_grace_period: 30s
     mem_limit: 256m
     healthcheck:

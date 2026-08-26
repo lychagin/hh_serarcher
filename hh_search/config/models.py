@@ -215,6 +215,40 @@ class LimitsConfig(Base):
     # `pending_scoring` и `reported_since` — три выборки, читающие колонку
     # `description`, на которую приходится ~80% размера базы.
     rows_per_batch: int = Field(default=DEFAULT_BATCH_LIMIT, ge=1)
+    # Потолок вакансий, отдаваемых локальной модели за прогон. По образцу
+    # `enrich_per_run`: бэклог не теряется, остальное берёт следующий
+    # прогон. Умолчание 200 при замеренных 1.2-1.5 с на вакансию (§0.5
+    # спеки 2026-08-26) — около пяти минут, против интервала в четыре часа.
+    llm_per_run: int = Field(default=200, ge=1)
+
+
+class LlmConfig(Base):
+    """Локальная Ollama (спека `2026-08-26-local-llm-design.md`, §7).
+
+    Общего флага `enabled` здесь НЕТ сознательно. Он завёл бы состояние
+    `enabled: false` при `semantic: true` — конфиг, который выглядит
+    осмысленно и не значит ничего. Выключение целиком выражается двумя
+    `false`, и тогда клиент не строится вовсе.
+
+    Два флага вместо одного — потому что цена у них разная: `facts` стоит
+    прогону около пяти минут, `semantic` — около одной (§0.5). Владельцу,
+    которому нужен только порядок выдачи, есть что не платить.
+    """
+
+    # `auto` вычисляет адрес хоста из таблицы маршрутов при старте
+    # (`llm.client.resolve_base_url`). Умолчание именно такое, потому что
+    # адрес шлюза WSL2 меняется при каждой перезагрузке Windows, а
+    # записанный руками протухает МОЛЧА: прогон не падает, а деградирует
+    # на одни ключевые слова.
+    base_url: NonEmptyStr = "auto"
+    chat_model: NonEmptyStr = "llama3"
+    embed_model: NonEmptyStr = "bge-m3"
+    # Щедрый потолок против замеренных 1.5 с: холодная загрузка модели
+    # стоит 6.9 с (§0.5), и таймаут, срезающий её, означал бы деградацию
+    # ровно на первом прогоне после перезапуска Ollama.
+    timeout_sec: float = Field(default=60.0, gt=0)
+    semantic: bool = True
+    facts: bool = True
 
 
 class PathsConfig(Base):
@@ -230,6 +264,7 @@ class AppConfig(Base):
     http: HttpConfig = HttpConfig()
     enrich: EnrichConfig = EnrichConfig()
     limits: LimitsConfig = LimitsConfig()
+    llm: LlmConfig = LlmConfig()
     # Пустой список приёмников — прогон, который работает и никуда не отчитывается.
     sinks: list[NonEmptyStr] = Field(min_length=1)
     paths: PathsConfig
