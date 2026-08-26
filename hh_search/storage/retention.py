@@ -81,9 +81,15 @@ class Retention:
         Строка остаётся на месте. Она и есть дедупликация: удалённая
         вакансия была бы найдена заново, скачана ещё раз и повторно
         отправлена в Telegram — циклически, пока висит объявление.
+
+        Вектор и его модель обнуляются ТЕМ ЖЕ UPDATE. Вектор — производная
+        описания, и пережившая исходник производная это данные, которые
+        нечем перепроверить: ни пересчитать, ни объяснить, откуда взялись.
+        Заодно снимается и вес: 4 КБ на вакансию, которые уборка иначе
+        оставляла бы на диске навсегда, чистя ради них же описание.
         """
         cursor = self._connection.execute(
-            "UPDATE vacancy SET description = NULL "
+            "UPDATE vacancy SET description = NULL, embedding = NULL, embedding_model = NULL "
             "WHERE status = ? AND description IS NOT NULL "
             f"AND {_is_valid_iso('reported_at')} AND reported_at < ?",
             (STATUS_REPORTED, to_utc_iso(cutoff)),

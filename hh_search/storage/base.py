@@ -169,6 +169,28 @@ class Repository(Protocol):
         """Записать пересчитанную оценку, не трогая описание."""
         ...
 
+    # --- 2.5: вектор описания --------------------------------------------
+
+    def pending_embedding(self, model: str, limit: int) -> list[tuple[str, str]]:
+        """Описание есть, вектора ЭТОЙ модели нет: (id, текст под эмбеддинг).
+
+        Имя модели в предикате, а не проверка на NULL: правка
+        `llm.embed_model` обязана ставить корпус в очередь заново сама.
+        """
+        ...
+
+    def save_embedding(self, vacancy_id: str, model: str, vector: bytes) -> None:
+        """Вектор и имя отдавшей его модели — одним UPDATE, не двумя."""
+        ...
+
+    def embeddings(self, ids: Sequence[str], model: str) -> dict[str, bytes]:
+        """Сырые BLOB'ы названных вакансий, только этой модели.
+
+        Именно сырые: формат упаковки принадлежит `llm/semantic.py`, и
+        зависимости `storage → llm` в этом проекте нет.
+        """
+        ...
+
     # --- 3: отчёт --------------------------------------------------------
 
     def unreported(self, limit: int) -> list[ScoredVacancy]:

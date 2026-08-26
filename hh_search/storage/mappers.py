@@ -144,6 +144,17 @@ def to_details(row: sqlite3.Row) -> VacancyDetails:
     )
 
 
+def to_embedding_task(row: sqlite3.Row) -> tuple[str, str]:
+    """id и текст под эмбеддинг: заголовок плюс описание.
+
+    Заголовок склеивается с описанием, а не эмбеддится отдельно, потому
+    что решение принимается по вакансии целиком: «Team Lead» в заголовке
+    и «Team Lead» в требованиях — разный вес для человека, но для
+    косинуса к профилю важно, что и то и другое в этой вакансии есть.
+    """
+    return decode_text(row["id"]), f"{decode_text(row['title'])}\n{decode_text(row['description'])}"
+
+
 def to_scoring_task(row: sqlite3.Row) -> tuple[DiscoveredVacancy, VacancyDetails]:
     """Описание уже скачано, оценки нет — всё для локального пересчёта."""
     return to_discovered(row), to_details(row)

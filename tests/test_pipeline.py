@@ -1635,6 +1635,8 @@ class _MemoryRow:
     attempts: int = 0
     reject_code: str | None = None
     reported_at: datetime | None = None
+    embedding: bytes | None = None
+    embedding_model: str | None = None
 
 
 class MemoryRepository:
@@ -1759,6 +1761,27 @@ class MemoryRepository:
 
     def save_score(self, vacancy_id: str, score: ScoreBreakdown) -> None:
         self.rows[vacancy_id].score = score
+
+    # --- вектор описания -----------------------------------------------
+
+    def pending_embedding(self, model: str, limit: int) -> list[tuple[str, str]]:
+        pending = [
+            (vacancy_id, f"{row.discovered.title}\n{row.details.description}")
+            for vacancy_id, row in self.rows.items()
+            if row.details is not None and row.embedding_model != model
+        ]
+        return pending[:limit]
+
+    def save_embedding(self, vacancy_id: str, model: str, vector: bytes) -> None:
+        row = self.rows[vacancy_id]
+        row.embedding, row.embedding_model = vector, model
+
+    def embeddings(self, ids: Sequence[str], model: str) -> dict[str, bytes]:
+        return {
+            vacancy_id: row.embedding
+            for vacancy_id, row in self.rows.items()
+            if vacancy_id in set(ids) and row.embedding is not None and row.embedding_model == model
+        }
 
     # --- отчёт ---------------------------------------------------------
 
