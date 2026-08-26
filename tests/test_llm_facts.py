@@ -13,14 +13,17 @@ import pytest
 import respx
 
 from hh_search.config.models import LlmConfig
-from hh_search.domain.models import Relocation, VacancyFacts
+from hh_search.domain.models import Opinion, Relocation, VacancyFacts
 from hh_search.llm.client import OllamaClient
 from hh_search.llm.facts import (
     FACTS_SCHEMA,
+    OPINION_SCHEMA,
     RELOCATION_SCHEMA,
     extract_facts,
+    extract_opinion,
     extract_relocation,
 )
+from tests.test_llm_semantic import PROFILE
 
 BASE = "http://ollama.test:11434"
 
@@ -206,3 +209,67 @@ def test_unreachable_model_costs_the_relocation_detail_and_not_the_flag() -> Non
     respx.post(f"{BASE}/api/chat").mock(side_effect=httpx.ConnectError("refused"))
 
     assert extract_relocation(make_client(), "Инженер", "поможем с переездом") is None
+
+
+# --- Мнение модели ---------------------------------------------------------
+
+
+@respx.mock
+def test_opinion_is_asked_by_its_own_request() -> None:
+    """Отдельный запрос, а не поле в схеме фактов, — решение замера.
+
+    Замер 2026-08-26: тот же вопрос, заданный ОДНИМ запросом вместе с
+    фактами, обрушивает оба сигнала. Вакансия «Technical Team Lead
+    (C# / Python)» получала 35 отдельным вопросом и 75 совмещённым —
+    то есть ровно то расхождение с ключевой оценкой, ради которого
+    мнение и заводится, исчезало. Стек при этом беднел:
+    `Node.js, Nest, Redis, Docker, Jest, Kafka` превращалось в
+    `Node.js, Nest.js, TypeScript, Git`.
+    """
+    route = respx.post(f"{BASE}/api/chat").mock(
+        return_value=answer({"score": 35, "reason": "стек не соответствует профилю"})
+    )
+
+    opinion = extract_opinion(make_client(), PROFILE, "Team Lead C#", "нужен C# и .NET")
+
+    assert opinion == Opinion(score=35, reason="стек не соответствует профилю")
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["format"] == OPINION_SCHEMA
+    assert "stack" not in sent["format"]["properties"]
+
+
+@respx.mock
+def test_opinion_prompt_carries_the_profile() -> None:
+    """Профиль берётся из `profile.yaml`, а не зашит в промпт константой.
+
+    Иначе правка сигналов владельцем меняла бы ключевую оценку и НЕ
+    меняла бы мнение модели — два ответа на один вопрос, расходящиеся
+    молча и тем сильнее, чем дольше живёт проект.
+    """
+    route = respx.post(f"{BASE}/api/chat").mock(return_value=answer({"score": 50, "reason": "—"}))
+
+    extract_opinion(make_client(), PROFILE, "Заголовок", "описание")
+
+    system = json.loads(route.calls.last.request.content)["messages"][0]["content"]
+    assert "yocto" in system.lower()
+    assert "телеком" in system.lower()
+
+
+@respx.mock
+def test_score_outside_the_range_is_refused() -> None:
+    """0..100 сторожится валидацией, а не только схемой.
+
+    Ограничение живёт в Ollama, версия которой меняется без нас, а
+    оценка уезжает в отчёт как число рядом с ключевой — и 850 там
+    выглядело бы как факт.
+    """
+    respx.post(f"{BASE}/api/chat").mock(return_value=answer({"score": 850, "reason": "—"}))
+
+    assert extract_opinion(make_client(), PROFILE, "Заголовок", "описание") is None
+
+
+@respx.mock
+def test_unreachable_model_costs_the_opinion_and_not_the_run() -> None:
+    respx.post(f"{BASE}/api/chat").mock(side_effect=httpx.ConnectError("refused"))
+
+    assert extract_opinion(make_client(), PROFILE, "Заголовок", "описание") is None

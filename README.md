@@ -397,7 +397,7 @@ docker compose run --rm hh-search cleanup --reports --apply   # плюс фай�
 **CSV** — UTF-8 с BOM и разделителем `;` ради Excel, колонки:
 
 ```
-id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;listing;url;work_formats;semantic;stack;seniority;relocation
+id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;listing;url;work_formats;semantic;stack;seniority;relocation;llm_score;llm_reason
 ```
 
 Балл записан числом, поэтому сортировка по нему и фильтр по зарплате работают
@@ -415,6 +415,12 @@ id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;
 Наличие переезда определяют слова, без модели; модель называет город и
 отличает требование от льготы («по желанию: Кипр» — не то же, что «требуется:
 Елабуга»).
+
+`llm_score` и `llm_reason` — **мнение** модели о вакансии и одна строка почему.
+На балл и на порядок отчёта они **не влияют**: модель только высказывается, а
+решаете вы. Спрашивается мнение лишь у вакансий выше порога — там, где вы его
+читаете. Смотреть стоит на расхождения: балл 94 при мнении 35 обычно означает,
+что ключевые слова поймали роль, а стек вакансии вам чужой.
 
 `stack` и `seniority` — выписанное той же моделью из текста вакансии. Это не
 дубликат скоринга: балл считается по сигналам из `profile.yaml`, а сюда

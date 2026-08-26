@@ -704,17 +704,23 @@ class SqliteRepository:
 
     # --- 2.6: факты описания ----------------------------------------------
 
-    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str]]:
-        """Описание есть, фактов ЭТОЙ модели нет: (id, заголовок, описание).
+    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str, float]]:
+        """Описание есть, фактов ЭТОЙ модели нет: (id, заголовок, описание, оценка).
 
         Заголовок и описание отдаются порознь, а не склеенными, как в
         `pending_embedding`: эмбеддингу нужен один текст, а промпту —
         разные роли у этих двух полей.
+
+        Ключевая оценка нужна конвейеру, чтобы решить, спрашивать ли у
+        модели МНЕНИЕ: оно показывается только выше порога отчёта, и
+        платить за него на всём корпусе незачем. Ноль у неоценённой
+        строки — не «плохая вакансия», а «оценки ещё нет», и мнения у
+        такой не спрашивают, что верно: спрашивать не о чем.
         """
         rows = self._connection.execute(
             "SELECT CAST(id AS BLOB) AS id, CAST(title AS BLOB) AS title, "
-            "CAST(description AS BLOB) AS description FROM vacancy "
-            "WHERE description IS NOT NULL AND description <> '' "
+            "CAST(description AS BLOB) AS description, COALESCE(score, 0) AS score "
+            "FROM vacancy WHERE description IS NOT NULL AND description <> '' "
             "AND (llm_facts IS NULL OR llm_facts_model IS NOT ?) "
             "ORDER BY COALESCE(published_at, first_seen_at) DESC LIMIT ?",
             (model, limit),

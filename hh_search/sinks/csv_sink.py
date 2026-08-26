@@ -44,6 +44,11 @@ COLUMNS = [
     "stack",
     "seniority",
     "relocation",
+    # Оценка модели и её причина — ДВЕ колонки, а не одна: по числу
+    # владелец фильтрует и сортирует в таблице, причину читает глазами.
+    # Склеенные, они не годились бы ни для того, ни для другого.
+    "llm_score",
+    "llm_reason",
 ]
 
 # Excel и LibreOffice исполняют содержимое ячейки, начинающееся с этих
@@ -181,6 +186,11 @@ class CsvSink:
             "stack": _cell(", ".join(facts.stack) if facts and facts.stack else None),
             "seniority": _cell(facts.seniority if facts else None),
             "relocation": _cell(_relocation(facts)),
+            "llm_score": "" if facts is None or facts.opinion is None else str(facts.opinion.score),
+            # Через `_cell`: причину пишет модель по тексту работодателя,
+            # то есть формула в ней исполнится в Excel так же, как в
+            # заголовке вакансии.
+            "llm_reason": _cell(facts.opinion.reason if facts and facts.opinion else None),
         }
 
 

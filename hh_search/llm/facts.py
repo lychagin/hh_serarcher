@@ -11,7 +11,8 @@ import logging
 
 from pydantic import ValidationError
 
-from hh_search.domain.models import Relocation, VacancyFacts
+from hh_search.config.models import ProfileConfig
+from hh_search.domain.models import Opinion, Relocation, VacancyFacts
 from hh_search.errors import LlmUnavailable
 from hh_search.llm.client import OllamaClient
 
@@ -115,4 +116,58 @@ def extract_relocation(client: OllamaClient, title: str, description: str) -> Re
         return Relocation.model_validate(answer)
     except ValidationError:
         logger.warning("модель ответила мимо схемы переезда: %.200s", answer)
+        return None
+
+
+# Схема мнения. Фактов в ней НЕТ, и это замер, а не вкус: §0.9 спеки —
+# тот же вопрос, заданный одним запросом вместе с извлечением, обрушивает
+# оба сигнала. Вакансия «Technical Team Lead (C# / Python)» получала 35
+# отдельным вопросом и 75 совмещённым, то есть ровно то расхождение с
+# ключевой оценкой, ради которого мнение и заводится, исчезало.
+OPINION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "reason": {"type": "string"},
+    },
+    "required": ["score", "reason"],
+}
+
+
+def _profile_line(profile: ProfileConfig) -> str:
+    """Профиль для промпта — из `profile.yaml`, а не константой в коде.
+
+    Иначе правка сигналов владельцем меняла бы ключевую оценку и не
+    меняла бы мнение модели: два ответа на один вопрос, расходящиеся
+    молча и тем сильнее, чем дольше живёт проект.
+    """
+    signals = profile.signals
+    groups = (signals.title_roles, signals.title_tech, signals.stack, signals.domain)
+    words = [spelling for group in groups for entry in group for spelling in entry]
+    return ", ".join(words)
+
+
+def extract_opinion(
+    client: OllamaClient, profile: ProfileConfig, title: str, description: str
+) -> Opinion | None:
+    """Оценка модели и одна строка почему — или `None`.
+
+    Зовётся только у вакансий выше порога отчёта: мнение показывается
+    там, где владелец его читает, и платить за него на всём корпусе
+    незачем. Замер 2026-08-26 — 34 вакансии из 573, около минуты.
+    """
+    system = (
+        "Оцени, насколько вакансия подходит кандидату, и верни СТРОГО JSON. "
+        "score — от 0 до 100. reason — одно предложение по-русски, почему. "
+        f"Профиль кандидата: {_profile_line(profile)}."
+    )
+    try:
+        answer = client.chat(system, f"{title}\n{description}", OPINION_SCHEMA)
+    except LlmUnavailable as error:
+        logger.debug("мнение не получено (%s)", error)
+        return None
+    try:
+        return Opinion.model_validate(answer)
+    except ValidationError:
+        logger.warning("модель ответила мимо схемы мнения: %.200s", answer)
         return None

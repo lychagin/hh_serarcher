@@ -139,7 +139,14 @@ def _enrich_with_llm(
         ranker = build_ranker(llm, config.profile, config.app.llm.embed_model)
     facts_model = None
     if config.app.llm.facts:
-        extract_pending(llm, repo, config.app.llm.chat_model, limit)
+        extract_pending(
+            llm,
+            repo,
+            config.app.llm.chat_model,
+            limit,
+            config.profile,
+            config.profile.report_threshold,
+        )
         facts_model = config.app.llm.chat_model
     if ranker is None and facts_model is None:
         return None

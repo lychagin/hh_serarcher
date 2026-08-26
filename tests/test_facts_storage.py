@@ -63,9 +63,12 @@ def test_vacancy_without_facts_is_offered_for_extraction(repo: SqliteRepository)
 
     pending = repo.pending_facts(MODEL, limit=10)
 
-    assert [vacancy_id for vacancy_id, _, _ in pending] == ["1"]
+    assert [vacancy_id for vacancy_id, _, _, _ in pending] == ["1"]
     assert pending[0][1] == "Ведущий разработчик"
     assert pending[0][2] == "Yocto BSP ARM"
+    # Ключевая оценка едет вместе с текстом: по ней конвейер решает,
+    # спрашивать ли у модели мнение.
+    assert pending[0][3] == 87.3
 
 
 def test_vacancy_with_current_facts_is_not_offered_again(repo: SqliteRepository) -> None:

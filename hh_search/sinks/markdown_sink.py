@@ -193,4 +193,11 @@ def _facts_line(facts: VacancyFacts | None) -> str:
         where = f" в {_escape(facts.relocation.city)}" if facts.relocation.city else ""
         kind = "требуется" if facts.relocation.kind == "required" else "по желанию"
         parts.insert(0, f"**переезд{where} — {kind}**")
-    return f"_{' · '.join(parts)}_\n\n" if parts else ""
+    line = f"_{' · '.join(parts)}_\n\n" if parts else ""
+    if facts.opinion is None:
+        return line
+    # Оценка И причина вместе: голое число рядом с ключевой оценкой
+    # ставит вопрос и не отвечает на него. Отдельной строкой, а не в
+    # общем перечне, — это мнение о вакансии целиком, а не ещё один
+    # выписанный из неё факт.
+    return f"{line}> модель: {facts.opinion.score} — {_escape(facts.opinion.reason)}\n\n"

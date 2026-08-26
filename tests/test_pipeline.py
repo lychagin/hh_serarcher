@@ -1793,9 +1793,14 @@ class MemoryRepository:
 
     # --- факты описания --------------------------------------------------
 
-    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str]]:
+    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str, float]]:
         pending = [
-            (vacancy_id, row.discovered.title, row.details.description)
+            (
+                vacancy_id,
+                row.discovered.title,
+                row.details.description,
+                row.score.total if row.score else 0.0,
+            )
             for vacancy_id, row in self.rows.items()
             if row.details is not None and row.facts_model != model
         ]

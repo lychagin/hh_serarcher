@@ -194,8 +194,12 @@ class Repository(Protocol):
 
     # --- 2.6: факты описания ---------------------------------------------
 
-    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str]]:
-        """Описание есть, фактов ЭТОЙ модели нет: (id, заголовок, описание)."""
+    def pending_facts(self, model: str, limit: int) -> list[tuple[str, str, str, float]]:
+        """Описание есть, фактов ЭТОЙ модели нет: (id, заголовок, описание, оценка).
+
+        Оценка — чтобы конвейер решил, спрашивать ли МНЕНИЕ модели: оно
+        показывается только выше порога отчёта.
+        """
         ...
 
     def save_facts(self, vacancy_id: str, model: str, facts: VacancyFacts) -> None:

@@ -223,7 +223,9 @@ def test_absent_vectors_are_silent_while_broken_ones_are_not(
     assert "битая" in warnings[0].getMessage()
 
 
-def enriched_with(repo: SqliteRepository, vacancy_id: str, description: str) -> None:
+def enriched_with(
+    repo: SqliteRepository, vacancy_id: str, description: str, score: float = 87.3
+) -> None:
     repo.add_discovered(
         DiscoveredVacancy(
             id=vacancy_id,
@@ -237,7 +239,7 @@ def enriched_with(repo: SqliteRepository, vacancy_id: str, description: str) -> 
     repo.save_enriched(
         vacancy_id,
         VacancyDetails(description=description),
-        ScoreBreakdown(title=1, stack=1, responsibilities=1, domain=1, penalty=0, total=87.3),
+        ScoreBreakdown(title=1, stack=1, responsibilities=1, domain=1, penalty=0, total=score),
     )
 
 
@@ -273,3 +275,31 @@ def test_relocation_is_asked_only_where_the_text_mentions_it(repo: SqliteReposit
     assert stored["с-переездом"].relocation is not None
     assert stored["с-переездом"].relocation.city == "Елабуга"
     assert stored["без-переезда"].relocation is None
+
+
+@respx.mock
+def test_opinion_is_asked_only_above_the_report_threshold(repo: SqliteRepository) -> None:
+    """Мнение показывается только в «Топе», значит и спрашивать его надо там.
+
+    Замер §0.8 спеки: выше порога 34 вакансии из 573. Спрашивать всех —
+    втрое дороже ради строк, которых владелец не увидит: секция
+    «Остальное» в отчёте минимальна по его же решению.
+    """
+    enriched_with(repo, "выше-порога", "Yocto BSP ARM", score=87.3)
+    enriched_with(repo, "ниже-порога", "Yocto BSP ARM", score=12.0)
+
+    def by_question(request: httpx.Request) -> httpx.Response:
+        system = json.loads(request.content)["messages"][0]["content"]
+        answer = (
+            {"score": 35, "reason": "чужой стек"} if "Оцени" in system else {"stack": ["Yocto"]}
+        )
+        return httpx.Response(200, json={"message": {"content": json.dumps(answer)}})
+
+    respx.post(f"{BASE}/api/chat").mock(side_effect=by_question)
+
+    extract_pending(make_client(), repo, "llama3", 10, PROFILE, threshold=60.0)
+
+    stored = repo.facts(["выше-порога", "ниже-порога"], "llama3")
+    assert stored["выше-порога"].opinion is not None
+    assert stored["выше-порога"].opinion.score == 35
+    assert stored["ниже-порога"].opinion is None

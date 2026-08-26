@@ -11,6 +11,7 @@ from pathlib import Path
 
 from hh_search.domain.models import (
     DiscoveredVacancy,
+    Opinion,
     Relocation,
     ScoreBreakdown,
     ScoredVacancy,
@@ -19,6 +20,7 @@ from hh_search.domain.models import (
 )
 from hh_search.sinks.csv_sink import COLUMNS, CsvSink
 from hh_search.sinks.markdown_sink import MarkdownSink
+from hh_search.sinks.ordering import by_relevance
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
 
@@ -232,3 +234,57 @@ def test_csv_calls_an_optional_relocation_optional(tmp_path: Path) -> None:
     with (tmp_path / f"{NOW:%Y-%m-%d}-new.csv").open(encoding="utf-8-sig") as handle:
         row = next(iter(csv.DictReader(handle, delimiter=";")))
     assert row["relocation"] == "по желанию: Кипр"
+
+
+# --- Мнение модели --------------------------------------------------------
+
+
+def test_opinion_is_shown_with_its_reason(tmp_path: Path) -> None:
+    """Оценка модели И причина — вместе, иначе число нечем поверить.
+
+    Владелец решил (2026-08-26) показывать мнение, а не отсеивать по нему.
+    Голая цифра «35» рядом с ключевой «94» ставит вопрос и не отвечает на
+    него; «стек не соответствует профилю» отвечает.
+    """
+    facts = VacancyFacts(opinion=Opinion(score=35, reason="стек не соответствует профилю"))
+    MarkdownSink(tmp_path, threshold=60.0).emit([with_facts("1", facts)], NOW)
+
+    text = (tmp_path / f"{NOW:%Y-%m-%d}-new.md").read_text(encoding="utf-8")
+    assert "35" in text
+    assert "стек не соответствует профилю" in text
+
+
+def test_opinion_does_not_change_the_order() -> None:
+    """Решение владельца: мнение ПОКАЗЫВАЕТСЯ, но ничего не двигает.
+
+    Замер §0.8 показал, что расхождения модели с ключевой оценкой не
+    случайны, и НЕ показал, что они верны. До того как владелец рассудит
+    это на живых данных, дать мнению двигать отчёт значило бы принять
+    решение за него — и тем лишить смысла сам показ.
+    """
+    # Баллы РАВНЫ, а семантика и мнение спорят: семантика ставит первым
+    # «ближе-по-смыслу», мнение — «нравится-модели». Разный первый ключ
+    # эту пару не различил бы вовсе (проверено мутацией: тест с разными
+    # баллами оставался зелёным, когда мнение подменяло семантику в
+    # сортировке, — решал уже первый ключ).
+    closer_but_disliked = make("ближе-по-смыслу", 87.3, semantic=0.9).model_copy(
+        update={"facts": VacancyFacts(opinion=Opinion(score=10, reason="чужой стек"))}
+    )
+    farther_but_liked = make("нравится-модели", 87.3, semantic=0.1).model_copy(
+        update={"facts": VacancyFacts(opinion=Opinion(score=95, reason="точное попадание"))}
+    )
+
+    ordered = by_relevance([farther_but_liked, closer_but_disliked])
+
+    assert [item.discovered.id for item in ordered] == ["ближе-по-смыслу", "нравится-модели"]
+
+
+def test_csv_carries_opinion_score_and_reason(tmp_path: Path) -> None:
+    CsvSink(tmp_path).emit(
+        [with_facts("1", VacancyFacts(opinion=Opinion(score=35, reason="чужой стек")))], NOW
+    )
+
+    with (tmp_path / f"{NOW:%Y-%m-%d}-new.csv").open(encoding="utf-8-sig") as handle:
+        row = next(iter(csv.DictReader(handle, delimiter=";")))
+    assert row["llm_score"] == "35"
+    assert row["llm_reason"] == "чужой стек"

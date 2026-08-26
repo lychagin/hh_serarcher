@@ -125,6 +125,8 @@ def test_csv_row_carries_every_column(tmp_path: Path) -> None:
             "stack": "",
             "seniority": "",
             "relocation": "",
+            "llm_score": "",
+            "llm_reason": "",
         }
     ]
 

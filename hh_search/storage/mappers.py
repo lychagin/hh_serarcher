@@ -155,9 +155,23 @@ def to_embedding_task(row: sqlite3.Row) -> tuple[str, str]:
     return decode_text(row["id"]), f"{decode_text(row['title'])}\n{decode_text(row['description'])}"
 
 
-def to_facts_task(row: sqlite3.Row) -> tuple[str, str, str]:
-    """id, заголовок и описание порознь: у них разные роли в промпте."""
-    return decode_text(row["id"]), decode_text(row["title"]), decode_text(row["description"])
+def to_facts_task(row: sqlite3.Row) -> tuple[str, str, str, float]:
+    """id, заголовок и описание порознь плюс ключевая оценка.
+
+    Порознь — потому что у заголовка и описания разные роли в промпте.
+    Оценка — потому что по ней конвейер решает, спрашивать ли МНЕНИЕ
+    модели: оно показывается только выше порога отчёта.
+
+    Оценка приходит числом (`COALESCE(score, 0)`), а не BLOB'ом: она
+    участвует в сравнении, а не в выводе, и портиться ей нечем — колонка
+    REAL, а нечитаемое значение уронило бы строку в карантин ещё раньше.
+    """
+    return (
+        decode_text(row["id"]),
+        decode_text(row["title"]),
+        decode_text(row["description"]),
+        float(row["score"]),
+    )
 
 
 def to_scoring_task(row: sqlite3.Row) -> tuple[DiscoveredVacancy, VacancyDetails]:

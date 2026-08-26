@@ -17,7 +17,7 @@ from hh_search.domain.models import ScoredVacancy
 from hh_search.errors import LlmUnavailable
 from hh_search.filtering.relocation import mentions_relocation
 from hh_search.llm.client import OllamaClient
-from hh_search.llm.facts import extract_facts, extract_relocation
+from hh_search.llm.facts import extract_facts, extract_opinion, extract_relocation
 from hh_search.llm.semantic import cosine, pack_vector, profile_text, unpack_vector
 from hh_search.storage.base import Repository
 
@@ -129,7 +129,14 @@ class SemanticRanker:
             return None
 
 
-def extract_pending(client: OllamaClient, repo: Repository, model: str, limit: int) -> int:
+def extract_pending(
+    client: OllamaClient,
+    repo: Repository,
+    model: str,
+    limit: int,
+    profile: ProfileConfig | None = None,
+    threshold: float = 0.0,
+) -> int:
     """Выписать факты из описаний очереди. Возвращает, сколько записано.
 
     По одной вакансии за запрос — в отличие от векторов, которые уезжают
@@ -144,7 +151,7 @@ def extract_pending(client: OllamaClient, repo: Repository, model: str, limit: i
     недоступна для следующей.
     """
     written = 0
-    for vacancy_id, title, description in repo.pending_facts(model, limit):
+    for vacancy_id, title, description, score in repo.pending_facts(model, limit):
         facts = extract_facts(client, title, description)
         if facts is None:
             continue
@@ -157,6 +164,15 @@ def extract_pending(client: OllamaClient, repo: Repository, model: str, limit: i
             relocation = extract_relocation(client, title, description)
             if relocation is not None:
                 facts = facts.model_copy(update={"relocation": relocation})
+        # Мнение — ТРЕТИЙ запрос и только выше порога отчёта: оно
+        # показывается там, где владелец его читает, и платить за него на
+        # всём корпусе незачем (замер §0.8: 34 вакансии из 573).
+        # Отдельным запросом, а не полем в схеме фактов: совмещение
+        # измеренно рушит оба сигнала (§0.9).
+        if profile is not None and score >= threshold:
+            opinion = extract_opinion(client, profile, title, description)
+            if opinion is not None:
+                facts = facts.model_copy(update={"opinion": opinion})
         repo.save_facts(vacancy_id, model, facts)
         written += 1
     if written:
