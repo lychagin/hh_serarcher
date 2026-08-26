@@ -134,19 +134,6 @@ OPINION_SCHEMA: dict[str, object] = {
 }
 
 
-def _profile_line(profile: ProfileConfig) -> str:
-    """Профиль для промпта — из `profile.yaml`, а не константой в коде.
-
-    Иначе правка сигналов владельцем меняла бы ключевую оценку и не
-    меняла бы мнение модели: два ответа на один вопрос, расходящиеся
-    молча и тем сильнее, чем дольше живёт проект.
-    """
-    signals = profile.signals
-    groups = (signals.title_roles, signals.title_tech, signals.stack, signals.domain)
-    words = [spelling for group in groups for entry in group for spelling in entry]
-    return ", ".join(words)
-
-
 def extract_opinion(
     client: OllamaClient, profile: ProfileConfig, title: str, description: str
 ) -> Opinion | None:
@@ -156,10 +143,16 @@ def extract_opinion(
     там, где владелец его читает, и платить за него на всём корпусе
     незачем. Замер 2026-08-26 — 34 вакансии из 573, около минуты.
     """
+    if not profile.summary:
+        return None
+    # Формулировка воспроизводит ту, на которой снят замер §0.8, дословно:
+    # соседний замер §0.10 показал, что оценка ходит на 50 пунктов от
+    # одной вводной фразы. Правя этот текст, замер придётся повторить.
     system = (
-        "Оцени, насколько вакансия подходит кандидату, и верни СТРОГО JSON. "
-        "score — от 0 до 100. reason — одно предложение по-русски, почему. "
-        f"Профиль кандидата: {_profile_line(profile)}."
+        "Ты помогаешь инженеру отбирать вакансии. "
+        f"Профиль кандидата: {profile.summary} "
+        "Оцени вакансию и верни СТРОГО JSON без пояснений: "
+        '{"score": <0..100 int>, "reason": "<одно предложение по-русски>"}'
     )
     try:
         answer = client.chat(system, f"{title}\n{description}", OPINION_SCHEMA)

@@ -1110,6 +1110,14 @@ queries:
 
 ```yaml
 # profile.yaml
+# Связное описание владельца — ТОЛЬКО для локальной модели (спека
+# 2026-08-26-local-llm-design.md, §0.10). Пусто — мнение не спрашивается.
+summary: >-
+  15+ лет в разработке, Team Lead и ведущий разработчик.
+  Стек: C++, Python, Node.js/TypeScript, Embedded Linux, Yocto/Buildroot,
+  BSP, ARM, Docker, Kubernetes, Kafka, PostgreSQL, ClickHouse, LLM/RAG/MCP.
+  Домен: телеком, встраиваемые системы, IoT/IIoT, микросервисы.
+  Нижний Новгород, интересна удалённая работа.
 weights: {title: 0.40, stack: 0.30, responsibilities: 0.20, domain: 0.10}
 saturation: {stack: 5, responsibilities: 3}
 penalty_per_signal: 15

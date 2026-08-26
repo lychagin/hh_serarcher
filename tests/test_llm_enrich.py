@@ -22,6 +22,7 @@ from hh_search.pipeline.llm_enrich import (
     extract_pending,
 )
 from hh_search.storage.repository import SqliteRepository
+from tests.test_llm_facts import WITH_SUMMARY
 from tests.test_llm_semantic import PROFILE
 
 BASE = "http://ollama.test:11434"
@@ -297,7 +298,7 @@ def test_opinion_is_asked_only_above_the_report_threshold(repo: SqliteRepository
 
     respx.post(f"{BASE}/api/chat").mock(side_effect=by_question)
 
-    extract_pending(make_client(), repo, "llama3", 10, PROFILE, threshold=60.0)
+    extract_pending(make_client(), repo, "llama3", 10, WITH_SUMMARY, threshold=60.0)
 
     stored = repo.facts(["выше-порога", "ниже-порога"], "llama3")
     assert stored["выше-порога"].opinion is not None

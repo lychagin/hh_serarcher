@@ -25,6 +25,11 @@ from hh_search.llm.facts import (
 )
 from tests.test_llm_semantic import PROFILE
 
+# Профиль с прозой: без неё мнение не спрашивается вовсе (§0.10).
+WITH_SUMMARY = PROFILE.model_copy(
+    update={"summary": "15+ лет, Team Lead и ведущий разработчик; стек C++ и Python; телеком"}
+)
+
 BASE = "http://ollama.test:11434"
 
 
@@ -230,7 +235,7 @@ def test_opinion_is_asked_by_its_own_request() -> None:
         return_value=answer({"score": 35, "reason": "стек не соответствует профилю"})
     )
 
-    opinion = extract_opinion(make_client(), PROFILE, "Team Lead C#", "нужен C# и .NET")
+    opinion = extract_opinion(make_client(), WITH_SUMMARY, "Team Lead C#", "нужен C# и .NET")
 
     assert opinion == Opinion(score=35, reason="стек не соответствует профилю")
     sent = json.loads(route.calls.last.request.content)
@@ -239,20 +244,25 @@ def test_opinion_is_asked_by_its_own_request() -> None:
 
 
 @respx.mock
-def test_opinion_prompt_carries_the_profile() -> None:
+def test_opinion_prompt_carries_the_profile_from_config() -> None:
     """Профиль берётся из `profile.yaml`, а не зашит в промпт константой.
 
-    Иначе правка сигналов владельцем меняла бы ключевую оценку и НЕ
-    меняла бы мнение модели — два ответа на один вопрос, расходящиеся
-    молча и тем сильнее, чем дольше живёт проект.
+    Иначе правка описания владельцем не меняла бы мнение модели — два
+    ответа на один вопрос, расходящиеся молча и тем сильнее, чем дольше
+    живёт проект.
+
+    Прежняя редакция этого теста требовала, чтобы в промпт попадали
+    СИГНАЛЫ (`yocto`, `телеком`). Замер §0.10 показал, что именно так
+    мнение и обесценивается: перечнем ключевых слов модель отвечает
+    65-85 почти всем. Тест исправлен вслед за фактом.
     """
     route = respx.post(f"{BASE}/api/chat").mock(return_value=answer({"score": 50, "reason": "—"}))
 
-    extract_opinion(make_client(), PROFILE, "Заголовок", "описание")
+    extract_opinion(make_client(), WITH_SUMMARY, "Заголовок", "описание")
 
     system = json.loads(route.calls.last.request.content)["messages"][0]["content"]
-    assert "yocto" in system.lower()
-    assert "телеком" in system.lower()
+    assert WITH_SUMMARY.summary is not None
+    assert WITH_SUMMARY.summary in system
 
 
 @respx.mock
@@ -271,5 +281,43 @@ def test_score_outside_the_range_is_refused() -> None:
 @respx.mock
 def test_unreachable_model_costs_the_opinion_and_not_the_run() -> None:
     respx.post(f"{BASE}/api/chat").mock(side_effect=httpx.ConnectError("refused"))
+
+    assert extract_opinion(make_client(), PROFILE, "Заголовок", "описание") is None
+
+
+@respx.mock
+def test_opinion_prefers_the_prose_summary_over_signal_lists() -> None:
+    """Модели нужна проза, а не перечень ключевых слов — измерено.
+
+    Замер 2026-08-26 (§0.10): один и тот же вход с описанием профиля
+    связной фразой давал вакансии «Technical Team Lead (C# / Python)»
+    оценку 35, а с перечнем сигналов из `profile.yaml` — 75. То есть
+    различающая способность, ради которой мнение и заводится, живёт в
+    ПРОЗЕ, и перечнем её не заменить.
+
+    Причина, судя по всему, в том, чего в перечне нет по построению:
+    стажа. «15+ лет» в `profile.yaml` не хранится ни в каком виде —
+    сигналы описывают, ЧТО искать, а не КТО ищет.
+    """
+    route = respx.post(f"{BASE}/api/chat").mock(return_value=answer({"score": 35, "reason": "—"}))
+    extract_opinion(make_client(), WITH_SUMMARY, "Заголовок", "описание")
+
+    system = json.loads(route.calls.last.request.content)["messages"][0]["content"]
+    assert "15+ лет" in system
+    # Перечня сигналов рядом нет: две картины профиля в одном промпте
+    # спорили бы друг с другом, и какая победит — неизвестно.
+    assert "buildroot" not in system.lower()
+
+
+@respx.mock
+def test_without_a_summary_the_opinion_is_not_asked_at_all() -> None:
+    """Нет прозы — нет и мнения. Молчание честнее неразличающего числа.
+
+    Перечнем сигналов модель отвечает 65–85 почти всем (§0.10), то есть
+    выдаёт число, которое выглядит оценкой и ею не является. Показать
+    такое владельцу хуже, чем не показать ничего: он станет на него
+    смотреть.
+    """
+    respx.post(f"{BASE}/api/chat").mock(return_value=answer({"score": 35, "reason": "—"}))
 
     assert extract_opinion(make_client(), PROFILE, "Заголовок", "описание") is None
