@@ -397,11 +397,17 @@ docker compose run --rm hh-search cleanup --reports --apply   # плюс фай�
 **CSV** — UTF-8 с BOM и разделителем `;` ради Excel, колонки:
 
 ```
-id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;listing;url;work_formats
+id;score;cluster;title;company;area;salary_from;salary_to;currency;published_at;listing;url;work_formats;semantic
 ```
 
 Балл записан числом, поэтому сортировка по нему и фильтр по зарплате работают
 прямо в таблице.
+
+`semantic` — близость описания к профилю по локальной модели, от 0 до 1. В
+балл она **не входит** и порог не двигает: она лишь упорядочивает вакансии с
+ОДИНАКОВЫМ баллом, а таких больше половины. Пустая ячейка значит «не
+считалось» — модель выключена в `app.yaml`, недоступна, или описание уже снято
+уборкой.
 
 Отчёт можно пересобрать из базы, ничего не запрашивая у hh.ru:
 

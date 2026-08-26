@@ -135,8 +135,15 @@ class MarkdownSink:
         # ей не грозит (markdown-спецсимволов в словаре подписей нет), но
         # штраф в скоринге без него выглядел бы произволом (спека §3).
         work_format = format_work_formats(item.details.work_formats)
+        # Семантика приписывается к оценке, а НЕ заменяет её: она не
+        # участвует в `total` (§6 спеки 2026-08-26) и служит владельцу
+        # материалом для решения, стоит ли давать ей больший вес. Пусто —
+        # значит не считалось, и тогда строка выглядит в точности как до
+        # появления модели (наблюдаемая форма §4).
+        semantic = "" if item.semantic is None else f" · близость {item.semantic:.3f}"
         return (
-            f"**[{_plain(discovered.title)}]({discovered.url})** — {item.score.total:.1f}\n\n"
+            f"**[{_plain(discovered.title)}]({discovered.url})** — "
+            f"{item.score.total:.1f}{semantic}\n\n"
             f"{_plain(discovered.company)} · {_plain(discovered.area)} · "
             f"{_plain(discovered.salary.raw, fallback='зарплата не указана')} · "
             f"{published} · {work_format}\n\n"

@@ -118,6 +118,9 @@ def test_csv_row_carries_every_column(tmp_path: Path) -> None:
             "published_at": "2026-07-27 06:21",
             "listing": "programmist",
             "url": "https://hh.ru/vacancy/1",
+            # Пусто: `make_scored()` не задаёт семантику, то есть это
+            # вакансия из прогона без локальной модели — штатный случай.
+            "semantic": "",
         }
     ]
 

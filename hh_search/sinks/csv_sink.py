@@ -33,6 +33,10 @@ COLUMNS = [
     "listing",
     "url",
     "work_formats",
+    # В хвосте по тому же правилу, что и `work_formats` выше: заголовок
+    # файла дня написан прошлой версией, и колонка в середине сдвинула бы
+    # для `DictReader` все поля после себя — молча.
+    "semantic",
 ]
 
 # Excel и LibreOffice исполняют содержимое ячейки, начинающееся с этих
@@ -158,6 +162,11 @@ class CsvSink:
             "listing": _cell(discovered.found_by_query),
             "url": _cell(discovered.url),
             "work_formats": _cell(format_work_formats(item.details.work_formats)),
+            # Пустая ячейка, а не ноль: «не считалось» (модель недоступна,
+            # `llm.semantic: false`, вектор снят уборкой) и «посчиталось,
+            # вышло мало» — разные вещи, и ноль на месте первого утверждал
+            # бы то, чего никто не измерял.
+            "semantic": "" if item.semantic is None else f"{item.semantic:.3f}",
         }
 
 
