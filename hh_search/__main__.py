@@ -21,11 +21,13 @@ import typer
 
 from hh_search.config.loader import load_config
 from hh_search.config.models import Config
+from hh_search.domain.models import ScoredVacancy
 from hh_search.errors import AccessForbidden, StorageUnavailable
 from hh_search.llm.client import build_llm
 from hh_search.logging_setup import setup_logging
 from hh_search.pipeline import EXIT_CODES, OK, PARTIAL, RunStats, run_once
 from hh_search.pipeline.cleanup import CleanupDays, execute, horizon, plan
+from hh_search.pipeline.llm_enrich import ReportEnrichment, build_ranker
 from hh_search.pipeline.reporting import emit_to_sinks, maintain_sinks
 from hh_search.runlock import RunInProgress, single_run
 from hh_search.scheduler import EXIT_FORBIDDEN, StopSignal, serve
@@ -33,6 +35,7 @@ from hh_search.scoring.keyword import KeywordScorer
 from hh_search.sinks import build_sinks
 from hh_search.sinks.base import Sink
 from hh_search.sources.http import PoliteClient
+from hh_search.storage.base import Repository
 from hh_search.storage.repository import SqliteRepository
 
 logger = logging.getLogger(__name__)
@@ -493,6 +496,42 @@ def cleanup_command(
         raise typer.Exit(EXIT_CODES[PARTIAL])
 
 
+def _enriched(
+    config: Config, repo: Repository, vacancies: list[ScoredVacancy]
+) -> list[ScoredVacancy]:
+    """Досыпать семантику и факты в перегенерируемый отчёт.
+
+    `report --since` обязан вести себя ровно так же, как `run`, — тот же
+    инвариант, что уже записан ниже про `maintain_sinks`: два описания
+    одного прогона, расходящиеся в порядке вакансий и в том, что рядом с
+    ними написано, — это ровно та тихая беда, ради которой у CLI и
+    конвейера общий `emit_to_sinks`.
+
+    Векторы и факты УЖЕ в базе, поэтому цена здесь — один запрос за
+    вектором профиля, а не переэмбеддинг корпуса. Ничего нового не
+    считается: `report` перерисовывает историю, а не обогащает её, и
+    вакансия без вектора останется без него.
+
+    Недоступная модель обходится в ту же цену, что и везде (§4 спеки
+    2026-08-26): отчёт выйдет прежним, в порядке по одной оценке.
+    """
+    llm = build_llm(config.app.llm)
+    if llm is None:
+        return vacancies
+    try:
+        ranker = (
+            build_ranker(llm, config.profile, config.app.llm.embed_model)
+            if config.app.llm.semantic
+            else None
+        )
+        facts_model = config.app.llm.chat_model if config.app.llm.facts else None
+        if ranker is None and facts_model is None:
+            return vacancies
+        return ReportEnrichment(ranker=ranker, facts_model=facts_model).attach(repo, vacancies)
+    finally:
+        llm.close()
+
+
 @app.command("report")
 def report_command(ctx: typer.Context, since: Since = "7d") -> None:
     """Перегенерировать отчёт из базы по уже отправленным вакансиям."""
@@ -521,7 +560,7 @@ def report_command(ctx: typer.Context, since: Since = "7d") -> None:
     limit = config.app.limits.rows_per_batch
     try:
         with _storage_errors(config), _open(config) as repo:
-            vacancies = repo.reported_since(cutoff, limit)
+            vacancies = _enriched(config, repo, repo.reported_since(cutoff, limit))
     except StorageUnavailable as error:
         _die(str(error), EXIT_FAILED)
     if not vacancies:

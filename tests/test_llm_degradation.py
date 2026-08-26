@@ -10,6 +10,7 @@
 упасть» — совпасть.
 """
 
+import csv
 import json
 from pathlib import Path
 
@@ -214,3 +215,60 @@ def test_working_ollama_puts_extracted_facts_into_the_report(tmp_path: Path) -> 
     assert all(item.facts is not None for item in sink.items)
     assert sink.items[0].facts is not None
     assert sink.items[0].facts.stack == ["Yocto", "ARM"]
+
+
+@respx.mock
+def test_report_command_enriches_like_a_run_does(tmp_path: Path) -> None:
+    """`report --since` обязан вести себя ровно так же, как `run`.
+
+    Это не новое требование: тот же инвариант уже записан комментарием в
+    `__main__.report_command` про `maintain_sinks` — «двух разных ответов
+    на один отказ у CLI быть не должно». Семантика и факты подчиняются ему
+    ровно так же: перегенерированный отчёт, где вакансия стоит в другом
+    месте и без стека, — это второе описание одного прогона, расходящееся
+    с первым.
+
+    Векторы уже лежат в базе, поэтому цена здесь — один запрос за вектором
+    профиля, а не переэмбеддинг корпуса.
+    """
+    from typer.testing import CliRunner
+
+    from hh_search.__main__ import app
+    from tests.test_cli import prepare
+
+    config_dir = prepare(tmp_path)
+    (config_dir / "app.yaml").write_text(
+        (config_dir / "app.yaml").read_text(encoding="utf-8") + LLM_ON, encoding="utf-8"
+    )
+    config = load_config(config_dir)
+    mock_source(TWO_ENRICHABLE)
+    respx.post(f"{OLLAMA}/api/embed").mock(
+        side_effect=lambda request: httpx.Response(
+            200, json={"embeddings": [[1.0, 0.0]] * len(json.loads(request.content)["input"])}
+        )
+    )
+    respx.post(f"{OLLAMA}/api/chat").mock(
+        return_value=httpx.Response(
+            200, json={"message": {"content": json.dumps({"stack": ["Yocto", "ARM"]})}}
+        )
+    )
+    # Каталог тома создаёт CLI (`init-db`/`run`); здесь база открывается
+    # напрямую, поэтому его надо завести самим.
+    config.app.paths.state.parent.mkdir(parents=True, exist_ok=True)
+    with SqliteRepository(config.app.paths.state) as repo:
+        repo.init_schema()
+    with make_client(config) as client, SqliteRepository(config.app.paths.state) as repo:
+        run_once(config, client, repo, KeywordScorer(config.profile), [], NOW, llm=llm_client())
+        repo.mark_reported([vacancy.discovered.id for vacancy in repo.unreported(10)])
+
+    result = CliRunner().invoke(app, ["--config-dir", str(config_dir), "report", "--since", "30d"])
+
+    assert result.exit_code == 0, result.output
+    # Сверка по CSV, а не по Markdown: колонки там есть у любой вакансии, а
+    # секция «Остальное» в Markdown минимальна по решению владельца, и
+    # добавлять в неё семантику ради удобства теста нельзя.
+    with next((config.app.paths.reports).glob("*.csv")).open(encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle, delimiter=";"))
+    assert rows, "перегенерированный отчёт пуст"
+    assert all(row["semantic"] for row in rows), "семантика не доехала до `report`"
+    assert all(row["stack"] == "Yocto, ARM" for row in rows), "факты не доехали до `report`"
