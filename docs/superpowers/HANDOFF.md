@@ -179,6 +179,8 @@ Allow: /vacancies/*?*&page=      ← БОЛЬШЕ НЕТ
 | Документ | Путь |
 |---|---|
 | Правила работы (**читать всегда**) | `CLAUDE.md` |
+| Обзор для человека | `README.md` |
+| Настройка, команды, отчёты, модель | `docs/configuration.md`, `docs/commands.md`, `docs/reports.md`, `docs/local-llm.md` |
 | Спека системы (действующая) | `docs/superpowers/specs/2026-07-27-hh-autosearch-design.md` |
 | **Спека локальной LLM (действующая)** | `docs/superpowers/specs/2026-08-26-local-llm-design.md` |
 | Спека приёмника Telegram | `docs/superpowers/specs/2026-07-29-telegram-sink-design.md` |
