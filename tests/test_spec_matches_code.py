@@ -30,7 +30,7 @@ from pathlib import Path
 import yaml
 
 from hh_search.__main__ import cleanup_command
-from hh_search.config.models import LocationConfig
+from hh_search.config.models import LocationConfig, QuerySpec
 from hh_search.domain.models import WorkFormat
 from hh_search.sinks.telegram_message import TIER_HOT, TIER_WARM, TOP_LIMIT
 
@@ -249,6 +249,12 @@ def _texts_that_must_not_repeat_the_volume() -> list[tuple[str, str]]:
         ("спека без §4.1", spec.replace(guarded, "")),
         ("README.md", README.read_text(encoding="utf-8")),
     ]
+    # Документы из docs/, куда в 2026-08-27 уехали детали README: копия
+    # числа переехала бы вместе с текстом, если её не запретить и здесь.
+    texts += [
+        (str(doc.relative_to(ROOT)), doc.read_text(encoding="utf-8"))
+        for doc in sorted((ROOT / "docs").glob("*.md"))
+    ]
     for path in [*sorted((ROOT / "config.example").glob("*.yaml")), *sorted(PACKAGE.rglob("*.py"))]:
         texts.append((str(path.relative_to(ROOT)), path.read_text(encoding="utf-8")))
     return texts
@@ -377,10 +383,21 @@ def test_spec_does_not_count_tests() -> None:
 
 
 README = ROOT / "README.md"
+# Детали уехали из README в docs/ (2026-08-27): он сжался с шестисот строк до
+# полутора сотен и стал читаться человеком. Сторожа переехали ВМЕСТЕ с
+# текстом — удалить их значило бы отпустить ровно те утверждения, которые
+# ломаются тихо.
+CONFIG_DOC = ROOT / "docs/configuration.md"
+COMMANDS_DOC = ROOT / "docs/commands.md"
+REPORTS_DOC = ROOT / "docs/reports.md"
+LLM_DOC = ROOT / "docs/local-llm.md"
 
 
-def readme_section(start: str, end: str) -> str:
-    """Срез README от заголовка `start` до следующего заголовка `end`.
+def doc_section(path: Path, start: str, end: str | None) -> str:
+    """Срез документа от заголовка `start` до следующего заголовка `end`.
+
+    `end=None` — до конца файла: раздел, стоящий последним, иначе пришлось
+    бы держать за ним пустой заголовок ради теста.
 
     Два независимых требования к поиску `end`, каждое проверено мутацией:
 
@@ -398,13 +415,20 @@ def readme_section(start: str, end: str) -> str:
        строки, а не в её начале. Безобидная вставка подзаголовка обрезала
        бы секцию до пустой и красила сторож, который её читает.
     """
-    text = README.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
     start_index = text.index(start)
     tail = text[start_index + len(start) :]
+    if end is None:
+        return text[start_index:]
     end_match = re.search(rf"^{re.escape(end)}", tail, re.MULTILINE)
     assert end_match is not None, f"конец секции {end!r} после {start!r} не найден"
     end_index = start_index + len(start) + end_match.start()
     return text[start_index:end_index]
+
+
+def readme_section(start: str, end: str) -> str:
+    """Срез README — обёртка над `doc_section` для сторожей, оставшихся в нём."""
+    return doc_section(README, start, end)
 
 
 def test_readme_names_the_real_report_files() -> None:
@@ -419,7 +443,7 @@ def test_readme_names_the_real_report_files() -> None:
     `report --since`, и с широкой границей порча строки таблицы оставалась
     зелёной (проверено мутацией).
     """
-    section = readme_section("## Где смотреть результаты", "## Отчёт в Telegram")
+    section = doc_section(REPORTS_DOC, "| Что | Путь", "## Markdown")
     for module, suffix in (("csv_sink", "csv"), ("markdown_sink", "md"), ("telegram_sink", "html")):
         source = (PACKAGE / "sinks" / f"{module}.py").read_text(encoding="utf-8")
         assert f'-new.{suffix}"' in source, f"{module} больше не пишет файл `-new.{suffix}`"
@@ -430,7 +454,7 @@ def test_readme_lists_the_real_csv_columns() -> None:
     """Список колонок CSV в README — копия `COLUMNS`, и копии обязаны сверяться."""
     from hh_search.sinks.csv_sink import COLUMNS
 
-    section = readme_section("## Где смотреть результаты", "## Разработка")
+    section = doc_section(REPORTS_DOC, "## CSV", "## Telegram")
     assert ";".join(COLUMNS) in section, (
         "перечень колонок в README разошёлся с `csv_sink.COLUMNS`: " + ";".join(COLUMNS)
     )
@@ -438,7 +462,7 @@ def test_readme_lists_the_real_csv_columns() -> None:
 
 def test_readme_names_the_real_report_headings() -> None:
     """Разделы markdown-отчёта названы так же, как их пишет приёмник."""
-    section = readme_section("## Где смотреть результаты", "## Разработка")
+    section = doc_section(REPORTS_DOC, "## Markdown", "## CSV")
     source = (PACKAGE / "sinks" / "markdown_sink.py").read_text(encoding="utf-8")
     for heading in ("## Топ", "## Остальное"):
         assert f'"{heading}"' in source, f"markdown_sink больше не пишет раздел {heading}"
@@ -448,18 +472,32 @@ def test_readme_names_the_real_report_headings() -> None:
 # --- README §«Два потока discovery» ----------------------------------------
 
 
-def test_readme_explains_both_discovery_streams() -> None:
-    """Раздел про два потока обязан называть настоящее имя поля и настоящее
-    значение перечисления — оба берутся из кода."""
-    section = readme_section("## Два потока discovery", "## ")
-    assert "work_format" in section
-    assert WorkFormat.REMOTE.value in section
+def test_docs_explain_why_the_work_format_stream_is_dead() -> None:
+    """Второй поток discovery МЁРТВ, и документ обязан говорить об этом.
+
+    Прежняя редакция этого сторожа требовала, чтобы README описывал два
+    потока как работающие, — и была зелена ещё три недели после того, как
+    hh.ru убрал из `robots.txt` разрешение постраничного обхода (первый
+    отказ в журнале прогонов — 2026-08-04, найдено 2026-08-26). Сторож
+    держал утверждение, а не факт.
+
+    Теперь держится факт, и держится с трёх сторон: поле в коде ещё
+    ЕСТЬ (читатель может его найти и попробовать), значение перечисления
+    настоящее, а документ обязан назвать причину, по которой оно больше не
+    работает. Уберут поле из кода — покраснеет первая проверка; вернёт
+    hh.ru разрешение и мы снимем предупреждение — покраснеет третья.
+    """
+    section = doc_section(CONFIG_DOC, "## queries.yaml", "## profile.yaml")
+    assert "work_format" in QuerySpec.model_fields, "поля work_format больше нет в коде"
+    assert "work_format" in section, "документ не называет поле work_format"
+    assert WorkFormat.REMOTE.value in section, "документ не называет значение перечисления"
+    assert "Disallow: *?*" in section, "документ не называет правило, которое это закрыло"
 
 
 def test_readme_lists_the_location_penalty_field() -> None:
     """Штраф за неудалённую работу вне дома обязан быть виден в README, а не
     только в спеке: это раздел `profile.yaml`, который человек правит руками."""
-    section = README.read_text(encoding="utf-8")
+    section = CONFIG_DOC.read_text(encoding="utf-8")
     assert "penalty_not_remote_elsewhere" in section
     assert "home_areas" in section
 
@@ -520,7 +558,7 @@ def test_readme_names_the_real_telegram_variables() -> None:
     Переменные читает `TelegramCredentials.from_env` в `telegram_client.py`,
     а не `telegram_sink.py`: транспорт и приёмник — разные модули (Task 3).
     """
-    section = readme_section("## Отчёт в Telegram", "## Разработка")
+    section = doc_section(REPORTS_DOC, "## Telegram", None)
     source = (PACKAGE / "sinks" / "telegram_client.py").read_text(encoding="utf-8")
     for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
         assert name in source, f"код больше не читает {name}"
@@ -538,7 +576,7 @@ def test_env_example_documents_the_telegram_variables() -> None:
 def test_readme_names_the_real_sink_name() -> None:
     from hh_search.sinks.telegram_sink import TelegramSink
 
-    section = readme_section("## Отчёт в Telegram", "## Разработка")
+    section = doc_section(REPORTS_DOC, "## Telegram", None)
     assert f"`{TelegramSink.name}`" in section
 
 
@@ -560,7 +598,7 @@ def test_readme_recipe_for_a_repeat_delivery_matches_the_real_lookback_window() 
     from hh_search.sinks.base import LOOKBACK_DAYS
     from hh_search.sinks.telegram_sink import _SENT_SUFFIX
 
-    section = readme_section("## Отчёт в Telegram", "## Разработка")
+    section = doc_section(REPORTS_DOC, "## Telegram", None)
     assert "LOOKBACK_DAYS" in section
     assert f"{LOOKBACK_DAYS} предыдущих суток" in section
     assert "недостаточно" in section, "README больше не предупреждает, что удаления файла мало"
@@ -627,7 +665,7 @@ def _cleanup_command_defaults() -> dict[str, int]:
 
 def test_readme_cleanup_defaults_match_the_command() -> None:
     defaults = _cleanup_command_defaults()
-    section = readme_section("### Уборка старых данных", "## Где смотреть результаты")
+    section = doc_section(COMMANDS_DOC, "## Уборка старых данных", None)
     assert f"описания {defaults['descriptions_days']} дней" in section
     assert f"журнал прогонов {defaults['runs_days']}" in section
     assert f"файлы отчётов {defaults['reports_days']} (" in section
@@ -651,16 +689,18 @@ def test_spec_cleanup_defaults_match_the_command() -> None:
 def test_documents_name_the_real_top_limit() -> None:
     """Потолок топа назван в спеке и README тем же числом, что в коде."""
     spec = LAYOUT_SPEC.read_text(encoding="utf-8")
-    readme = README.read_text(encoding="utf-8")
+    # Устройство сообщения переехало в docs/reports.md вместе с README.
+    readme = REPORTS_DOC.read_text(encoding="utf-8")
     assert f"не больше **{TOP_LIMIT}**" in spec, "спека называет другой потолок, чем TOP_LIMIT"
     assert f"ЕЩЁ {TOP_LIMIT - 1}" in spec, "макет в спеке разошёлся с потолком TOP_LIMIT"
-    assert f"первые {TOP_LIMIT}" in readme, "README называет другой потолок, чем TOP_LIMIT"
+    assert f"первые {TOP_LIMIT}" in readme, "docs/reports.md называет другой потолок"
 
 
 def test_spec_names_the_real_tier_thresholds() -> None:
     """Границы значков 80/70 — из кода, а не переписанные в документ."""
     spec = LAYOUT_SPEC.read_text(encoding="utf-8")
-    readme = README.read_text(encoding="utf-8")
+    # Устройство сообщения переехало в docs/reports.md вместе с README.
+    readme = REPORTS_DOC.read_text(encoding="utf-8")
     assert f"`🔥` при {TIER_HOT:.0f} и выше" in spec
     assert f"`⚡` при {TIER_WARM:.0f}–{TIER_HOT - 0.1:.1f}" in spec
     assert f"`▫️` ниже {TIER_WARM:.0f}" in spec
@@ -679,3 +719,46 @@ def test_telegram_sink_spec_points_at_the_layout_spec() -> None:
     text = TELEGRAM_SPEC.read_text(encoding="utf-8")
     assert "2026-08-02-telegram-digest-layout-design.md" in text
     assert "Новых вакансий: N" not in text
+
+
+# --- README как оглавление: ссылки обязаны вести куда обещано --------------
+
+
+def _local_links(doc: Path) -> list[tuple[str, str]]:
+    """Пары (текст, цель) для ссылок на файлы, без внешних адресов."""
+    found = re.findall(r"\[([^\]]+)\]\(([^)]+)\)", doc.read_text(encoding="utf-8"))
+    return [(text, target) for text, target in found if not target.startswith("http")]
+
+
+def test_every_link_between_documents_resolves() -> None:
+    """Ссылка на несуществующий файл — единственный вид порчи, который не
+    виден при чтении: markdown рендерит её как обычную ссылку.
+
+    Сторож заведён вместе с разбиением README на `docs/` (2026-08-27): пока
+    весь текст жил в одном файле, ссылаться было почти не на что, а теперь
+    README — оглавление, и его ценность целиком в том, что ссылки живые.
+    """
+    broken = []
+    for doc in [README, *sorted((ROOT / "docs").glob("*.md"))]:
+        for text, target in _local_links(doc):
+            path = (doc.parent / target.partition("#")[0]).resolve()
+            if not path.exists():
+                broken.append(f"{doc.relative_to(ROOT)}: [{text}]({target})")
+    assert broken == [], "ссылки ведут в никуда: " + "; ".join(broken)
+
+
+def test_readme_links_to_every_document_beside_it() -> None:
+    """Документ из `docs/`, на который README не ссылается, читатель не найдёт.
+
+    Ровно так и теряются документы: файл создан, полезен и не упомянут
+    нигде, кроме коммита, которым заведён.
+    """
+    linked = {
+        (README.parent / target.partition("#")[0]).resolve() for _, target in _local_links(README)
+    }
+    missing = [
+        str(doc.relative_to(ROOT))
+        for doc in sorted((ROOT / "docs").glob("*.md"))
+        if doc.resolve() not in linked
+    ]
+    assert missing == [], f"README не ссылается на {missing}"
