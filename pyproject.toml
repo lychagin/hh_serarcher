@@ -2,6 +2,9 @@
 name = "hh-search"
 version = "0.1.0"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = ["License :: OSI Approved :: MIT License"]
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",

@@ -5,6 +5,10 @@
 отдаёт короткий список — только новое, только по делу. На диск в Markdown, CSV и
 HTML; в Telegram — если подключите.
 
+[![CI](https://github.com/lychagin/hh_serarcher/actions/workflows/ci.yml/badge.svg)](https://github.com/lychagin/hh_serarcher/actions/workflows/ci.yml)
+[![Лицензия: MIT](https://img.shields.io/badge/лицензия-MIT-green.svg)](LICENSE)
+![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)
+
 Python 3.12 · SQLite · Docker · без внешних сервисов, кроме hh.ru и Bot API.
 
 ---
@@ -204,3 +208,8 @@ uv run pytest -m llm         # контрактные тесты против ж
 что с кодом разошлись ровно те разделы, которых не сторожил ни один тест.
 Покраснел такой тест — правьте документ вместе с кодом, а не выключайте
 сторожа.
+
+## Лицензия
+
+[MIT](LICENSE) — берите, меняйте, встраивайте куда угодно; единственное условие —
+сохранить текст лицензии.
